@@ -475,8 +475,7 @@ unsafe extern "system" fn host_proc(
         }
         if matches!(
             msg,
-            WM_MOUSEMOVE
-                | WM_LBUTTONDOWN
+            WM_LBUTTONDOWN
                 | WM_LBUTTONUP
                 | WM_KEYDOWN
                 | WM_CHAR
@@ -484,6 +483,8 @@ unsafe extern "system" fn host_proc(
                 | WM_KILLFOCUS
                 | EM_SETSEL
         ) || msg == WM_USER + 55
+            || (msg == WM_MOUSEMOVE
+                && wp & windows_sys::Win32::System::SystemServices::MK_LBUTTON as usize != 0)
         {
             invalidate(hwnd);
         }
@@ -709,6 +710,15 @@ fn native_scroll_remains_available_without_native_tracks() {
         attach(hwnd, CANVAS);
         SetWindowTextW(hwnd, wide(&"scroll test line\r\n".repeat(200)).as_ptr());
         measure(hwnd);
+        ValidateRect(hwnd, null());
+        for _ in 0..30 {
+            SendMessageW(hwnd, WM_MOUSEMOVE, 0, (40 << 16) | 40);
+        }
+        assert_eq!(
+            GetUpdateRect(hwnd, null_mut(), 0),
+            0,
+            "Hovering must not repaint the editor and interrupt caret blinking"
+        );
         let max = limit(&info(hwnd, true));
         assert!(max > 0, "Missing hidden scroll range");
         set_position(hwnd, true, max / 2);

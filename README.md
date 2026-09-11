@@ -59,11 +59,11 @@ The bottom status bar shows context-specific shortcut hints when there is no tem
 
 ## Syntax highlighting
 
-The source editor automatically colours Markdown headings, emphasis, links, lists, quotes and code fences. Fenced code uses its language label. Basic lexical highlighting covers Rust, JSON/JSONC, JavaScript/TypeScript, Python, C/C++/C#/Java/Go, shell/PowerShell, TOML/YAML, CSS and HTML/XML. Unknown extensions remain plain text; untitled documents default to Markdown.
+The source editor automatically colours Markdown headings, emphasis, links, lists, quotes and code fences. Fenced code uses the same language rules as standalone files. All syntax-bearing text extensions in `assets/file-types.tsv` are covered: Rust, JS/TS and module/component variants, C/C++ headers, C#/Java/Go, Python/R/Ruby/Perl/Lua, Kotlin/Swift/Dart/Groovy, shell/PowerShell/batch, SQL, JSON/notebooks, TOML/YAML/INI/environment/config files, CSS/HTML/XML/SVG, TeX/BibTeX, CSV/TSV, Diff/Patch, reStructuredText/AsciiDoc and Git patterns. Dockerfile, Makefile, CMakeLists.txt, dotfiles and common shebang interpreters are detected too. Unknown extensions remain plain text; untitled documents default to Markdown.
 
-Colours use cyan keywords, blue functions/punctuation, mint strings, muted comments and warm numbers. Highlighting changes no font sizes or file contents. Native text ranges preserve selection and undo/redo; clipboard paste stays plain text. IME composition postpones highlighting.
+CSV/TSV use consistent column colours, including unquoted text, escaped quotes and multiline quoted fields. Colours for code use cyan keywords, blue functions/punctuation, mint strings, muted comments and warm numbers. Highlighting changes no font sizes or file contents. Native text ranges preserve selection and undo/redo; clipboard paste stays plain text. IME composition postpones highlighting.
 
-Work is debounced and limited to 32K UTF-16 units near the viewport, with at most 4,096 colour runs per update. This is lexical highlighting, not a compiler: multiline constructs starting more than 16K units before the viewport can have approximate colours. Extremely dense token windows fall back to plain text. The separate >8 MiB read-only viewport remains uncoloured to preserve its bounded memory and fast open path.
+Work is debounced and limited to 32K UTF-16 units near the viewport, with at most 4,096 colour runs per update. The >8 MiB read-only viewer colours only its bounded page on its worker thread, without a full-file scan or index. This is lexical highlighting, not semantic analysis: mixed-language components use shared basic rules, and multiline constructs starting outside the bounded context can have approximate colours. Soft wrapping preserves logical record boundaries. Dense token windows spend the bounded formatting budget on visible text first; colours beyond that budget are deferred until scrolling.
 
 ## Large files
 

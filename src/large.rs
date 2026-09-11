@@ -34,6 +34,8 @@ struct Request {
 struct Row {
     start: u64,
     text: String,
+    colors: Vec<u32>,
+    line_end: bool,
 }
 struct Page {
     id: u64,
@@ -46,11 +48,12 @@ struct Source {
     file: File,
     utf16: Option<bool>,
     bom: u64,
+    language: crate::syntax::Language,
 }
 impl Source {
     fn open(path: &std::path::Path) -> Result<Self, String> {
         let mut file = File::open(path).map_err(|e| e.to_string())?;
-        let mut prefix = [0; 3];
+        let mut prefix = [0; 1024];
         let n = file.read(&mut prefix).map_err(|e| e.to_string())?;
         let utf16 = if n >= 2 && prefix[..2] == [0xff, 0xfe] {
             Some(true)
@@ -61,12 +64,33 @@ impl Source {
         };
         let bom = if utf16.is_some() {
             2
-        } else if n == 3 && prefix == [0xef, 0xbb, 0xbf] {
+        } else if n >= 3 && prefix[..3] == [0xef, 0xbb, 0xbf] {
             3
         } else {
             0
         };
-        Ok(Self { file, utf16, bom })
+        let header = if let Some(le) = utf16 {
+            let units: Vec<_> = prefix[2..n]
+                .chunks_exact(2)
+                .map(|p| {
+                    if le {
+                        u16::from_le_bytes([p[0], p[1]])
+                    } else {
+                        u16::from_be_bytes([p[0], p[1]])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(&prefix[bom as usize..n]).into_owned()
+        };
+        let language = crate::syntax::Language::detect(path, &header);
+        Ok(Self {
+            file,
+            utf16,
+            bom,
+            language,
+        })
     }
     fn page(&mut self, req: Request) -> Result<Page, String> {
         let len = self.file.metadata().map_err(|e| e.to_string())?.len();
@@ -171,6 +195,8 @@ impl Source {
                 rows.push(Row {
                     start: row_start,
                     text: std::mem::take(&mut text),
+                    colors: Vec::new(),
+                    line_end: ch == '\n',
                 });
                 row_start = start + pos as u64 - if ch == '\n' { 0 } else { width as u64 };
                 count = 0;
@@ -187,12 +213,46 @@ impl Source {
             rows.push(Row {
                 start: row_start,
                 text,
+                colors: Vec::new(),
+                line_end: false,
             });
         }
         let at = rows
             .partition_point(|r| r.start < target)
             .saturating_sub(req.back);
-        let rows = rows.into_iter().skip(at).take(256).collect();
+        let mut rows: Vec<Row> = rows.into_iter().skip(at).take(256).collect();
+        // Only colour the bounded page on the worker; never scan the full file.
+        let mut source = String::new();
+        for row in &rows {
+            source.push_str(&row.text);
+            if row.line_end {
+                source.push('\n');
+            }
+        }
+        let colors = crate::syntax::colors(&source, self.language);
+        let mut offset = 0;
+        for row in &mut rows {
+            let raw = std::mem::take(&mut row.text);
+            let mut column = 0;
+            for (byte, ch) in raw.char_indices() {
+                let width = if ch == '\t' {
+                    8 - column % 8
+                } else {
+                    ch.width().unwrap_or(1).max(1)
+                };
+                if ch == '\t' {
+                    row.text.extend(std::iter::repeat_n(' ', width));
+                    row.colors
+                        .extend(std::iter::repeat_n(colors[offset + byte], width));
+                } else {
+                    row.text.push(ch);
+                    row.colors
+                        .extend_from_slice(&colors[offset + byte..offset + byte + ch.len_utf8()]);
+                }
+                column += width;
+            }
+            offset += raw.len() + usize::from(row.line_end);
+        }
         Ok(Page {
             id: req.id,
             len,
@@ -416,19 +476,43 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                         .take(((rc.bottom - 48) / 28).max(1) as usize)
                         .enumerate()
                     {
-                        label(
-                            canvas,
-                            &row.text,
-                            RECT {
-                                left: 32,
-                                top: 24 + i as i32 * 28,
-                                right: rc.right - 28,
-                                bottom: 52 + i as i32 * 28,
-                            },
-                            s.font,
-                            INK,
-                            DT_SINGLELINE | DT_NOPREFIX | DT_EXPANDTABS,
-                        );
+                        let old = SelectObject(canvas, s.font);
+                        SetBkMode(canvas, TRANSPARENT as i32);
+                        let mut x = 32;
+                        let mut start = 0;
+                        for end in row
+                            .text
+                            .char_indices()
+                            .map(|(n, _)| n)
+                            .skip(1)
+                            .chain(std::iter::once(row.text.len()))
+                        {
+                            if end < row.text.len() && row.colors[end] == row.colors[start] {
+                                continue;
+                            }
+                            let run = wide(&row.text[start..end]);
+                            SetTextColor(canvas, row.colors.get(start).copied().unwrap_or(INK));
+                            TextOutW(
+                                canvas,
+                                x,
+                                24 + i as i32 * 28,
+                                run.as_ptr(),
+                                run.len() as i32 - 1,
+                            );
+                            let mut size: SIZE = zeroed();
+                            GetTextExtentPoint32W(
+                                canvas,
+                                run.as_ptr(),
+                                run.len() as i32 - 1,
+                                &mut size,
+                            );
+                            x += size.cx;
+                            start = end;
+                            if x >= rc.right - 28 {
+                                break;
+                            }
+                        }
+                        SelectObject(canvas, old);
                     }
                 }
                 if !s.message.is_empty() {
@@ -456,6 +540,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
 }
 
 #[test]
+fn tabular_highlighting_survives_display_wrapping() {
+    let path = std::env::temp_dir().join(format!("featherpad-table-{}.tsv", std::process::id()));
+    std::fs::write(
+        &path,
+        "name\tcity\tnote\nAlice\tParis\t\"long quoted field across wrapping\"\n",
+    )
+    .unwrap();
+    let page = Source::open(&path)
+        .unwrap()
+        .page(Request {
+            id: 1,
+            offset: 0,
+            columns: 16,
+            back: 0,
+        })
+        .unwrap();
+    let paris = page.rows.iter().find(|r| r.text.contains("Paris")).unwrap();
+    assert_eq!(
+        paris.colors[paris.text.find("Paris").unwrap()],
+        rgb(218, 185, 130)
+    );
+    for row in &page.rows {
+        assert_eq!(row.text.len(), row.colors.len());
+        if let Some(at) = row.text.find("wrapping") {
+            assert_eq!(row.colors[at], rgb(145, 206, 180));
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn bounded_reads_and_unicode_boundaries() {
     use std::io::Write;
     let dir = std::env::temp_dir().join(format!("featherpad-large-{}", std::process::id()));
@@ -477,6 +592,11 @@ fn bounded_reads_and_unicode_boundaries() {
         })
         .unwrap();
     assert_eq!(page.len, 1024 * 1024 * 1024);
+    assert_eq!(page.rows[0].colors[0], ACCENT);
+    assert!(page
+        .rows
+        .iter()
+        .all(|row| row.colors.len() == row.text.len()));
     assert!(page.read <= BLOCK as usize * 2);
     assert_eq!(page.rows[1].text, "中文 😀");
     let end = source

@@ -2366,6 +2366,45 @@ fn native_highlighting_preserves_text_selection_scroll_and_undo() {
         );
         SendMessageW(edit, WM_USER + 84, 0, 0); // EM_REDO
         assert_eq!(text(edit), edited);
+        for (path, content, keyword_len) in [
+            ("query.sql", "SELECT name FROM items", 6),
+            ("script.lua", "local name = '中文'", 5),
+            ("script.ps1", "param($name)", 5),
+            ("Dockerfile", "FROM alpine", 4),
+            ("main.kt", "fun main() {}", 3),
+            ("table.csv", "name,city\r\nAlice,Paris", 4),
+        ] {
+            SetWindowTextW(edit, wide(content).as_ptr());
+            SendMessageW(edit, EM_EMPTYUNDOBUFFER, 0, 0);
+            SendMessageW(edit, EM_SETMODIFY, 0, 0);
+            h.update(edit, Some(Path::new(path)));
+            assert_eq!(
+                doc.Range(0, keyword_len)
+                    .unwrap()
+                    .GetFont()
+                    .unwrap()
+                    .GetForeColor()
+                    .unwrap(),
+                theme::ACCENT as i32,
+                "{path}"
+            );
+            assert_eq!(text(edit), content);
+            assert_eq!(SendMessageW(edit, EM_GETMODIFY, 0, 0), 0);
+            assert_eq!(SendMessageW(edit, EM_CANUNDO, 0, 0), 0);
+        }
+        SetWindowTextW(edit, wide(&"name,city,note\r\n".repeat(4000)).as_ptr());
+        SendMessageW(edit, EM_SETSEL, 0, 0);
+        h.update(edit, Some(Path::new("dense.csv")));
+        assert_eq!(
+            doc.Range(0, 4)
+                .unwrap()
+                .GetFont()
+                .unwrap()
+                .GetForeColor()
+                .unwrap(),
+            theme::ACCENT as i32,
+            "Dense CSV must retain visible field colours"
+        );
         // A viewport update on a long source must neither move the caret nor scroll.
         SetWindowTextW(
             edit,
