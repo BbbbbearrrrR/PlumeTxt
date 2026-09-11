@@ -1,0 +1,94 @@
+id	label	name	extensions
+101	MD	Markdown	md markdown mdown
+102	TXT	Text	txt
+103	PDF	PDF	pdf
+104	PNG	PNG image	png
+105	JPG	JPEG image	jpg
+106	GIF	GIF image	gif
+107	BMP	Bitmap image	bmp
+108	TIF	TIFF image	tif
+109	ICO	Icon	ico
+110	JXR	JPEG XR image	jxr
+111	WEBP	WebP image	webp
+112	HEIC	HEIF image	heic
+113	AVIF	AVIF image	avif
+114	RS	Rust source	rs
+115	JS	JavaScript	js
+116	TS	TypeScript	ts
+117	JSON	JSON data	json
+118	TOML	TOML config	toml
+119	YAML	YAML config	yaml
+120	HTML	HTML source	html
+121	CSS	CSS source	css
+122	PY	Python source	py
+123	C	C source	c
+124	CPP	C++ source	cpp
+125	CS	C# source	cs
+126	JAVA	Java source	java
+127	GO	Go source	go
+128	SH	Shell script	sh
+129	PS1	PowerShell script	ps1
+130	XML	XML data	xml
+131	CSV	CSV data	csv
+132	INI	Configuration	ini
+133	LOG	Text	log
+134	TEXT	Text	text
+135	APNG	PNG image	apng
+136	JPEG	JPEG image	jpeg
+137	JPE	JPEG image	jpe
+138	JFIF	JPEG image	jfif
+139	DIB	Bitmap image	dib
+140	TIFF	TIFF image	tiff
+141	WDP	JPEG XR image	wdp
+142	HDP	JPEG XR image	hdp
+143	HEIF	HEIF image	heif
+144	MJS	JavaScript	mjs
+145	CJS	JavaScript	cjs
+146	JSX	JavaScript	jsx
+147	TSX	TypeScript	tsx
+148	JSONC	JSON data	jsonc
+149	YML	YAML config	yml
+150	HTM	HTML source	htm
+151	SCSS	CSS source	scss
+152	LESS	CSS source	less
+153	PYW	Python source	pyw
+154	H	C source	h
+155	CC	C++ source	cc
+156	CXX	C++ source	cxx
+157	HPP	C++ source	hpp
+158	HXX	C++ source	hxx
+159	BASH	Shell script	bash
+160	ZSH	Shell script	zsh
+161	PSM1	PowerShell script	psm1
+162	PSD1	PowerShell script	psd1
+163	SVG	XML data	svg
+164	TSV	CSV data	tsv
+165	CFG	Configuration	cfg
+166	CONF	Configuration	conf
+167	SQL	SQL source	sql
+168	VUE	Vue component	vue
+169	SVLT	Svelte component	svelte
+170	PHP	PHP source	php
+171	RB	Ruby source	rb
+172	LUA	Lua source	lua
+173	KT	Kotlin source	kt
+174	KTS	Kotlin script	kts
+175	SWIFT	Swift source	swift
+176	R	R source	r
+177	DART	Dart source	dart
+178	BAT	Batch script	bat
+179	CMD	Command script	cmd
+180	ENV	Environment config	env
+181	LOCK	Lock file	lock
+182	PROP	Properties config	properties
+183	TEX	LaTeX source	tex
+184	BIB	Bibliography	bib
+185	RST	reStructuredText	rst
+186	ADOC	AsciiDoc	adoc asciidoc
+187	DIFF	Diff	diff
+188	PATCH	Patch	patch
+189	NB	Notebook JSON	ipynb
+190	GIT	Git ignore rules	gitignore
+191	GATTR	Git attributes	gitattributes
+192	ECFG	Editor config	editorconfig
+193	GRDL	Gradle script	gradle

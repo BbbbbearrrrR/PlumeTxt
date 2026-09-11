@@ -1,0 +1,5 @@
+/target/
+/.cargo-cache/
+/tmp/
+/FeatherPad.exe
+/FeatherPad.previous-*.exe
