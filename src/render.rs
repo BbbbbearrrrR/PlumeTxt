@@ -82,7 +82,9 @@ impl Renderer {
         if self.gpu.is_none()
             && !self.over_budget
             && self.retry.is_none_or(|t| t.elapsed().as_secs() >= 5)
-            && std::env::var_os("FEATHERPAD_RENDERER").is_none_or(|v| v != "gdi")
+            && std::env::var_os("PLUMETXT_RENDERER")
+                .or_else(|| std::env::var_os("FEATHERPAD_RENDERER"))
+                .is_none_or(|v| v != "gdi")
         {
             match Gpu::new(hwnd, rc) {
                 Ok(gpu) => self.gpu = Some(gpu),

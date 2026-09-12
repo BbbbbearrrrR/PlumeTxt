@@ -50,7 +50,7 @@ def run():
     data += b'xref\n0 5\n0000000000 65535 f \n' + b''.join(f'{v:010} 00000 n \n'.encode() for v in offsets[1:])
     data += f'trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n'.encode()
     pdf.write_bytes(data)
-    exe = t.n.b.ROOT / 'target' / 'release' / 'featherpad.exe'
+    exe = t.n.b.ROOT / 'target' / 'release' / 'plumetxt.exe'
     for path, prefix in [(note, 'Reading'), (pdf, 'Page 1 / 2')]:
         proc = subprocess.Popen([str(exe), str(path)])
         try:
@@ -64,7 +64,7 @@ def run():
                 assert commands and t.text(commands) == 'Commands  Ctrl+Shift+P'
                 fits(commands)
             u.SendMessageW(commands, 0xF5, 0, 0)  # BM_CLICK
-            panel = t.n.wait_for(lambda: t.child(hwnd, 'FeatherPadCommands'))
+            panel = t.n.wait_for(lambda: t.child(hwnd, 'PlumeTxtCommands'))
             commands_list = t.child(panel, 'ListBox')
             count = u.SendMessageW(commands_list, 0x18B, 0, 0)
             labels = []
@@ -79,9 +79,9 @@ def run():
             assert 'Quit' not in labels and 'Bold' not in labels
 
             u.SendMessageW(hwnd, 0x8002, 118, 0)
-            t.n.wait_for(lambda: not t.child(hwnd, 'FeatherPadCommands'))
+            t.n.wait_for(lambda: not t.child(hwnd, 'PlumeTxtCommands'))
             if path == pdf:
-                reader = t.child(hwnd, 'FeatherPadReader')
+                reader = t.child(hwnd, 'PlumeTxtReader')
                 u.SendMessageW(reader, 0x8000 + 92, 1, 100000)
                 t.n.wait_for(lambda: footer(hwnd, 'Page 2 / 2'))
             else:

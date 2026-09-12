@@ -281,7 +281,7 @@ fn fit_preserves_aspect_and_centers() {
 #[ignore = "Requires Microsoft Print to PDF; prints only to temporary files"]
 fn native_image_and_pdf_print_to_virtual_printer() {
     use std::time::{Duration, Instant};
-    let root = std::env::temp_dir().join(format!("featherpad-print-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("plumetxt-print-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let picture = root.join("input.bmp");
     let source = root.join("image-output.pdf");

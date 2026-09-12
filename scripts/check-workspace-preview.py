@@ -55,7 +55,7 @@ def run():
     file = root / 'nested' / 'notes.md'
     file.write_text(source, encoding='utf-8')
     (root / 'other.txt').write_text('Other document', encoding='utf-8')
-    exe = n.b.ROOT / 'target' / 'release' / 'featherpad.exe'
+    exe = n.b.ROOT / 'target' / 'release' / 'plumetxt.exe'
     proc = subprocess.Popen([str(exe), str(file)], cwd=exe.parent)
     try:
         hwnd = n.wait_for(lambda: n.b.window_for(proc.pid, file.name))
@@ -65,7 +65,7 @@ def run():
         proc.wait()
     proc = subprocess.Popen([str(exe), str(root)], cwd=exe.parent)
     try:
-        hwnd = n.wait_for(lambda: n.b.window_for(proc.pid, 'FeatherPad'))
+        hwnd = n.wait_for(lambda: n.b.window_for(proc.pid, 'PlumeTxt'))
         tree = n.wait_for(lambda: child(hwnd, 'SysTreeView32'))
         time.sleep(.2)  # Let the initial folder layout finish before measuring the drag.
         before = n.b.w.RECT()
@@ -113,11 +113,11 @@ def run():
         n.wait_for(lambda: 'BODY_MARKER' in text(preview))
         for _ in range(2):
             u.SendMessageW(hwnd, 0x8002, 122, 0)
-            n.wait_for(lambda: child(hwnd, 'FeatherPadTerminal'))
+            n.wait_for(lambda: child(hwnd, 'PlumeTxtTerminal'))
             time.sleep(.35)
             assert text(edit) == original and 'BODY_MARKER' in text(preview)
             u.SendMessageW(hwnd, 0x8002, 122, 0)
-            n.wait_for(lambda: not child(hwnd, 'FeatherPadTerminal'))
+            n.wait_for(lambda: not child(hwnd, 'PlumeTxtTerminal'))
             assert text(edit) == original and child(hwnd, 'SysTreeView32') == tree
         # The arrow is in the heading gutter (32 px text margin, first heading).
         clicked = None

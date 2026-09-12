@@ -233,7 +233,7 @@ fn changed_lines_preserve_both_versions() {
 #[test]
 fn watcher_tracks_replacements_and_recovery() {
     let dir = std::env::temp_dir().join(format!(
-        "featherpad-watch-{}-{:?}",
+        "plumetxt-watch-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));

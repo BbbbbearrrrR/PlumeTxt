@@ -45,12 +45,12 @@ def run():
     with large.open('wb') as file:
         file.write(b'padding\n' * (1100 * 1024))
         file.write('中文 LARGE_NEEDLE here\n'.encode())
-    proc = subprocess.Popen([str(t.n.b.ROOT / 'target/release/featherpad.exe'), str(root)])
+    proc = subprocess.Popen([str(t.n.b.ROOT / 'target/release/plumetxt.exe'), str(root)])
     try:
-        hwnd = t.n.wait_for(lambda: t.n.b.window_for(proc.pid, 'FeatherPad'))
+        hwnd = t.n.wait_for(lambda: t.n.b.window_for(proc.pid, 'PlumeTxt'))
         t.n.wait_for(lambda: t.child(hwnd, 'SysTreeView32'))
         find_command(hwnd)  # Find must work before any file has been selected.
-        panel = t.n.wait_for(lambda: t.child(hwnd, 'FeatherPadSearch'))
+        panel = t.n.wait_for(lambda: t.child(hwnd, 'PlumeTxtSearch'))
         edit, tree, status = [u.GetDlgItem(panel, n) for n in (1, 2, 3)]
         assert u.GetWindowLongW(tree, -16) & 0x8000
         set_query(edit, 'missing')
@@ -106,15 +106,15 @@ def run():
         t.n.wait_for(lambda: not t.modal(proc.pid))
         assert 'UNSAVED' in t.text(editor)
         u.PostMessageW(edit, 0x100, 0x1B, 0)
-        t.n.wait_for(lambda: not t.child(hwnd, 'FeatherPadSearch'))
+        t.n.wait_for(lambda: not t.child(hwnd, 'PlumeTxtSearch'))
         assert t.child(hwnd, 'SysTreeView32')
         u.SendMessageW(hwnd, 0x8002, 135, 0)
-        t.n.wait_for(lambda: t.child(hwnd, 'FeatherPadSearch'))
+        t.n.wait_for(lambda: t.child(hwnd, 'PlumeTxtSearch'))
         assert t.text(edit) == 'note'
         set_query(edit, 'nothing-here')
         t.n.wait_for(lambda: t.text(status).startswith('0 matches'), timeout=20)
         u.SendMessageW(hwnd, 0x8002, 128, 0)
-        assert not t.child(hwnd, 'FeatherPadSearch')
+        assert not t.child(hwnd, 'PlumeTxtSearch')
         assert b'UNSAVED' not in large.read_bytes()
     finally:
         proc.terminate(); proc.wait()

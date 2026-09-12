@@ -1,19 +1,21 @@
-# FeatherPad
+# PlumeTxt
+
+Previously named FeatherPad; this project is unrelated to the Linux Qt editor of that name.
 
 A small native Windows editor, Markdown preview, PDF reader, and integrated terminal. Written in Rust. English by default, with a black and cyan interface.
 
 ## Run
 
-Open `FeatherPad.exe`, drop a document onto the window, or pass a path:
+Open `PlumeTxt.exe`, drop a document onto the window, or pass a path:
 
 ```powershell
-.\FeatherPad.exe .\examples\welcome.md
-.\FeatherPad.exe "D:\Documents\paper.pdf"
+.\PlumeTxt.exe .\examples\welcome.md
+.\PlumeTxt.exe "D:\Documents\paper.pdf"
 ```
 
 Windows 10 version 1809 or later / Windows 11, x64. PDF export requires Microsoft Print to PDF and Print Spooler. No browser runtime or external PDF reader is needed.
 
-Keep the `runtime` folder beside `FeatherPad.exe` when moving or distributing the app; it contains the PDF text-search library and its licenses. This library loads on demand for searches.
+Keep the `runtime` folder beside `PlumeTxt.exe` when moving or distributing the app; it contains the PDF text-search library and its licenses. This library loads on demand for searches.
 
 ## Controls
 
@@ -52,7 +54,7 @@ Preview headings have a clickable disclosure arrow. Collapsing a heading hides i
 
 Opening a file normally keeps the single-file layout. Use Ctrl+Shift+O / **Open folder**, drop a folder onto the window, or pass a folder as the command-line argument to open a workspace. Its dark left file tree shows folders first, with compact text and seven high-contrast, distinct silhouettes for folders, archives, Markdown, PDF, images, code and other files. Icons are shared across rows and regenerated only when DPI changes; they do not depend on installed file associations. Drag the right divider to widen the file tree or PDF outline for long names. A cyan guide follows the pointer; document layout changes once on release to avoid tearing and repeated PDF rendering; neither directory panel has a horizontal scrollbar. Native hover tooltips are disabled. Subdirectories are read only when expanded; selecting a file uses the normal open path, including unsaved-change prompts and all supported viewers.
 
-Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-file-types.ps1` once to add **Open with FeatherPad** to Explorer's folder, folder background and drive context menus for the current user. On Windows 11, this classic menu entry is under **Show more options**. It opens the chosen directory as a workspace with the feather icon in the menu.
+Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-file-types.ps1` once to add **Open with PlumeTxt** to Explorer's folder, folder background and drive context menus for the current user. On Windows 11, this classic menu entry is under **Show more options**. It opens the chosen directory as a workspace with the feather icon in the menu.
 
 Use **Toggle file tree** / Ctrl+Shift+B to hide or show the file tree, and **Toggle PDF outline** / Ctrl+Shift+L to hide or show the PDF outline. Hidden panels retain their width and tree state.
 
@@ -76,11 +78,11 @@ Headings, emphasis, lists, tasks, quotes, code, tables, and link text are suppor
 
 ## Images and shortcuts
 
-Open an image directly with Ctrl+O or a command-line path to view it inside FeatherPad. The viewer fits the image to the window, supports wheel zoom and drag-to-pan, and uses Ctrl+0 to reset the view. Ctrl+E returns to the retained text document. Images are read-only. The terminal starts in the image's folder when creating a new session.
+Open an image directly with Ctrl+O or a command-line path to view it inside PlumeTxt. The viewer fits the image to the window, supports wheel zoom and drag-to-pan, and uses Ctrl+0 to reset the view. Ctrl+E returns to the retained text document. Images are read-only. The terminal starts in the image's folder when creating a new session.
 
 Dropping an image into an empty editor opens the viewer. In a saved Markdown document, dropping still inserts an attachment; hold Shift while dropping to open the viewer instead.
 
-In a Markdown document, paste a screenshot or a copied image with Ctrl+V. You can also copy one image file in Explorer and paste it, drop an image file onto the editor, or use Ctrl+Shift+I to choose one. FeatherPad saves an attachment into `<document-name>.assets` beside the Markdown file and inserts a relative Markdown link. An untitled document first opens Save as; cancelling creates no attachment. Move the Markdown file and its assets folder together. Save as does not relocate existing attachments.
+In a Markdown document, paste a screenshot or a copied image with Ctrl+V. You can also copy one image file in Explorer and paste it, drop an image file onto the editor, or use Ctrl+Shift+I to choose one. PlumeTxt saves an attachment into `<document-name>.assets` beside the Markdown file and inserts a relative Markdown link. An untitled document first opens Save as; cancelling creates no attachment. Move the Markdown file and its assets folder together. Save as does not relocate existing attachments.
 
 PNG/APNG, JPEG/JFIF, GIF, BMP/DIB, TIFF, ICO and JPEG XR (`.jxr`, `.wdp`, `.hdp`) are accepted through Windows Imaging Component. WebP, HEIC/HEIF and AVIF use the matching installed Windows codecs; import reports a clear error if the decoder is unavailable or the file is damaged. SVG and layered formats such as PSD are not supported.
 
@@ -124,7 +126,7 @@ Measured locally on 2026-09-12 (release build, one warm-cache run): 1 GiB first 
 
 ## PDF
 
-PDFs render inside FeatherPad using Windows.Data.Pdf. Pages scroll continuously. The outline reads local PDF bookmarks and falls back to page numbers. Visible pages and neighboring pages are rendered on demand.
+PDFs render inside PlumeTxt using Windows.Data.Pdf. Pages scroll continuously. The outline reads local PDF bookmarks and falls back to page numbers. Visible pages and neighboring pages are rendered on demand.
 
 The CPU raster cache is capped at 48 MiB, with up to 16 MiB of shared page textures per GPU reader; each page is capped at about 8 million pixels. These limits exclude system decoder memory, in-flight frames, and window buffers. PDF text search and match highlighting are available with Ctrl+F. Arbitrary PDF text selection, annotations, forms, and password entry are not implemented.
 
@@ -138,7 +140,7 @@ The integrated terminal uses Windows ConPTY and a VT parser. PowerShell starts w
 - Paste with Ctrl+V; drag to select and copy with Ctrl+Shift+C. Without a selection, copy captures the visible screen.
 - Use the wheel for up to 2,000 rows of scrollback.
 - Hiding the panel keeps the session alive. After `exit`, reopen the panel to start a new session.
-- Closing FeatherPad terminates its terminal session. This is a local interactive shell, not a sandbox.
+- Closing PlumeTxt terminates its terminal session. This is a local interactive shell, not a sandbox.
 
 Startup and terminal I/O run off the UI thread. Output is bounded and painting is double buffered. This is a basic terminal surface, not a complete VS Code terminal implementation; advanced terminal protocols and accessibility text providers are not yet implemented.
 
@@ -173,7 +175,7 @@ cargo test --locked
 cargo test --locked -- --include-ignored --test-threads=1
 ```
 
-The executable is `target/release/featherpad.exe`. Test output is written to `tmp/`. The root `FeatherPad.exe` is the packaged build. Feather assets are embedded in the executable.
+The executable is `target/release/plumetxt.exe`. Test output is written to `tmp/`. The root `PlumeTxt.exe` is the packaged build. Feather assets are embedded in the executable.
 
 ## Rendering and materials
 
@@ -181,22 +183,26 @@ PDF and image scaling, terminal text and the large-file overview use an on-deman
 
 Rendering starts only when a custom view paints. GPU textures are reused and capped at 16 MiB per view; PDF CPU rasters are capped at 48 MiB. Hidden custom views release their rendering buffers. A successful GPU frame releases the GDI viewport buffer. Hardware creation, resize or draw failure repaints through GDI immediately, with a five-second retry cooldown. A visible page set or image beyond the texture budget uses GDI until the source or view is reset, avoiding repeated texture eviction and upload. These limits exclude driver/device memory, window back buffers and decoder working memory. Hardware acceleration can increase process memory and is not guaranteed to outperform GDI for small static views.
 
-For troubleshooting or minimum graphics overhead, launch with `$env:FEATHERPAD_RENDERER = "gdi"`; remove that environment variable to restore hardware rendering. No dedicated GPU is required. Run `cargo test --bin featherpad --locked native_renderer_draws_reuses_and_recovers -- --ignored --nocapture` to compare the two paths locally and verify cached textures, resize, immediate fallback and resource release.
+For troubleshooting or minimum graphics overhead, launch with `$env:PLUMETXT_RENDERER = "gdi"`; remove that environment variable to restore hardware rendering. No dedicated GPU is required. Run `cargo test --bin plumetxt --locked native_renderer_draws_reuses_and_recovers -- --ignored --nocapture` to compare the two paths locally and verify cached textures, resize, immediate fallback and resource release.
 
 ## Windows Explorer file icons
 
-The 93 file icons use a cyan-blue feather, a distinct color and a format abbreviation (MD, TXT, PDF, JSX, TSX, H, HPP, JSONC, LOG, etc.), covering 96 extensions. Additional source/configuration formats open as text; icon registration does not add specialized parsers or viewers. After copying the release build to the root `FeatherPad.exe`, run:
+The 93 file icons use a cyan-blue feather, a distinct color and a format abbreviation (MD, TXT, PDF, JSX, TSX, H, HPP, JSONC, LOG, etc.), covering 96 extensions. Additional source/configuration formats open as text; icon registration does not add specialized parsers or viewers. After copying the release build to the root `PlumeTxt.exe`, run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-file-types.ps1
 ```
 
-Registration is per user and verifies all 93 embedded icons first. Explorer icons are installed under `%LOCALAPPDATA%\FeatherPad\FileIcons` using content-hashed names so an updated design receives a new cache key. Registration then queries the effective Windows associations and reports legacy icons still in use. In Windows Settings > Apps > Default apps > FeatherPad, choose the extensions you want it to open. Select the named format entry, such as `FeatherPad (PDF)`, rather than the legacy `FeatherPad.exe` entry (scroll the choice list if needed). Extension-specific auto associations pointing to this exact executable also get their icon repaired. Registration does not overwrite protected Windows default choices or other applications' defaults. Keep the executable at its registered path; rerun registration after moving it.
+Registration is per user and verifies all 93 embedded icons first. Explorer icons are installed under `%LOCALAPPDATA%\PlumeTxt\FileIcons` using content-hashed names so an updated design receives a new cache key. Registration then queries the effective Windows associations and reports legacy icons still in use. In Windows Settings > Apps > Default apps > PlumeTxt, choose the extensions you want it to open. Select the named format entry, such as `PlumeTxt (PDF)`, rather than the legacy `PlumeTxt.exe` entry (scroll the choice list if needed). Extension-specific auto associations pointing to this exact executable also get their icon repaired. Registration does not overwrite protected Windows default choices or other applications' defaults. Keep the executable at its registered path; rerun registration after moving it.
 
-Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-shell-icons.ps1` to register and verify the actual Shell-returned MD and TOML icons against the installed artwork. This requires those two formats already associated with FeatherPad. The test writes example files and diagnostic PNGs under `tmp/shell-icon-check/`, and allows only one RGB level of native alpha-rounding difference.
+Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-shell-icons.ps1` to register and verify the actual Shell-returned MD and TOML icons against the installed artwork. This requires those two formats already associated with PlumeTxt. The test writes example files and diagnostic PNGs under `tmp/shell-icon-check/`, and allows only one RGB level of native alpha-rounding difference.
 
 ## Printing images and PDFs
 
 Press Ctrl+P while viewing an image or PDF, or choose **Print image or PDF** in the command panel. The Windows print dialog provides printer selection, paper/orientation settings, copies and PDF page ranges. Pages fit the printable area without cropping; transparent images print on white. Images print the displayed first frame. PDF printing rasterizes one page at a time using a bounded buffer (target 300 DPI, reduced for very large pages). Rendering/spooling runs in the background. **Cancel print** stops at the next page boundary; already spooled pages may require cancellation in the Windows print queue. Markdown PDF export uses Ctrl+Shift+E; Ctrl+P is reserved for printing images and PDFs.
 
 PDFs open centered with margins at a reading scale showing about three quarters of a page vertically, limited by the available width to avoid horizontal overflow. The default adapts to panel/window resizing until you zoom manually. Ctrl+Shift+0 restores whole-page reading; Ctrl+0 fits the page width.
+
+### Upgrading from FeatherPad
+
+Use `PlumeTxt.exe` with the existing `runtime` folder. Run `scripts/register-file-types.ps1` again to register the new name. It redirects legacy FeatherPad associations only when they point to the former executable in this same directory; existing protected default selections remain unchanged. Old executable backups and historical benchmark records retain their original names. `PLUMETXT_RENDERER` replaces `FEATHERPAD_RENDERER`; the old variable remains a fallback for existing launch scripts.

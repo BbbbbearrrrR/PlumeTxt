@@ -126,7 +126,7 @@ struct State {
 pub struct Reader(pub HWND);
 impl Reader {
     pub unsafe fn create(parent: HWND, font: HFONT, small: HFONT) -> Self {
-        let class = wide("FeatherPadReader");
+        let class = wide("PlumeTxtReader");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: GetModuleHandleW(null()),

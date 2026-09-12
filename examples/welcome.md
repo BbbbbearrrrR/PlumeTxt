@@ -1,4 +1,4 @@
-# FeatherPad
+# PlumeTxt
 
 A quiet place to write, read, and work.
 
@@ -21,7 +21,7 @@ PDF files open here, with continuous scrolling and an outline.
 
 ```rust
 fn main() {
-    println!("Hello, FeatherPad!");
+    println!("Hello, PlumeTxt!");
 }
 ```
 

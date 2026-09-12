@@ -8,4 +8,4 @@ PDFium 155.0.8044.0, Windows x64, without JavaScript or XFA.
 - API: https://pdfium.googlesource.com/pdfium/+/refs/heads/main/public/fpdf_text.h
 - Redistribution notices: `LICENSE` and every file in `licenses/`.
 
-Keep this directory beside FeatherPad.exe under `runtime/pdfium`. The build copies the runtime and licenses into the Cargo output directory. It loads only during PDF text searches and unloads afterward; the existing Windows renderer remains in use. Updating it requires replacing the binary and accompanying notices, checking the new hash, and rerunning PDF search tests.
+Keep this directory beside PlumeTxt.exe under `runtime/pdfium`. The build copies the runtime and licenses into the Cargo output directory. It loads only during PDF text searches and unloads afterward; the existing Windows renderer remains in use. Updating it requires replacing the binary and accompanying notices, checking the new hash, and rerunning PDF search tests.

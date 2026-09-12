@@ -89,7 +89,7 @@ unsafe fn error(hwnd: HWND, text: &str) {
     MessageBoxW(
         hwnd,
         wide(text).as_ptr(),
-        wide("FeatherPad").as_ptr(),
+        wide("PlumeTxt").as_ptr(),
         MB_OK | MB_ICONERROR,
     );
 }
@@ -312,7 +312,7 @@ impl App {
             let range: ITextRange2 = doc.Range(start, end).ok()?.cast().ok()?;
             let url = range.GetURL().ok()?.to_string();
             url.trim_matches('"')
-                .strip_prefix("featherpad-fold:")?
+                .strip_prefix("plumetxt-fold:")?
                 .parse::<usize>()
                 .ok()
         })();
@@ -684,7 +684,7 @@ impl App {
         SetWindowTextW(
             self.hwnd,
             wide(&format!(
-                "{}{}{} — FeatherPad",
+                "{}{}{} — PlumeTxt",
                 if dirty { "* " } else { "" },
                 name,
                 if self.large.is_some() {
@@ -946,7 +946,7 @@ impl App {
         self.workspace_width = (self.workspace_width as i64 * dpi as i64 / self.dpi as i64) as i32;
         self.terminal_width = (self.terminal_width as i64 * dpi as i64 / self.dpi as i64) as i32;
         self.dpi = dpi;
-        SetPropW(self.hwnd, wide("FeatherPadDpi").as_ptr(), dpi as usize as _);
+        SetPropW(self.hwnd, wide("PlumeTxtDpi").as_ptr(), dpi as usize as _);
         let fonts = theme::Fonts::at_dpi(dpi);
         theme::replace_fonts(self.hwnd, &self.fonts, &fonts);
         if let Some(workspace) = &mut self.workspace {
@@ -1055,7 +1055,7 @@ impl App {
         match MessageBoxW(
             self.hwnd,
             wide("Save changes?").as_ptr(),
-            wide("FeatherPad").as_ptr(),
+            wide("PlumeTxt").as_ptr(),
             MB_YESNOCANCEL | MB_ICONQUESTION,
         ) {
             IDYES => {
@@ -2233,7 +2233,7 @@ fn export_chunk_document(
     base: Option<&Path>,
 ) -> Result<(), String> {
     let snapshot = std::env::temp_dir().join(format!(
-        "featherpad-export-{}-{}.txt",
+        "plumetxt-export-{}-{}.txt",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2260,7 +2260,7 @@ fn export_sections(
         time::{Duration, Instant},
     };
     let temporary = output.with_file_name(format!(
-        ".featherpad-{}-{}.pdf",
+        ".plumetxt-{}-{}.pdf",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2331,7 +2331,7 @@ unsafe fn export_pdf(
         }
         let result = (|| {
             let destination = path_wide(output);
-            let title = wide("FeatherPad Markdown");
+            let title = wide("PlumeTxt Markdown");
             let info = DOCINFOW {
                 cbSize: size_of::<DOCINFOW>() as i32,
                 lpszDocName: title.as_ptr(),
@@ -2440,7 +2440,7 @@ unsafe fn draw_terminal_button(draw: &DRAWITEMSTRUCT) {
     // Keep this path independent of App so every paint supplies the dark background.
     theme::fill(draw.hDC, draw.rcItem, theme::SURFACE);
     let d = |v| theme::px(draw.hwndItem, v);
-    let hovered = !GetPropW(draw.hwndItem, wide("FeatherPadHover").as_ptr()).is_null();
+    let hovered = !GetPropW(draw.hwndItem, wide("PlumeTxtHover").as_ptr()).is_null();
     let pressed = draw.itemState & ODS_SELECTED != 0;
     let focused = draw.itemState & ODS_FOCUS != 0;
     let mut surface = draw.rcItem;
@@ -3027,7 +3027,7 @@ pub fn run() {
             64,
             LR_SHARED,
         ) as HICON;
-        let class = wide("FeatherPadWindow");
+        let class = wide("PlumeTxtWindow");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
@@ -3044,7 +3044,7 @@ pub fn run() {
         let hwnd = CreateWindowExW(
             WS_EX_ACCEPTFILES,
             class.as_ptr(),
-            wide("FeatherPad").as_ptr(),
+            wide("PlumeTxt").as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -3343,7 +3343,7 @@ fn native_markdown_pdf_roundtrip() {
         let source = include_str!("../examples/welcome.md");
         set_rtf(control, &markdown::rtf(source, 9000)).unwrap();
         let rendered = text(control);
-        assert!(rendered.contains("FeatherPad"), "{rendered}");
+        assert!(rendered.contains("PlumeTxt"), "{rendered}");
         assert!(rendered.contains("Hello, world"));
         assert!(!rendered.contains("**加粗**"));
         DestroyWindow(control);
@@ -3415,7 +3415,7 @@ fn native_markdown_pdf_roundtrip() {
 #[test]
 #[ignore = "Requires Windows RichEdit and Microsoft Print to PDF"]
 fn native_region_export_includes_whole_document_and_unsaved_edits() {
-    let root = std::env::temp_dir().join(format!("featherpad-region-pdf-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("plumetxt-region-pdf-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let input = root.join("input.md");
     let output = root.join("output.pdf");
@@ -3486,7 +3486,7 @@ fn native_preview_heading_arrow_has_actionable_link() {
         let link: ITextRange2 = range.cast().unwrap();
         assert_eq!(
             link.GetURL().unwrap().to_string().trim_matches('"'),
-            "featherpad-fold:0"
+            "plumetxt-fold:0"
         );
         set_rtf(
             control,
@@ -3505,7 +3505,7 @@ fn native_startup_background_is_dark_before_app_is_ready() {
     unsafe {
         let library = LoadLibraryW(wide("Msftedit.dll").as_ptr());
         let instance = GetModuleHandleW(null());
-        let name = wide("FeatherPadStartupPaintTest");
+        let name = wide("PlumeTxtStartupPaintTest");
         let class = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance,

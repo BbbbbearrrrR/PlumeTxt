@@ -126,7 +126,7 @@ fn formatted(
                         } else {
                             9662
                         };
-                        let _ = write!(out, "{{\\field{{\\*\\fldinst HYPERLINK \"featherpad-fold:{}\"}}{{\\fldrslt \\u{}?}}}} ", range.start, arrow);
+                        let _ = write!(out, "{{\\field{{\\*\\fldinst HYPERLINK \"plumetxt-fold:{}\"}}{{\\fldrslt \\u{}?}}}} ", range.start, arrow);
                     }
                 }
                 Tag::Strong => out.push_str("{\\b "),
@@ -228,15 +228,15 @@ fn heading_folds_respect_hierarchy_and_leave_export_complete() {
     assert!(!view.contains("PARENT_BODY"));
     assert!(!view.contains("Child"));
     assert!(view.contains("Next") && view.contains("NEXT_BODY"));
-    assert!(view.contains("featherpad-fold:0") && view.contains("\\u9656?"));
+    assert!(view.contains("plumetxt-fold:0") && view.contains("\\u9656?"));
     let child = source.find("## Child").unwrap();
     let view = folding_preview(source, 9000, None, &BTreeSet::from([child]));
     assert!(view.contains("PARENT_BODY") && !view.contains("CHILD_BODY"));
     assert!(rtf(source, 9000).contains("CHILD_BODY"));
-    assert!(!rtf(source, 9000).contains("featherpad-fold:"));
+    assert!(!rtf(source, 9000).contains("plumetxt-fold:"));
     assert!(
         !folding_preview("```md\n# Fake\n```", 9000, None, &BTreeSet::new())
-            .contains("featherpad-fold:")
+            .contains("plumetxt-fold:")
     );
     let setext = folding_preview(
         "Heading\n=======\n\nHIDDEN\n\nOther\n=====\nSHOWN",

@@ -45,7 +45,7 @@ macro_rules! api {
                 if folder.file_name().is_some_and(|n| n == "deps") { folder = folder.parent().ok_or("Missing runtime directory")?; }
                 let path = crate::ui::path_wide(&folder.join("runtime/pdfium/pdfium.dll"));
                 let library = LoadLibraryExW(path.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-                if library.is_null() { return Err("PDF search runtime missing · Keep the runtime folder beside FeatherPad.exe".into()); }
+                if library.is_null() { return Err("PDF search runtime missing · Keep the runtime folder beside PlumeTxt.exe".into()); }
                 let loaded = (|| Ok(Self { library, $( $name: std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn($($arg),*) -> $ret>(GetProcAddress(library, concat!(stringify!($name), "\0").as_ptr()).ok_or("Incompatible PDF search runtime")?), )* }))();
                 if loaded.is_err() { FreeLibrary(library); }
                 loaded

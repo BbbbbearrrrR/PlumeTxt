@@ -49,7 +49,7 @@ struct State {
 pub struct Terminal(pub HWND);
 impl Terminal {
     pub unsafe fn create(parent: HWND, cwd: &Path) -> Self {
-        let name = wide("FeatherPadTerminal");
+        let name = wide("PlumeTxtTerminal");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: GetModuleHandleW(null()),

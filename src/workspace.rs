@@ -388,7 +388,7 @@ pub unsafe fn choose_folder(parent: HWND) -> Option<PathBuf> {
 #[ignore = "Requires Windows native controls"]
 fn native_tree_loads_only_expanded_directories() {
     use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
-    let root = std::env::temp_dir().join(format!("featherpad-workspace-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("plumetxt-workspace-{}", std::process::id()));
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(root.join("note.md"), "# Note").unwrap();
     std::fs::write(root.join("sub/deep.txt"), "nested").unwrap();
@@ -415,7 +415,7 @@ fn native_tree_loads_only_expanded_directories() {
         assert_ne!(images, 0);
         assert_eq!(ImageList_GetImageCount(images as _), 7);
         for dpi in [96, 144, 192, 96] {
-            SetPropW(parent, wide("FeatherPadDpi").as_ptr(), dpi as usize as _);
+            SetPropW(parent, wide("PlumeTxtDpi").as_ptr(), dpi as usize as _);
             tree.update_icons().unwrap();
             let (mut width, mut height) = (0, 0);
             assert_ne!(

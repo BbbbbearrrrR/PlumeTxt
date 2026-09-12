@@ -239,7 +239,7 @@ pub struct Divider {
 impl Divider {
     pub unsafe fn new(parent: HWND, x: i32) -> Self {
         use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-        let name = wide("FeatherPadDivider");
+        let name = wide("PlumeTxtDivider");
         RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(divider_proc),
             hInstance: GetModuleHandleW(null()),
@@ -443,7 +443,7 @@ pub fn scale(value: i32, dpi: u32) -> i32 {
 }
 pub unsafe fn dpi(hwnd: HWND) -> u32 {
     let root = GetAncestor(hwnd, GA_ROOT);
-    let stored = GetPropW(root, wide("FeatherPadDpi").as_ptr()) as usize;
+    let stored = GetPropW(root, wide("PlumeTxtDpi").as_ptr()) as usize;
     if stored > 0 {
         stored as u32
     } else {
@@ -502,8 +502,8 @@ unsafe extern "system" fn button_proc(
             invalidate(GetParent(hwnd));
         }
         WM_MOUSEMOVE => {
-            if GetPropW(hwnd, wide("FeatherPadHover").as_ptr()).is_null() {
-                SetPropW(hwnd, wide("FeatherPadHover").as_ptr(), 1usize as _);
+            if GetPropW(hwnd, wide("PlumeTxtHover").as_ptr()).is_null() {
+                SetPropW(hwnd, wide("PlumeTxtHover").as_ptr(), 1usize as _);
                 let mut track = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -515,12 +515,12 @@ unsafe extern "system" fn button_proc(
             }
         }
         windows_sys::Win32::UI::Controls::WM_MOUSELEAVE | WM_KILLFOCUS => {
-            RemovePropW(hwnd, wide("FeatherPadHover").as_ptr());
+            RemovePropW(hwnd, wide("PlumeTxtHover").as_ptr());
             invalidate(hwnd);
             invalidate(GetParent(hwnd));
         }
         WM_NCDESTROY => {
-            RemovePropW(hwnd, wide("FeatherPadHover").as_ptr());
+            RemovePropW(hwnd, wide("PlumeTxtHover").as_ptr());
             RemoveWindowSubclass(hwnd, Some(button_proc), 110);
         }
         _ => (),

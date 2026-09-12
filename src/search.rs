@@ -416,7 +416,7 @@ impl Drop for State {
 pub struct Search(pub HWND);
 impl Search {
     pub unsafe fn create(parent: HWND, root: PathBuf, font: HFONT) -> Self {
-        let name = wide("FeatherPadSearch");
+        let name = wide("PlumeTxtSearch");
         RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: GetModuleHandleW(null()),
@@ -885,7 +885,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
 #[test]
 fn streaming_search_offsets_limits_and_cancellation() {
     use crate::document::{decode, encode, Chunk};
-    let root = std::env::temp_dir().join(format!("featherpad-search-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("plumetxt-search-{}", std::process::id()));
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join(".git/hidden.txt"), "needle").unwrap();
     std::fs::write(root.join("binary.bin"), b"\0needle").unwrap();

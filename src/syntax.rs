@@ -510,7 +510,7 @@ impl Highlighter {
     }
     pub unsafe fn update(&mut self, hwnd: HWND, path: Option<&Path>) {
         if windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd
-            || !GetPropW(hwnd, wide("FeatherPadComposing").as_ptr()).is_null()
+            || !GetPropW(hwnd, wide("PlumeTxtComposing").as_ptr()).is_null()
         {
             return;
         }
@@ -790,7 +790,7 @@ unsafe extern "system" fn editor_proc(
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
     if msg == WM_NCDESTROY {
         RemoveWindowSubclass(hwnd, Some(editor_proc), 903);
-        RemovePropW(hwnd, wide("FeatherPadComposing").as_ptr());
+        RemovePropW(hwnd, wide("PlumeTxtComposing").as_ptr());
         if data != 0 {
             drop(Box::from_raw(
                 data as *mut windows::Win32::UI::Controls::RichEdit::ITextServices,
@@ -799,10 +799,10 @@ unsafe extern "system" fn editor_proc(
         return DefSubclassProc(hwnd, msg, wp, lp);
     }
     if msg == WM_IME_STARTCOMPOSITION {
-        SetPropW(hwnd, wide("FeatherPadComposing").as_ptr(), 1usize as _);
+        SetPropW(hwnd, wide("PlumeTxtComposing").as_ptr(), 1usize as _);
     }
     if msg == WM_IME_ENDCOMPOSITION {
-        RemovePropW(hwnd, wide("FeatherPadComposing").as_ptr());
+        RemovePropW(hwnd, wide("PlumeTxtComposing").as_ptr());
         SetTimer(GetAncestor(hwnd, GA_ROOT), 9, 80, None);
     }
     if msg == WM_PASTE {
@@ -942,7 +942,7 @@ unsafe fn block_caret(hwnd: HWND) {
     );
     // A selection has an active end, not an insertion point at its start.
     // Leave that edge under RichEdit's control while dragging or using Shift+arrows.
-    if start == end && GetPropW(hwnd, wide("FeatherPadComposing").as_ptr()).is_null() {
+    if start == end && GetPropW(hwnd, wide("PlumeTxtComposing").as_ptr()).is_null() {
         use windows::Win32::UI::Controls::RichEdit::{
             tomClientCoord, tomCluster, tomConstants, tomStart,
         };

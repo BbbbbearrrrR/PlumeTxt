@@ -50,13 +50,13 @@ def run():
     pdf = root / '搜索.pdf'; make_pdf(pdf)
     (root / 'note.txt').write_text('Needle in workspace', encoding='utf-8')
     for standalone in (True, False):
-        proc = subprocess.Popen([str(t.n.b.ROOT / 'target/release/featherpad.exe'), str(pdf if standalone else root)])
+        proc = subprocess.Popen([str(t.n.b.ROOT / 'target/release/plumetxt.exe'), str(pdf if standalone else root)])
         try:
-            hwnd = t.n.wait_for(lambda: t.n.b.window_for(proc.pid, 'FeatherPad'))
+            hwnd = t.n.wait_for(lambda: t.n.b.window_for(proc.pid, 'PlumeTxt'))
             if standalone: t.n.wait_for(lambda: page_status(hwnd, 1))
             else: t.n.wait_for(lambda: t.child(hwnd, 'SysTreeView32'))
             s.find_command(hwnd, workspace=not standalone)
-            panel = t.n.wait_for(lambda: t.child(hwnd, 'FeatherPadSearch'))
+            panel = t.n.wait_for(lambda: t.child(hwnd, 'PlumeTxtSearch'))
             edit, tree, status = [u.GetDlgItem(panel, n) for n in (1, 2, 3)]
             s.set_query(edit, 'needle')
             expected = 2 if standalone else 3
@@ -71,16 +71,16 @@ def run():
             assert group and second
             u.SendMessageW(tree, 0x110B, 9, second)
             u.PostMessageW(tree, 0x100, 0x0D, 0)
-            reader = t.n.wait_for(lambda: t.child(hwnd, 'FeatherPadReader'))
+            reader = t.n.wait_for(lambda: t.child(hwnd, 'PlumeTxtReader'))
             t.n.wait_for(lambda: scroll_position(reader) > 0, timeout=20)
-            assert t.child(hwnd, 'FeatherPadReader') and not t.n.editors(hwnd)
+            assert t.child(hwnd, 'PlumeTxtReader') and not t.n.editors(hwnd)
             time.sleep(.5)
             if standalone and '--capture' in __import__('sys').argv:
                 from PIL import ImageGrab
                 ImageGrab.grab(window=hwnd).save(root / 'hit.png')
             u.PostMessageW(edit, 0x100, 0x1B, 0)
-            t.n.wait_for(lambda: not t.child(hwnd, 'FeatherPadSearch'))
-            assert t.child(hwnd, 'FeatherPadReader')
+            t.n.wait_for(lambda: not t.child(hwnd, 'PlumeTxtSearch'))
+            assert t.child(hwnd, 'PlumeTxtReader')
         finally:
             proc.terminate(); proc.wait()
     print('PASS: standalone PDF Find, workspace PDF search before opening a file, page jump and rotated/cropped text')

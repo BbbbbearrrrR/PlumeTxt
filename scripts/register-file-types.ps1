@@ -1,13 +1,14 @@
 $ErrorActionPreference = 'Stop'
-$appPath = (Resolve-Path -LiteralPath "$PSScriptRoot/../FeatherPad.exe").Path
+$appPath = (Resolve-Path -LiteralPath "$PSScriptRoot/../PlumeTxt.exe").Path
+$oldAppPath = [System.IO.Path]::GetFullPath("$PSScriptRoot/../FeatherPad.exe")
 $types = Import-Csv -LiteralPath "$PSScriptRoot/../assets/file-types.tsv" -Delimiter "`t"
 
-if (-not ('FeatherPadFileIcons' -as [type])) {
+if (-not ('PlumeTxtFileIcons' -as [type])) {
     Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-public static class FeatherPadFileIcons {
+public static class PlumeTxtFileIcons {
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     public static extern uint ExtractIconEx(string file, int index, out IntPtr large, out IntPtr small, uint count);
     [DllImport("user32.dll")]
@@ -24,11 +25,11 @@ public static class FeatherPadFileIcons {
 foreach ($type in $types) {
     $large = [IntPtr]::Zero
     $small = [IntPtr]::Zero
-    $count = [FeatherPadFileIcons]::ExtractIconEx($appPath, -[int]$type.id, [ref]$large, [ref]$small, 1)
+    $count = [PlumeTxtFileIcons]::ExtractIconEx($appPath, -[int]$type.id, [ref]$large, [ref]$small, 1)
     $valid = $count -gt 0 -and $large -ne [IntPtr]::Zero -and $small -ne [IntPtr]::Zero
-    if ($large -ne [IntPtr]::Zero) { [void][FeatherPadFileIcons]::DestroyIcon($large) }
-    if ($small -ne [IntPtr]::Zero) { [void][FeatherPadFileIcons]::DestroyIcon($small) }
-    if (-not $valid) { throw "Missing embedded icon for $($type.label). Build and package FeatherPad first." }
+    if ($large -ne [IntPtr]::Zero) { [void][PlumeTxtFileIcons]::DestroyIcon($large) }
+    if ($small -ne [IntPtr]::Zero) { [void][PlumeTxtFileIcons]::DestroyIcon($small) }
+    if (-not $valid) { throw "Missing embedded icon for $($type.label). Build and package PlumeTxt first." }
 }
 
 function Set-RegistryText($path, $name, $value) {
@@ -37,14 +38,22 @@ function Set-RegistryText($path, $name, $value) {
     finally { $key.Dispose() }
 }
 
-$capabilities = 'Software\FeatherPad\Capabilities'
-Set-RegistryText $capabilities 'ApplicationName' 'FeatherPad'
+# Redirect old IDs only when they belong to this exact installation.
+function Test-OldCommand($path) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$path\shell\open\command")
+    if (-not $key) { return $false }
+    try { return $key.GetValue('') -eq ('"{0}" "%1"' -f $oldAppPath) }
+    finally { $key.Dispose() }
+}
+
+$capabilities = 'Software\PlumeTxt\Capabilities'
+Set-RegistryText $capabilities 'ApplicationName' 'PlumeTxt'
 Set-RegistryText $capabilities 'ApplicationDescription' 'Markdown editor, PDF and image viewer'
 Set-RegistryText $capabilities 'ApplicationIcon' ('"{0}",-1' -f $appPath)
 $registered = 0
 $iconPaths = @{}
 # A content-addressed ICO path gives Explorer a fresh cache key after an update.
-$iconDirectory = Join-Path $env:LOCALAPPDATA 'FeatherPad\FileIcons'
+$iconDirectory = Join-Path $env:LOCALAPPDATA 'PlumeTxt\FileIcons'
 [void][System.IO.Directory]::CreateDirectory($iconDirectory)
 foreach ($type in $types) {
     $sourceIcon = Join-Path "$PSScriptRoot/../assets/file-icons" ($type.label.ToLowerInvariant() + '.ico')
@@ -59,13 +68,22 @@ foreach ($type in $types) {
     $icon = '"{0}",0' -f $installedIcon
     $iconPaths[$type.id] = $icon
     foreach ($extension in $type.extensions.Split(' ')) {
-        $progId = "FeatherPad.$extension"
+        $progId = "PlumeTxt.$extension"
         $path = "Software\Classes\$progId"
         Set-RegistryText $path '' ("{0} document" -f $type.name)
         Set-RegistryText "$path\DefaultIcon" '' $icon
         Set-RegistryText "$path\shell\open\command" '' ('"{0}" "%1"' -f $appPath)
-        Set-RegistryText "$path\Application" 'ApplicationName' ("FeatherPad ({0})" -f $type.label)
+        Set-RegistryText "$path\Application" 'ApplicationName' ("PlumeTxt ({0})" -f $type.label)
         Set-RegistryText "$path\Application" 'ApplicationIcon' $icon
+        foreach ($oldId in @("FeatherPad.$extension", "${extension}_auto_file")) {
+            $oldKey = "Software\Classes\$oldId"
+            if (Test-OldCommand $oldKey) {
+                Set-RegistryText "$oldKey\shell\open\command" '' ('"{0}" "%1"' -f $appPath)
+                Set-RegistryText "$oldKey\DefaultIcon" '' $icon
+                Set-RegistryText "$oldKey\Application" 'ApplicationName' ("PlumeTxt ({0})" -f $type.label)
+                Set-RegistryText "$oldKey\Application" 'ApplicationIcon' $icon
+            }
+        }
         # Explorer can retain an extension-specific auto ProgID after Open with.
         # Only repair its icon when it still opens this exact executable.
         $legacy = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Classes\${extension}_auto_file\shell\open\command")
@@ -82,17 +100,39 @@ foreach ($type in $types) {
         $registered++
     }
 }
-Set-RegistryText 'Software\RegisteredApplications' 'FeatherPad' $capabilities
+Set-RegistryText 'Software\RegisteredApplications' 'PlumeTxt' $capabilities
+$oldApplication = 'Software\Classes\Applications\FeatherPad.exe'
+if (Test-OldCommand $oldApplication) {
+    Set-RegistryText "$oldApplication\shell\open\command" '' ('"{0}" "%1"' -f $appPath)
+    Set-RegistryText $oldApplication 'FriendlyAppName' 'PlumeTxt'
+}
+$oldCapabilities = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\FeatherPad\Capabilities')
+if ($oldCapabilities) {
+    try { $owned = $oldCapabilities.GetValue('ApplicationIcon') -eq ('"{0}",-1' -f $oldAppPath) }
+    finally { $oldCapabilities.Dispose() }
+    if ($owned) {
+        $apps = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\RegisteredApplications', $true)
+        try { if ($apps) { $apps.DeleteValue('FeatherPad', $false) } }
+        finally { if ($apps) { $apps.Dispose() } }
+    }
+}
 # Reuse the application's folder argument for Explorer workspace entry points.
 foreach ($entry in @(
     @{ Class = 'Directory'; Argument = '%1' },
     @{ Class = 'Directory\Background'; Argument = '%V' },
     @{ Class = 'Drive'; Argument = '%1' }
 )) {
-    $verb = "Software\Classes\$($entry.Class)\shell\FeatherPad"
+    $verb = "Software\Classes\$($entry.Class)\shell\PlumeTxt"
+    $oldVerb = "Software\Classes\$($entry.Class)\shell\FeatherPad"
+    $oldCommand = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$oldVerb\command")
+    if ($oldCommand) {
+        try { $owned = $oldCommand.GetValue('') -in @(('"{0}" "{1}\."' -f $oldAppPath, $entry.Argument), ('"{0}" "{1}\."' -f $appPath, $entry.Argument)) }
+        finally { $oldCommand.Dispose() }
+        if ($owned) { $verb = $oldVerb }
+    }
     # Appending \. keeps a drive root's trailing slash away from the closing quote.
     $folderCommand = '"{0}" "{1}\."' -f $appPath, $entry.Argument
-    Set-RegistryText $verb '' 'Open with FeatherPad'
+    Set-RegistryText $verb '' 'Open with PlumeTxt'
     Set-RegistryText $verb 'Icon' ('"{0}",-1' -f $appPath)
     Set-RegistryText "$verb\command" '' $folderCommand
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$verb\command")
@@ -100,23 +140,23 @@ foreach ($entry in @(
         if ($key.GetValue('') -ne $folderCommand) { throw "Folder menu registration failed: $($entry.Class)" }
     } finally { $key.Dispose() }
 }
-[FeatherPadFileIcons]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
-Write-Output 'Registered Open with FeatherPad for folders, folder backgrounds and drives.'
+[PlumeTxtFileIcons]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+Write-Output 'Registered Open with PlumeTxt for folders, folder backgrounds and drives.'
 Write-Output "Verified $($types.Count) embedded icons; registered $registered extensions for the current user."
 foreach ($type in $types) {
     foreach ($extension in $type.extensions.Split(' ')) {
         $command = [System.Text.StringBuilder]::new(2048)
         $length = [uint32]$command.Capacity
-        $result = [FeatherPadFileIcons]::AssocQueryString(0, 2, ".$extension", 'open', $command, [ref]$length)
+        $result = [PlumeTxtFileIcons]::AssocQueryString(0, 2, ".$extension", 'open', $command, [ref]$length)
         if ($result -ne 0 -or $command.ToString() -ne $appPath) { continue }
         $actual = [System.Text.StringBuilder]::new(2048)
         $length = [uint32]$actual.Capacity
-        $result = [FeatherPadFileIcons]::AssocQueryString(0, 15, ".$extension", $null, $actual, [ref]$length)
+        $result = [PlumeTxtFileIcons]::AssocQueryString(0, 15, ".$extension", $null, $actual, [ref]$length)
         $expected = $iconPaths[$type.id]
         if ($result -eq 0 -and $actual.ToString() -eq $expected) {
             Write-Output ".$extension : type icon active"
         } else {
-            Write-Warning ".$extension : still using a legacy icon. Choose 'FeatherPad ($($type.label))' in Default apps, not 'FeatherPad.exe'."
+            Write-Warning ".$extension : still using a legacy icon. Choose 'PlumeTxt ($($type.label))' in Default apps, not 'PlumeTxt.exe'."
         }
     }
 }

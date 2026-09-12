@@ -184,7 +184,7 @@ impl Chunk {
         use std::io::{Seek, SeekFrom};
         use std::os::windows::fs::OpenOptionsExt;
         let temp = destination.with_file_name(format!(
-            ".featherpad-{}-{}.tmp",
+            ".plumetxt-{}-{}.tmp",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -236,7 +236,7 @@ impl Chunk {
 
 #[test]
 fn region_edits_preserve_surrounding_bytes_and_reject_external_changes() {
-    let root = std::env::temp_dir().join(format!("featherpad-region-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("plumetxt-region-{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
     let path = root.join("source.txt");
     let copy = root.join("copy.txt");
@@ -409,7 +409,7 @@ pub fn fingerprint(bytes: &[u8]) -> u64 {
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temp = path.with_file_name(format!(
-        ".featherpad-{}-{}.tmp",
+        ".plumetxt-{}-{}.tmp",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -467,7 +467,7 @@ fn encoding_and_safe_save() {
     }
     assert!(decode(&[0xff]).is_err());
     assert!(decode(b"a\0b").is_err());
-    let path = std::env::temp_dir().join(format!("featherpad-test-{}.txt", std::process::id()));
+    let path = std::env::temp_dir().join(format!("plumetxt-test-{}.txt", std::process::id()));
     atomic_write(&path, b"first").unwrap();
     atomic_write(&path, b"second").unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"second");

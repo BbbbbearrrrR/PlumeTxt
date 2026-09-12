@@ -40,7 +40,7 @@ impl Palette {
         items: Vec<Command>,
         dispatch: u32,
     ) -> Self {
-        let name = wide("FeatherPadCommands");
+        let name = wide("PlumeTxtCommands");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: GetModuleHandleW(null()),

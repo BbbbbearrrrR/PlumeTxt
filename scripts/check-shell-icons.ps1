@@ -1,11 +1,11 @@
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/register-file-types.ps1"
 Add-Type -AssemblyName System.Drawing
-if (-not ('FeatherPadShellCheck' -as [type])) {
+if (-not ('PlumeTxtShellCheck' -as [type])) {
     Add-Type @'
 using System;
 using System.Runtime.InteropServices;
-public static class FeatherPadShellCheck {
+public static class PlumeTxtShellCheck {
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct FileInfo {
         public IntPtr icon;
@@ -26,15 +26,15 @@ foreach ($extension in 'md', 'toml') {
     $expectedPath = $iconPaths[$type.id].Substring(1).Split('"')[0]
     $file = Join-Path $outputDirectory "example.$extension"
     if (-not (Test-Path -LiteralPath $file)) { [System.IO.File]::WriteAllText($file, '') }
-    $info = New-Object FeatherPadShellCheck+FileInfo
-    $result = [FeatherPadShellCheck]::SHGetFileInfo($file, 0, [ref]$info, [System.Runtime.InteropServices.Marshal]::SizeOf($info), 0x100)
+    $info = New-Object PlumeTxtShellCheck+FileInfo
+    $result = [PlumeTxtShellCheck]::SHGetFileInfo($file, 0, [ref]$info, [System.Runtime.InteropServices.Marshal]::SizeOf($info), 0x100)
     if ($result -eq [IntPtr]::Zero -or $info.icon -eq [IntPtr]::Zero) { throw "Shell returned no icon: .$extension" }
     $large = [IntPtr]::Zero
     $small = [IntPtr]::Zero
     $actualBitmap = $null
     $expectedBitmap = $null
     try {
-        [void][FeatherPadFileIcons]::ExtractIconEx($expectedPath, 0, [ref]$large, [ref]$small, 1)
+        [void][PlumeTxtFileIcons]::ExtractIconEx($expectedPath, 0, [ref]$large, [ref]$small, 1)
         $actualBitmap = [System.Drawing.Icon]::FromHandle($info.icon).ToBitmap()
         $expectedBitmap = [System.Drawing.Icon]::FromHandle($large).ToBitmap()
         $actualBitmap.Save((Join-Path $outputDirectory "$extension-shell.png"))
@@ -58,7 +58,7 @@ foreach ($extension in 'md', 'toml') {
         if ($actualBitmap) { $actualBitmap.Dispose() }
         if ($expectedBitmap) { $expectedBitmap.Dispose() }
         foreach ($handle in $info.icon,$large,$small) {
-            if ($handle -ne [IntPtr]::Zero) { [void][FeatherPadFileIcons]::DestroyIcon($handle) }
+            if ($handle -ne [IntPtr]::Zero) { [void][PlumeTxtFileIcons]::DestroyIcon($handle) }
         }
     }
 }

@@ -25,7 +25,7 @@ struct State {
 impl ImageView {
     pub unsafe fn open(parent: HWND, path: &Path) -> Result<Self, String> {
         let (dib, width, height) = assets::load_picture(path)?;
-        let class = wide("FeatherPadImage");
+        let class = wide("PlumeTxtImage");
         RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: GetModuleHandleW(null()),

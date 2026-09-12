@@ -2,5 +2,8 @@
 /.cargo-cache/
 /tmp/
 __pycache__/
+/PlumeTxt.exe
+/PlumeTxt.previous-*.exe
+
 /FeatherPad.exe
 /FeatherPad.previous-*.exe

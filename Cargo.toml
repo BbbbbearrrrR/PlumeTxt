@@ -1,5 +1,5 @@
 [package]
-name = "featherpad"
+name = "plumetxt"
 version = "0.2.0"
 edition = "2021"
 description = "Lightweight native Windows Markdown editor and PDF reader"

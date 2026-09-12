@@ -246,9 +246,9 @@ fn nested_bookmarks_named_destinations_and_cycles() {
 }
 
 #[test]
-#[ignore = "Set FEATHERPAD_PDF_REGRESSION to verify a local PDF's outline geometry"]
+#[ignore = "Set PLUMETXT_PDF_REGRESSION to verify a local PDF's outline geometry"]
 fn local_pdf_destination_units_match_winrt() {
-    let Ok(path) = std::env::var("FEATHERPAD_PDF_REGRESSION") else {
+    let Ok(path) = std::env::var("PLUMETXT_PDF_REGRESSION") else {
         return;
     };
     let d = Document::load(&path).unwrap();

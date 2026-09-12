@@ -48,7 +48,7 @@ struct Bar {
 pub unsafe fn info(hwnd: HWND, vertical: bool) -> SCROLLINFO {
     let value = native_info(hwnd, vertical);
     if vertical && limit(&value) == 0 {
-        let peer = GetPropW(hwnd, wide("FeatherPadScrollPeer").as_ptr());
+        let peer = GetPropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr());
         if !peer.is_null() {
             return native_info(peer, true);
         }
@@ -66,9 +66,9 @@ unsafe fn native_info(hwnd: HWND, vertical: bool) -> SCROLLINFO {
 }
 pub unsafe fn pair(hwnd: HWND, peer: HWND) {
     if peer.is_null() {
-        RemovePropW(hwnd, wide("FeatherPadScrollPeer").as_ptr());
+        RemovePropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr());
     } else {
-        SetPropW(hwnd, wide("FeatherPadScrollPeer").as_ptr(), peer);
+        SetPropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr(), peer);
     }
 }
 pub unsafe fn measure(hwnd: HWND) {
@@ -103,9 +103,9 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
         0
     } else if class.starts_with("LISTBOX") {
         1
-    } else if class.starts_with("FeatherPadReader") {
+    } else if class.starts_with("PlumeTxtReader") {
         2
-    } else if class.starts_with("FeatherPadLarge") {
+    } else if class.starts_with("PlumeTxtLarge") {
         4
     } else {
         3
@@ -113,19 +113,19 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
     if kind == 0 || kind == 1 {
         SetPropW(
             hwnd,
-            wide("FeatherPadClippedScroll").as_ptr(),
+            wide("PlumeTxtClippedScroll").as_ptr(),
             (bg as usize + 1) as _,
         );
     }
     if kind == 3 {
         SetPropW(
             hwnd,
-            wide("FeatherPadTreeScroll").as_ptr(),
+            wide("PlumeTxtTreeScroll").as_ptr(),
             (bg as usize + 1) as _,
         );
     }
     if kind == 1 || kind == 3 {
-        SetPropW(hwnd, wide("FeatherPadQuietScroll").as_ptr(), 1usize as _);
+        SetPropW(hwnd, wide("PlumeTxtQuietScroll").as_ptr(), 1usize as _);
     }
     let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
     SetWindowLongW(
@@ -149,7 +149,7 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
     );
-    let name = wide("FeatherPadScroll");
+    let name = wide("PlumeTxtScroll");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(bar_proc),
         hInstance: GetModuleHandleW(null()),
@@ -219,7 +219,7 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
     PostMessageW(hwnd, UPDATE, 0, 0);
 }
 pub unsafe fn resize(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
-    let extra_height = if !GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
+    let extra_height = if !GetPropW(hwnd, wide("PlumeTxtTreeScroll").as_ptr()).is_null()
         && GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL == 0
     {
         windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CYHSCROLL, dpi(hwnd))
@@ -254,7 +254,7 @@ pub unsafe fn resize(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
         y,
         width + windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, dpi(hwnd)),
         height
-            + if GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
+            + if GetPropW(hwnd, wide("PlumeTxtTreeScroll").as_ptr()).is_null()
                 || GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL != 0
             {
                 0
@@ -278,7 +278,7 @@ unsafe fn editor_viewport(hwnd: HWND) -> RECT {
             - windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, dpi(hwnd)))
         .max(1),
     );
-    if !GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
+    if !GetPropW(hwnd, wide("PlumeTxtTreeScroll").as_ptr()).is_null()
         && GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL == 0
     {
         rc.bottom = rc.bottom.min(
@@ -299,7 +299,7 @@ pub unsafe fn set_position(hwnd: HWND, vertical: bool, pos: i32) {
 unsafe fn position(hwnd: HWND, kind: u8, vertical: bool, pos: i32) {
     let pos = pos.clamp(0, limit(&info(hwnd, vertical)));
     if kind == 0 && vertical && limit(&native_info(hwnd, true)) == 0 {
-        let peer = GetPropW(hwnd, wide("FeatherPadScrollPeer").as_ptr());
+        let peer = GetPropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr());
         if !peer.is_null() && limit(&native_info(peer, true)) > 0 {
             set_position(peer, vertical, pos);
             return;
@@ -427,7 +427,7 @@ unsafe extern "system" fn host_proc(
     let ptr = data as *mut RefCell<Host>;
     // Native scroll painting can reenter while Host is borrowed. Its geometry stays
     // enabled for RichEdit; only our dark sibling controls should ever draw the tracks.
-    let clipped = GetPropW(hwnd, wide("FeatherPadClippedScroll").as_ptr());
+    let clipped = GetPropW(hwnd, wide("PlumeTxtClippedScroll").as_ptr());
     if !clipped.is_null() {
         if msg == WM_NCPAINT {
             return 0;
@@ -444,7 +444,7 @@ unsafe extern "system" fn host_proc(
             SetWindowRgn(hwnd, CreateRectRgn(0, 0, rc.right, rc.bottom), 0);
         }
     }
-    let tree_background = GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr());
+    let tree_background = GetPropW(hwnd, wide("PlumeTxtTreeScroll").as_ptr());
     if !tree_background.is_null() {
         if msg == WM_ERASEBKGND {
             return 1;
@@ -459,9 +459,9 @@ unsafe extern "system" fn host_proc(
         }
     }
     if msg == WM_NCDESTROY {
-        RemovePropW(hwnd, wide("FeatherPadClippedScroll").as_ptr());
-        RemovePropW(hwnd, wide("FeatherPadTreeScroll").as_ptr());
-        RemovePropW(hwnd, wide("FeatherPadQuietScroll").as_ptr());
+        RemovePropW(hwnd, wide("PlumeTxtClippedScroll").as_ptr());
+        RemovePropW(hwnd, wide("PlumeTxtTreeScroll").as_ptr());
+        RemovePropW(hwnd, wide("PlumeTxtQuietScroll").as_ptr());
         RemoveWindowSubclass(hwnd, Some(host_proc), 902);
         let state = (*ptr).borrow();
         if state.kind == 0 {
@@ -558,7 +558,7 @@ unsafe extern "system" fn host_proc(
     }
     if msg == WM_MOUSEWHEEL && wp & 8 == 0 && (s.kind == 0 || s.kind == 2) {
         if s.kind == 0 && limit(&native_info(hwnd, true)) == 0 {
-            let peer = GetPropW(hwnd, wide("FeatherPadScrollPeer").as_ptr());
+            let peer = GetPropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr());
             if !peer.is_null() && limit(&native_info(peer, true)) > 0 {
                 SendMessageW(peer, msg, wp, lp);
                 return 0;
@@ -735,7 +735,7 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
     let Ok(mut s) = (*ptr).try_borrow_mut() else {
         return DefWindowProcW(hwnd, msg, wp, lp);
     };
-    let tree = !GetPropW(s.owner, wide("FeatherPadQuietScroll").as_ptr()).is_null();
+    let tree = !GetPropW(s.owner, wide("PlumeTxtQuietScroll").as_ptr()).is_null();
     if tree && matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
         PostMessageW(s.owner, UPDATE, 2, 0);
     }

@@ -1,5 +1,5 @@
 """Native smoke test: first text, editable readiness, cancellation and large-file save.
-Run against target/release/featherpad.exe; touches only tmp/responsive-open/.
+Run against target/release/plumetxt.exe; touches only tmp/responsive-open/.
 """
 import ctypes as c
 from ctypes import wintypes as w
@@ -148,7 +148,7 @@ def workflow(exe, root):
 if __name__ == '__main__':
     root = b.ROOT / 'tmp' / 'responsive-open'
     root.mkdir(parents=True, exist_ok=True)
-    exe = b.ROOT / 'target' / 'release' / 'featherpad.exe'
+    exe = b.ROOT / 'target' / 'release' / 'plumetxt.exe'
     results = []
     for name, size in [('table-1MiB.csv', 1), ('markdown-8MiB.md', 8)]:
         path = root / name

@@ -292,7 +292,7 @@ impl Large {
         }
     }
     pub unsafe fn create(parent: HWND, path: PathBuf, font: HFONT) -> Self {
-        let class = wide("FeatherPadLarge");
+        let class = wide("PlumeTxtLarge");
         RegisterClassW(&WNDCLASSW {
             style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
@@ -618,7 +618,7 @@ fn native_large_view_draws_and_releases() {
 
 #[test]
 fn tabular_highlighting_survives_display_wrapping() {
-    let path = std::env::temp_dir().join(format!("featherpad-table-{}.tsv", std::process::id()));
+    let path = std::env::temp_dir().join(format!("plumetxt-table-{}.tsv", std::process::id()));
     std::fs::write(
         &path,
         "name\tcity\tnote\nAlice\tParis\t\"long quoted field across wrapping\"\n",
@@ -650,7 +650,7 @@ fn tabular_highlighting_survives_display_wrapping() {
 #[test]
 fn bounded_reads_and_unicode_boundaries() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join(format!("featherpad-large-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("plumetxt-large-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("large.md");
     let mut f = File::create(&path).unwrap();
@@ -718,7 +718,7 @@ fn native_gigabyte_first_viewport() {
         io::Write,
         time::{Duration, Instant},
     };
-    let path = std::env::temp_dir().join(format!("featherpad-gigabyte-{}.md", std::process::id()));
+    let path = std::env::temp_dir().join(format!("plumetxt-gigabyte-{}.md", std::process::id()));
     let mut file = File::create(&path).unwrap();
     let mut block = b"# Markdown performance\n\nA large document should show its first screen without loading everything.\n\n".repeat(65536);
     block.resize(8 * 1024 * 1024, b' ');

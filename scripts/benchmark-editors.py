@@ -207,7 +207,7 @@ def main():
     preferences.mkdir(parents=True)
     (preferences / 'Preferences.sublime-settings').write_text(json.dumps({
         'hot_exit': False, 'remember_open_files': False, 'update_check': False}), encoding='utf-8')
-    apps = [('FeatherPad', ROOT / 'FeatherPad.exe'), ('Sublime Text 4200', sublime / 'sublime_text.exe')]
+    apps = [('PlumeTxt', ROOT / 'PlumeTxt.exe'), ('Sublime Text 4200', sublime / 'sublime_text.exe')]
     cases = [('markdown-1MiB.md',1),('markdown-8MiB.md',8),('markdown-64MiB.md',64),
              ('markdown-1GiB.md',1024),('table-1MiB.csv',1),('table-64MiB.csv',64)]
     for name, size in cases:
@@ -226,7 +226,7 @@ def main():
                 with (output / 'results.jsonl').open('a',encoding='utf-8') as stream:
                     stream.write(json.dumps(result) + '\n')
                 print(json.dumps(result),flush=True)
-    metadata = {'rounds':args.rounds,'featherpad_sha256':hashlib.sha256((ROOT/'FeatherPad.exe').read_bytes()).hexdigest(),
+    metadata = {'rounds':args.rounds,'plumetxt_sha256':hashlib.sha256((ROOT/'PlumeTxt.exe').read_bytes()).hexdigest(),
                 'sublime_sha256':hashlib.sha256((sublime/'sublime_text.exe').read_bytes()).hexdigest(),
                 'method':'Warm cache, fresh processes, isolated Sublime defaults. Responsive = filename title plus WM_NULL reply. Settled = 4 half-second samples below 25ms CPU each. Not a first-paint, full-load, edit-latency or FPS measurement. Working-set sums double-count shared pages. Peaks sampled every 0.5s.'}
     (output / 'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
