@@ -1,3 +1,5 @@
+<img src="assets/feather.png" alt="PlumeTxt logo" width="128" height="128">
+
 # PlumeTxt
 
 A native Windows text editor with Markdown preview, PDF reading, and an integrated terminal. Built in Rust, with a dark interface and no UI animations.
