@@ -88,7 +88,7 @@ fn formatted(
     base: Option<&std::path::Path>,
     folded: Option<&BTreeSet<usize>>,
 ) -> String {
-    let mut out = String::from("{\\rtf1\\ansi\\deff0\\uc1{\\fonttbl{\\f0 Segoe UI Semilight;}{\\f1 Consolas;}}{\\colortbl;\\red34\\green48\\blue64;\\red35\\green96\\blue154;}\\f0\\fs22\\cf1 ");
+    let mut out = String::from("{\\rtf1\\ansi\\deff0\\uc1{\\fonttbl{\\f0 Segoe UI;}{\\f1 Consolas;}}{\\colortbl;\\red34\\green48\\blue64;\\red35\\green96\\blue154;}\\f0\\fs22\\cf1 ");
     if dark {
         out = out.replace(r"\fs22", r"\fs30").replace(
             r"\red34\green48\blue64;\red35\green96\blue154;",

@@ -29,6 +29,7 @@ struct State {
     dispatch: u32,
     buffer: Buffer,
     reveal: i32,
+    started: std::time::Instant,
 }
 pub struct Palette(pub HWND);
 impl Palette {
@@ -78,6 +79,7 @@ impl Palette {
             null(),
         );
         SendMessageW(edit, WM_SETFONT, font as usize, 0);
+        attach_button(edit);
         SendMessageW(
             edit,
             EM_SETCUEBANNER,
@@ -124,19 +126,24 @@ impl Palette {
             dispatch,
             buffer: Buffer::default(),
             reveal: 388,
+            started: std::time::Instant::now(),
         };
         SetWindowLongPtrW(
             hwnd,
             GWLP_USERDATA,
             Box::into_raw(Box::new(RefCell::new(state))) as isize,
         );
-        Self(hwnd)
+        let palette = Self(hwnd);
+        SendMessageW(hwnd, FONTS_CHANGED, font as usize, small as isize);
+        palette
     }
     pub unsafe fn set_commands(&self, items: Vec<Command>) {
         with(self.0, |s| s.items = items);
     }
     pub unsafe fn show(&self) {
         with(self.0, |s| {
+            let window = s.hwnd;
+            let d = |v| px(window, v);
             if GetWindowLongW(s.hwnd, GWL_STYLE) as u32 & WS_VISIBLE != 0 {
                 s.hide();
                 return;
@@ -148,16 +155,21 @@ impl Palette {
             SetWindowPos(
                 s.hwnd,
                 HWND_TOP,
-                (rc.right - 600) / 2,
-                48,
-                600,
-                388,
+                (rc.right - d(600)) / 2,
+                d(48),
+                d(600),
+                d(388),
                 SWP_NOACTIVATE,
             );
             SetWindowTextW(s.edit, wide("").as_ptr());
             s.refresh();
-            s.reveal = 60;
-            SetWindowRgn(s.hwnd, CreateRoundRectRgn(0, 0, 600, s.reveal, 24, 24), 0);
+            s.reveal = d(60);
+            s.started = std::time::Instant::now();
+            SetWindowRgn(
+                s.hwnd,
+                CreateRoundRectRgn(0, 0, d(600), s.reveal, d(24), d(24)),
+                0,
+            );
             ShowWindow(s.hwnd, SW_SHOW);
             SetTimer(s.hwnd, 903, 15, None);
             SetFocus(s.edit);
@@ -274,7 +286,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     if msg == WM_MEASUREITEM {
-        (*(lp as *mut MEASUREITEMSTRUCT)).itemHeight = 48;
+        (*(lp as *mut MEASUREITEMSTRUCT)).itemHeight = px(hwnd, 48) as u32;
         return 1;
     }
     if msg == WM_ERASEBKGND {
@@ -283,8 +295,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
     if msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX {
         let dc = wp as HDC;
         SetTextColor(dc, INK);
-        SetBkColor(dc, SURFACE);
-        SetDCBrushColor(dc, SURFACE);
+        let bg = if msg == WM_CTLCOLOREDIT {
+            FIELD
+        } else {
+            SURFACE
+        };
+        SetBkColor(dc, bg);
+        SetDCBrushColor(dc, bg);
         return GetStockObject(DC_BRUSH) as isize;
     }
     if msg == WM_COMMAND && wp >> 16 == EN_CHANGE as usize {
@@ -299,13 +316,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         return DefWindowProcW(hwnd, msg, wp, lp);
     };
     match msg {
+        FONTS_CHANGED => {
+            s.font = wp as HFONT;
+            s.small = lp as HFONT;
+            let d = |v| px(hwnd, v);
+            SendMessageW(s.edit, WM_SETFONT, wp, 0);
+            SendMessageW(s.list, WM_SETFONT, wp, 0);
+            SendMessageW(s.list, LB_SETITEMHEIGHT, 0, d(48) as isize);
+            let parent = client(s.parent);
+            move_window(hwnd, (parent.right - d(600)) / 2, d(48), d(600), d(388), 0);
+            move_window(s.edit, d(24), d(20), d(490), d(32), 0);
+            crate::scroll::resize(s.list, d(12), d(76), d(574), d(288));
+            s.reveal = d(388);
+            KillTimer(hwnd, 903);
+            SetWindowRgn(
+                hwnd,
+                CreateRoundRectRgn(0, 0, d(600), d(388), d(24), d(24)),
+                1,
+            );
+            invalidate(hwnd);
+        }
+
         WM_TIMER if wp == 903 => {
-            s.reveal += (388 - s.reveal + 2) / 3;
-            if s.reveal >= 386 {
-                s.reveal = 388;
+            s.reveal = px(hwnd, 60)
+                + (px(hwnd, 328) as f64 * animation_progress(s.started, 0.16)).round() as i32;
+            if s.reveal >= px(hwnd, 388) {
+                s.reveal = px(hwnd, 388);
                 KillTimer(hwnd, 903);
             }
-            SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, 600, s.reveal, 24, 24), 1);
+            SetWindowRgn(
+                hwnd,
+                CreateRoundRectRgn(0, 0, px(hwnd, 600), s.reveal, px(hwnd, 24), px(hwnd, 24)),
+                1,
+            );
         }
         WM_MOUSEWHEEL => {
             SendMessageW(s.list, WM_MOUSEWHEEL, wp, lp);
@@ -349,25 +392,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                 fill(d.hDC, d.rcItem, SURFACE);
                 if selected {
                     let mut r = d.rcItem;
-                    r.right -= 12;
-                    rounded(d.hDC, r, SELECTED, 12);
+                    r.right -= px(hwnd, 12);
+                    panel(d.hDC, r, SELECTED, LINE, px(hwnd, 12), px(hwnd, 1));
                 }
                 if selected {
                     fill(
                         d.hDC,
                         RECT {
                             left: 0,
-                            top: d.rcItem.top + 12,
+                            top: d.rcItem.top + px(hwnd, 12),
                             right: 3,
-                            bottom: d.rcItem.bottom - 12,
+                            bottom: d.rcItem.bottom - px(hwnd, 12),
                         },
                         ACCENT,
                     );
                 }
                 let item = s.items[index];
                 let mut r = d.rcItem;
-                r.left += 18;
-                r.right -= 130;
+                r.left += px(hwnd, 18);
+                r.right -= px(hwnd, 130);
+                r.bottom = r.top + px(hwnd, 29);
                 label(
                     d.hDC,
                     item.1,
@@ -376,8 +420,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     if selected { ACCENT } else { INK },
                     DT_SINGLELINE | DT_VCENTER,
                 );
+                let detail = RECT {
+                    left: r.left,
+                    top: d.rcItem.top + px(hwnd, 28),
+                    right: r.right,
+                    bottom: d.rcItem.bottom - px(hwnd, 3),
+                };
+                label(
+                    d.hDC,
+                    item.3,
+                    detail,
+                    s.small,
+                    MUTED,
+                    DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+                r.top = d.rcItem.top;
+                r.bottom = d.rcItem.bottom;
                 r.left = r.right;
-                r.right = d.rcItem.right - 16;
+                r.right = d.rcItem.right - px(hwnd, 20);
+                let mut badge = r;
+                badge.top += px(hwnd, 12);
+                badge.bottom -= px(hwnd, 12);
+                rounded(d.hDC, badge, FIELD, px(hwnd, 8));
+                r.right -= px(hwnd, 6);
                 label(
                     d.hDC,
                     item.2,
@@ -398,25 +463,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                 return 0;
             }
             let dc = s.buffer.dc;
-            fill(dc, rc, SURFACE);
-            fill(
-                dc,
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: rc.right,
-                    bottom: 2,
-                },
-                ACCENT,
-            );
+            fill(dc, rc, CANVAS);
+            let mut card = rc;
+            InflateRect(&mut card, -px(hwnd, 4), -px(hwnd, 4));
+            shadow(dc, card, px(hwnd, 1));
+            panel(dc, card, SURFACE, LINE, px(hwnd, 20), px(hwnd, 1));
+            input_frame(hwnd, dc, s.edit);
             label(
                 dc,
                 "ESC",
                 RECT {
-                    left: 510,
-                    top: 16,
-                    right: 572,
-                    bottom: 42,
+                    left: px(hwnd, 510),
+                    top: px(hwnd, 16),
+                    right: px(hwnd, 572),
+                    bottom: px(hwnd, 42),
                 },
                 s.small,
                 MUTED,
@@ -425,10 +485,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             fill(
                 dc,
                 RECT {
-                    left: 24,
-                    top: 63,
-                    right: 574,
-                    bottom: 64,
+                    left: px(hwnd, 24),
+                    top: px(hwnd, 63),
+                    right: px(hwnd, 574),
+                    bottom: px(hwnd, 64),
                 },
                 LINE,
             );
@@ -437,16 +497,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     dc,
                     "No results",
                     RECT {
-                        left: 24,
-                        top: 80,
-                        right: 570,
-                        bottom: 130,
+                        left: px(hwnd, 24),
+                        top: px(hwnd, 80),
+                        right: px(hwnd, 570),
+                        bottom: px(hwnd, 130),
                     },
                     s.font,
                     MUTED,
                     DT_SINGLELINE,
                 );
             }
+            label(
+                dc,
+                "↑ ↓  Navigate     Enter  Run",
+                RECT {
+                    left: px(hwnd, 26),
+                    top: px(hwnd, 367),
+                    right: px(hwnd, 570),
+                    bottom: px(hwnd, 385),
+                },
+                s.small,
+                MUTED,
+                DT_SINGLELINE,
+            );
             s.buffer.blit(target, &ps.rcPaint);
             EndPaint(hwnd, &ps);
         }

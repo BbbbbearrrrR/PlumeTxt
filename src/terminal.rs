@@ -41,7 +41,7 @@ struct State {
     font: HFONT,
     cell_w: i32,
     cell_h: i32,
-    buffer: Buffer,
+    renderer: crate::render::Renderer,
     surrogate: Option<u16>,
     selection: Option<(usize, usize)>,
     selecting: bool,
@@ -72,7 +72,7 @@ impl Terminal {
             GetModuleHandleW(null()),
             null(),
         );
-        let font = font(17, 400, "Consolas");
+        let font = font(px(hwnd, 17), 400, "Consolas");
         let dc = GetDC(hwnd);
         let old = SelectObject(dc, font);
         let mut metrics = zeroed();
@@ -160,7 +160,7 @@ impl Terminal {
                 font,
                 cell_w: metrics.tmAveCharWidth.max(8),
                 cell_h: metrics.tmHeight.max(18),
-                buffer: Buffer::default(),
+                renderer: crate::render::Renderer::default(),
                 surrogate: None,
                 selection: None,
                 selecting: false,
@@ -238,8 +238,8 @@ impl State {
     }
     unsafe fn resize(&mut self) {
         let rc = client(self.hwnd);
-        let rows = ((rc.bottom - 16) / self.cell_h).clamp(2, 200) as u16;
-        let cols = ((rc.right - 32) / self.cell_w).clamp(10, 400) as u16;
+        let rows = ((rc.bottom - px(self.hwnd, 16)) / self.cell_h).clamp(2, 200) as u16;
+        let cols = ((rc.right - px(self.hwnd, 32)) / self.cell_w).clamp(10, 400) as u16;
         self.parser.screen_mut().set_size(rows, cols);
         if let Some(s) = &self.session {
             let _ = s.master.resize(PtySize {
@@ -285,11 +285,12 @@ impl State {
     }
     unsafe fn paint(&mut self, dc: HDC, dirty: &RECT) {
         let rc = client(self.hwnd);
-        if !self.buffer.ensure(dc, rc.right, rc.bottom) {
-            return;
-        }
-        let target = self.buffer.dc;
-        fill(target, rc, SURFACE);
+        let mut renderer = std::mem::take(&mut self.renderer);
+        renderer.paint(self.hwnd, dc, dirty, |canvas| self.draw(canvas, rc));
+        self.renderer = renderer;
+    }
+    unsafe fn draw(&self, canvas: &mut crate::render::Canvas, rc: RECT) {
+        canvas.fill(rc, SURFACE);
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
         let cursor = (GetFocus() == self.hwnd && !screen.hide_cursor() && screen.scrollback() == 0)
@@ -300,9 +301,27 @@ impl State {
                     .is_some_and(|cell| cell.is_wide_continuation());
                 (row, col.saturating_sub(u16::from(continuation)))
             });
-        let old = SelectObject(target, self.font);
-        SetBkMode(target, TRANSPARENT as i32);
+        let mut run = String::with_capacity(cols as usize);
+        let flush = |canvas: &mut crate::render::Canvas, run: &mut String, x, y, fg| {
+            if !run.is_empty() {
+                canvas.label(
+                    run,
+                    RECT {
+                        left: x,
+                        top: y,
+                        right: x + run.len() as i32 * self.cell_w,
+                        bottom: y + self.cell_h,
+                    },
+                    self.font,
+                    fg,
+                    DT_SINGLELINE,
+                );
+                run.clear();
+            }
+        };
         for row in 0..rows {
+            let y = px(self.hwnd, 8) + row as i32 * self.cell_h;
+            let (mut run_x, mut run_color) = (0, INK);
             for col in 0..cols {
                 if let Some(cell) = screen.cell(row, col) {
                     if cell.is_wide_continuation() {
@@ -324,8 +343,7 @@ impl State {
                         bg = ACCENT;
                         fg = SURFACE;
                     }
-                    let x = 16 + col as i32 * self.cell_w;
-                    let y = 8 + row as i32 * self.cell_h;
+                    let x = px(self.hwnd, 16) + col as i32 * self.cell_w;
                     let r = RECT {
                         left: x,
                         top: y,
@@ -333,33 +351,33 @@ impl State {
                         bottom: y + self.cell_h,
                     };
                     if bg != SURFACE {
-                        fill(target, r, bg);
+                        canvas.fill(r, bg);
                     }
-                    if cell.contents().is_empty() {
-                        continue;
+                    let text = cell.contents();
+                    if text.is_ascii() && !text.is_empty() && !cell.is_wide() {
+                        if fg != run_color || x != run_x + run.len() as i32 * self.cell_w {
+                            flush(canvas, &mut run, run_x, y, run_color);
+                        }
+                        if run.is_empty() {
+                            run_x = x;
+                            run_color = fg;
+                        }
+                        run.push_str(text);
+                    } else {
+                        flush(canvas, &mut run, run_x, y, run_color);
+                        if !text.is_empty() {
+                            canvas.label(text, r, self.font, fg, DT_SINGLELINE);
+                        }
                     }
-                    SetTextColor(target, fg);
-                    let text = wide(cell.contents());
-                    ExtTextOutW(
-                        target,
-                        x,
-                        y,
-                        ETO_CLIPPED,
-                        &r,
-                        text.as_ptr(),
-                        (text.len() - 1) as u32,
-                        null(),
-                    );
                 }
             }
+            flush(canvas, &mut run, run_x, y, run_color);
         }
-        SelectObject(target, old);
-        self.buffer.blit(dc, dirty);
     }
-    fn index(&self, lp: isize) -> usize {
+    unsafe fn index(&self, lp: isize) -> usize {
         let (rows, cols) = self.parser.screen().size();
-        let x = (lp as u16 as i16 as i32 - 16) / self.cell_w;
-        let y = ((lp >> 16) as u16 as i16 as i32 - 8) / self.cell_h;
+        let x = (lp as u16 as i16 as i32 - px(self.hwnd, 16)) / self.cell_w;
+        let y = ((lp >> 16) as u16 as i16 as i32 - px(self.hwnd, 8)) / self.cell_h;
         y.clamp(0, rows as i32 - 1) as usize * cols as usize + x.clamp(0, cols as i32 - 1) as usize
     }
     unsafe fn paste(&mut self) {
@@ -427,7 +445,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         let rc = client(hwnd);
         SetWindowRgn(
             hwnd,
-            CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, 14, 14),
+            CreateRoundRectRgn(
+                0,
+                0,
+                rc.right + 1,
+                rc.bottom + 1,
+                px(hwnd, 14),
+                px(hwnd, 14),
+            ),
             1,
         );
         PostMessageW(hwnd, RESIZE, 0, 0);
@@ -448,6 +473,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         return DefWindowProcW(hwnd, msg, wp, lp);
     };
     match msg {
+        WM_SHOWWINDOW if wp == 0 => {
+            s.renderer.release();
+        }
+        FONTS_CHANGED => {
+            let replacement = font(px(hwnd, 17), 400, "Consolas");
+            if !replacement.is_null() {
+                let dc = GetDC(hwnd);
+                let old = SelectObject(dc, replacement);
+                let mut metrics = zeroed();
+                GetTextMetricsW(dc, &mut metrics);
+                SelectObject(dc, old);
+                ReleaseDC(hwnd, dc);
+                DeleteObject(s.font);
+                s.font = replacement;
+                s.cell_w = metrics.tmAveCharWidth.max(1);
+                s.cell_h = metrics.tmHeight.max(1);
+                s.resize();
+            }
+        }
+
         READY => s.output(),
         RESIZE => s.resize(),
         WM_PAINT => {

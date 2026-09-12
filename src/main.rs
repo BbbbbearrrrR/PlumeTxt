@@ -12,6 +12,7 @@ mod pdf;
 mod pdftext;
 mod printing;
 mod reader;
+mod render;
 mod scroll;
 mod search;
 mod selection;

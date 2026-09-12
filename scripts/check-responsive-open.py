@@ -101,8 +101,10 @@ def workflow(exe, root):
         edit = wait_for(lambda: editor(hwnd))
         wait_for(lambda: u.SendMessageW(edit, 0xE, 0, 0) and not u.GetWindowLongW(edit, -16) & 0x800)
         u.SendMessageW(hwnd, 0x8002, 112, 0)
-        assert editor(hwnd) == edit, 'Ctrl+E must stay in the editor in both text modes'
-        u.SendMessageW(hwnd, 0x8002, 105, 0)
+        assert editor(hwnd) == edit, 'Internal editor focus must stay in the editor in both text modes'
+        u.SendMessageW(hwnd, 0x8002, 105, 0)  # Ctrl+E enters reading.
+        wait_for(lambda: len(editors(hwnd)) == 1)
+        u.SendMessageW(hwnd, 0x8002, 105, 0)  # Ctrl+E returns to editing.
         wait_for(lambda: len(editors(hwnd)) == 2)
         preview = editors(hwnd)[1]
         wait_for(lambda: u.SendMessageW(preview, 0xE, 0, 0) > 0)

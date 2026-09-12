@@ -269,7 +269,7 @@ struct State {
     result: Arc<Mutex<Option<Result<Page, String>>>>,
     page: Option<Page>,
     font: HFONT,
-    buffer: Buffer,
+    renderer: crate::render::Renderer,
     generation: u64,
     requested: u64,
     columns: usize,
@@ -341,7 +341,7 @@ impl Large {
                 result,
                 page: None,
                 font,
-                buffer: Buffer::default(),
+                renderer: crate::render::Renderer::default(),
                 generation: 0,
                 requested: 0,
                 columns: 80,
@@ -410,12 +410,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             // Use the outer width so hiding its track cannot trigger a read/resize loop.
             let mut bounds = zeroed();
             GetWindowRect(hwnd, &mut bounds);
-            let columns = ((bounds.right - bounds.left - 80) / 11).clamp(16, 240) as usize;
+            let columns = ((bounds.right - bounds.left - px(hwnd, 80)) / px(hwnd, 11))
+                .clamp(16, 240) as usize;
             if columns != s.columns || s.generation == 0 {
                 s.columns = columns;
                 let offset = s.requested;
                 s.request(offset, 0);
             }
+            invalidate(hwnd);
+        }
+        WM_SHOWWINDOW if wp == 0 => {
+            s.renderer.release();
+        }
+        FONTS_CHANGED => {
+            s.font = wp as HFONT;
+            PostMessageW(hwnd, WM_SIZE, 0, 0);
             invalidate(hwnd);
         }
         READY => {
@@ -446,7 +455,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             if let Some(page) = &s.page {
                 let offset = (lp as f64 / RANGE as f64 * page.len as f64) as u64;
                 let back = if lp >= RANGE as isize {
-                    ((client(hwnd).bottom - 48) / 28).max(1) as usize
+                    ((client(hwnd).bottom - px(hwnd, 48)) / px(hwnd, 28)).max(1) as usize
                 } else {
                     0
                 };
@@ -465,7 +474,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             SetFocus(hwnd);
         }
         WM_LBUTTONDBLCLK => {
-            let row = ((lp >> 16) as u16 as i16 as i32 - 24).max(0) / 28;
+            let row = ((lp >> 16) as u16 as i16 as i32 - px(hwnd, 24)).max(0) / px(hwnd, 28);
             if let Some(offset) = s
                 .page
                 .as_ref()
@@ -478,13 +487,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         WM_KEYDOWN => match wp as u16 {
             VK_DOWN => s.move_rows(1),
             VK_UP => s.move_rows(-1),
-            VK_NEXT => s.move_rows(((client(hwnd).bottom - 48) / 28).max(1)),
-            VK_PRIOR => s.move_rows(-((client(hwnd).bottom - 48) / 28).max(1)),
+            VK_NEXT => s.move_rows(((client(hwnd).bottom - px(hwnd, 48)) / px(hwnd, 28)).max(1)),
+            VK_PRIOR => s.move_rows(-((client(hwnd).bottom - px(hwnd, 48)) / px(hwnd, 28)).max(1)),
             VK_HOME => s.request(0, 0),
             VK_END => {
                 if let Some(page) = &s.page {
                     let end = page.len;
-                    s.request(end, ((client(hwnd).bottom - 48) / 28).max(1) as usize);
+                    s.request(
+                        end,
+                        ((client(hwnd).bottom - px(hwnd, 48)) / px(hwnd, 28)).max(1) as usize,
+                    );
                 }
             }
             _ => return DefWindowProcW(hwnd, msg, wp, lp),
@@ -493,19 +505,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             let mut ps = zeroed();
             let dc = BeginPaint(hwnd, &mut ps);
             let rc = client(hwnd);
-            if s.buffer.ensure(dc, rc.right, rc.bottom) {
-                let canvas = s.buffer.dc;
-                fill(canvas, rc, CANVAS);
+            let mut renderer = std::mem::take(&mut s.renderer);
+            renderer.paint(hwnd, dc, &ps.rcPaint, |canvas| {
+                canvas.fill(rc, CANVAS);
                 if let Some(page) = &s.page {
                     for (i, row) in page
                         .rows
                         .iter()
-                        .take(((rc.bottom - 48) / 28).max(1) as usize)
+                        .take(((rc.bottom - px(hwnd, 48)) / px(hwnd, 28)).max(1) as usize)
                         .enumerate()
                     {
-                        let old = SelectObject(canvas, s.font);
-                        SetBkMode(canvas, TRANSPARENT as i32);
-                        let mut x = 32;
+                        let mut x = px(hwnd, 32);
                         let mut start = 0;
                         for end in row
                             .text
@@ -517,53 +527,93 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                             if end < row.text.len() && row.colors[end] == row.colors[start] {
                                 continue;
                             }
-                            let run = wide(&row.text[start..end]);
-                            SetTextColor(canvas, row.colors.get(start).copied().unwrap_or(INK));
-                            TextOutW(
-                                canvas,
-                                x,
-                                24 + i as i32 * 28,
-                                run.as_ptr(),
-                                run.len() as i32 - 1,
+                            let run = &row.text[start..end];
+                            canvas.label(
+                                run,
+                                RECT {
+                                    left: x,
+                                    top: px(hwnd, 24) + i as i32 * px(hwnd, 28),
+                                    right: rc.right - px(hwnd, 28),
+                                    bottom: px(hwnd, 24) + (i as i32 + 1) * px(hwnd, 28),
+                                },
+                                s.font,
+                                row.colors.get(start).copied().unwrap_or(INK),
+                                DT_SINGLELINE,
                             );
-                            let mut size: SIZE = zeroed();
-                            GetTextExtentPoint32W(
-                                canvas,
-                                run.as_ptr(),
-                                run.len() as i32 - 1,
-                                &mut size,
-                            );
-                            x += size.cx;
+                            x += canvas.text_width(run, s.font);
                             start = end;
-                            if x >= rc.right - 28 {
+                            if x >= rc.right - px(hwnd, 28) {
                                 break;
                             }
                         }
-                        SelectObject(canvas, old);
                     }
                 }
                 if !s.message.is_empty() {
-                    label(
-                        canvas,
+                    canvas.label(
                         &s.message,
                         RECT {
-                            left: 32,
-                            top: 24,
-                            right: rc.right - 32,
-                            bottom: 80,
+                            left: px(hwnd, 32),
+                            top: px(hwnd, 24),
+                            right: rc.right - px(hwnd, 32),
+                            bottom: px(hwnd, 80),
                         },
                         s.font,
                         MUTED,
                         DT_SINGLELINE,
                     );
                 }
-                s.buffer.blit(dc, &ps.rcPaint);
-            }
+            });
+            s.renderer = renderer;
             EndPaint(hwnd, &ps);
         }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
     0
+}
+
+#[test]
+#[ignore = "Requires Windows native controls and graphics"]
+fn native_large_view_draws_and_releases() {
+    unsafe {
+        let parent = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            wide("Large view check").as_ptr(),
+            WS_POPUP | WS_VISIBLE,
+            0,
+            0,
+            800,
+            600,
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        let fonts = Fonts::new();
+        let view = Large::create(parent, PathBuf::from("examples/welcome.md"), fonts.code);
+        let start = std::time::Instant::now();
+        loop {
+            let mut msg: MSG = zeroed();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                DispatchMessageW(&msg);
+            }
+            let state = GetWindowLongPtrW(view.0, GWLP_USERDATA) as *const RefCell<State>;
+            if (*state).borrow().page.is_some() {
+                break;
+            }
+            assert!(start.elapsed().as_secs() < 5, "Large view did not load");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        RedrawWindow(view.0, null(), null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
+        let dc = GetDC(view.0);
+        assert!((24..80).any(|y| (32..500).any(|x| GetPixel(dc, x, y) != CANVAS)));
+        ReleaseDC(view.0, dc);
+        let window = view.0;
+        ShowWindow(window, SW_HIDE);
+        drop(view);
+        assert_eq!(IsWindow(window), 0);
+        DestroyWindow(parent);
+    }
 }
 
 #[test]

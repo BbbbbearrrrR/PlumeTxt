@@ -6,12 +6,14 @@ use windows_sys::Win32::UI::Controls::{EM_GETMODIFY, EM_SETMODIFY};
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 
 pub const INK: u32 = rgb(222, 232, 233);
-pub const MUTED: u32 = rgb(133, 153, 156);
-pub const CANVAS: u32 = rgb(9, 13, 15);
-pub const LINE: u32 = rgb(33, 47, 50);
-pub const SURFACE: u32 = rgb(16, 23, 26);
+pub const MUTED: u32 = rgb(156, 173, 184);
+pub const CANVAS: u32 = rgb(12, 17, 23);
+pub const LINE: u32 = rgb(48, 62, 74);
+pub const SURFACE: u32 = rgb(23, 31, 40);
+pub const FIELD: u32 = rgb(16, 23, 31);
+pub const HOVER: u32 = rgb(39, 54, 66);
 pub const ACCENT: u32 = rgb(63, 221, 207);
-pub const SELECTED: u32 = rgb(23, 57, 58);
+pub const SELECTED: u32 = rgb(28, 70, 77);
 pub const WHITE: u32 = rgb(255, 255, 255);
 pub const fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | (g << 8) | (b << 16)
@@ -62,12 +64,16 @@ pub struct Fonts {
     pub body: HFONT,
 }
 impl Fonts {
+    #[cfg(test)]
     pub unsafe fn new() -> Self {
+        Self::at_dpi(96)
+    }
+    pub unsafe fn at_dpi(dpi: u32) -> Self {
         Self {
-            ui: font(16, 350, "Segoe UI Semilight"),
-            small: font(13, 400, "Segoe UI"),
-            code: font(20, 400, "Consolas"),
-            body: font(20, 350, "Segoe UI Semilight"),
+            ui: font(scale(16, dpi), 400, "Segoe UI"),
+            small: font(scale(13, dpi), 400, "Segoe UI"),
+            code: font(scale(20, dpi), 400, "Consolas"),
+            body: font(scale(20, dpi), 400, "Segoe UI"),
         }
     }
 }
@@ -295,8 +301,8 @@ unsafe extern "system" fn divider_proc(hwnd: HWND, msg: u32, wp: usize, lp: isiz
     DefWindowProcW(hwnd, msg, wp, lp)
 }
 pub unsafe fn rounded(dc: HDC, rect: RECT, color: u32, radius: i32) {
-    let brush = CreateSolidBrush(color);
-    let old_brush = SelectObject(dc, brush);
+    SetDCBrushColor(dc, color);
+    let old_brush = SelectObject(dc, GetStockObject(DC_BRUSH));
     let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
     RoundRect(
         dc,
@@ -309,7 +315,50 @@ pub unsafe fn rounded(dc: HDC, rect: RECT, color: u32, radius: i32) {
     );
     SelectObject(dc, old_pen);
     SelectObject(dc, old_brush);
-    DeleteObject(brush);
+}
+
+// Static material: edge, upper highlight and inset body, without blur surfaces.
+pub unsafe fn panel(dc: HDC, mut rect: RECT, body: u32, edge: u32, radius: i32, unit: i32) {
+    rounded(dc, rect, edge, radius);
+    InflateRect(&mut rect, -unit, -unit);
+    rounded(dc, rect, body, (radius - unit).max(1));
+    let top = RECT {
+        left: rect.left + radius / 2,
+        top: rect.top,
+        right: rect.right - radius / 2,
+        bottom: rect.top + unit,
+    };
+    fill(dc, top, rgb(61, 77, 90));
+}
+pub unsafe fn shadow(dc: HDC, rect: RECT, unit: i32) {
+    for (spread, shade) in [(5, rgb(8, 12, 17)), (3, rgb(6, 9, 13)), (1, rgb(3, 5, 8))] {
+        rounded(
+            dc,
+            RECT {
+                left: rect.left - spread * unit,
+                top: rect.top + unit,
+                right: rect.right + spread * unit,
+                bottom: rect.bottom + (spread + 2) * unit,
+            },
+            shade,
+            16 * unit,
+        );
+    }
+}
+pub unsafe fn input_frame(parent: HWND, dc: HDC, edit: HWND) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    let mut rect: RECT = zeroed();
+    GetWindowRect(edit, &mut rect);
+    MapWindowPoints(null_mut(), parent, &mut rect as *mut RECT as *mut POINT, 2);
+    InflateRect(&mut rect, px(parent, 7), px(parent, 6));
+    panel(
+        dc,
+        rect,
+        FIELD,
+        if GetFocus() == edit { ACCENT } else { LINE },
+        px(parent, 12),
+        px(parent, 1),
+    );
 }
 
 #[test]
@@ -351,5 +400,154 @@ fn changing_font_preserves_readable_color_and_clean_state() {
         }
         DestroyWindow(hwnd);
         windows_sys::Win32::Foundation::FreeLibrary(library);
+    }
+}
+
+// Time-based easing keeps duration independent of delayed UI timer messages.
+pub fn ease_out(progress: f64) -> f64 {
+    1. - (1. - progress.clamp(0., 1.)).powi(3)
+}
+
+#[test]
+fn animation_progress_is_bounded_and_monotonic() {
+    assert_eq!(ease_out(-1.), 0.);
+    assert_eq!(ease_out(1.), 1.);
+    assert_eq!(ease_out(2.), 1.);
+    assert!((ease_out(0.5) - 0.875).abs() < 1e-10);
+    for i in 0..100 {
+        assert!(ease_out(i as f64 / 100.) <= ease_out((i + 1) as f64 / 100.));
+    }
+}
+
+pub unsafe fn animations_enabled() -> bool {
+    let mut enabled: i32 = 1;
+    SystemParametersInfoW(
+        SPI_GETCLIENTAREAANIMATION,
+        0,
+        &mut enabled as *mut _ as _,
+        0,
+    );
+    enabled != 0
+}
+pub unsafe fn animation_progress(start: std::time::Instant, duration: f64) -> f64 {
+    if animations_enabled() {
+        ease_out(start.elapsed().as_secs_f64() / duration)
+    } else {
+        1.
+    }
+}
+
+pub const FONTS_CHANGED: u32 = WM_APP + 180;
+pub fn scale(value: i32, dpi: u32) -> i32 {
+    ((value as i64 * dpi.max(96) as i64 + if value >= 0 { 48 } else { -48 }) / 96) as i32
+}
+pub unsafe fn dpi(hwnd: HWND) -> u32 {
+    let root = GetAncestor(hwnd, GA_ROOT);
+    let stored = GetPropW(root, wide("FeatherPadDpi").as_ptr()) as usize;
+    if stored > 0 {
+        stored as u32
+    } else {
+        windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96)
+    }
+}
+pub unsafe fn px(hwnd: HWND, value: i32) -> i32 {
+    scale(value, dpi(hwnd))
+}
+
+// Replace borrowed handles in every native descendant before freeing the old font set.
+pub unsafe fn replace_fonts(hwnd: HWND, old: &Fonts, new: &Fonts) {
+    let pairs = [
+        (old.ui, new.ui),
+        (old.small, new.small),
+        (old.code, new.code),
+        (old.body, new.body),
+    ];
+    unsafe extern "system" fn update(hwnd: HWND, data: isize) -> i32 {
+        let pairs = &*(data as *const [(HFONT, HFONT); 4]);
+        let current = SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT;
+        if let Some((_, replacement)) = pairs.iter().find(|(old, _)| *old == current) {
+            SendMessageW(hwnd, WM_SETFONT, *replacement as usize, 0);
+        }
+        let mut class = [0u16; 32];
+        GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+        if String::from_utf16_lossy(&class).starts_with("SysTreeView32") {
+            SendMessageW(
+                hwnd,
+                windows_sys::Win32::UI::Controls::TVM_SETITEMHEIGHT,
+                px(hwnd, 26) as usize,
+                0,
+            );
+        }
+        invalidate(hwnd);
+        1
+    }
+    EnumChildWindows(hwnd, Some(update), &pairs as *const _ as isize);
+}
+
+pub unsafe fn attach_button(hwnd: HWND) {
+    windows_sys::Win32::UI::Shell::SetWindowSubclass(hwnd, Some(button_proc), 110, 0);
+}
+unsafe extern "system" fn button_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: usize,
+    lp: isize,
+    _: usize,
+    _: usize,
+) -> isize {
+    use windows_sys::Win32::UI::{Input::KeyboardAndMouse::*, Shell::*};
+    match msg {
+        WM_SETFOCUS => {
+            invalidate(hwnd);
+            invalidate(GetParent(hwnd));
+        }
+        WM_MOUSEMOVE => {
+            if GetPropW(hwnd, wide("FeatherPadHover").as_ptr()).is_null() {
+                SetPropW(hwnd, wide("FeatherPadHover").as_ptr(), 1usize as _);
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                TrackMouseEvent(&mut track);
+                invalidate(hwnd);
+            }
+        }
+        windows_sys::Win32::UI::Controls::WM_MOUSELEAVE | WM_KILLFOCUS => {
+            RemovePropW(hwnd, wide("FeatherPadHover").as_ptr());
+            invalidate(hwnd);
+            invalidate(GetParent(hwnd));
+        }
+        WM_NCDESTROY => {
+            RemovePropW(hwnd, wide("FeatherPadHover").as_ptr());
+            RemoveWindowSubclass(hwnd, Some(button_proc), 110);
+        }
+        _ => (),
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+
+#[test]
+fn dpi_dimensions_round_and_return_without_drift() {
+    for dpi in [96, 120, 144, 192, 240] {
+        assert_eq!(scale(96, dpi), dpi as i32);
+        assert_eq!(scale(-96, dpi), -(dpi as i32));
+        assert!(scale(24, dpi) > scale(16, dpi));
+    }
+    assert_eq!(scale(13, 120), 16);
+    assert_eq!(scale(24, 144), 36);
+}
+
+// Let DWM own title-bar material, window shadow and supported-system fallback.
+pub unsafe fn window_material(hwnd: HWND) {
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    for (attribute, value) in [(20u32, 1u32), (33, 2), (34, LINE), (35, CANVAS), (36, INK)] {
+        DwmSetWindowAttribute(hwnd, attribute, &value as *const _ as _, 4);
+    }
+    let backdrop = 2u32;
+    if DwmSetWindowAttribute(hwnd, 38, &backdrop as *const _ as _, 4) >= 0 {
+        let default = 0xffffffffu32;
+        DwmSetWindowAttribute(hwnd, 35, &default as *const _ as _, 4);
     }
 }

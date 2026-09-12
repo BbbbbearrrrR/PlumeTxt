@@ -6,10 +6,10 @@ A quiet place to write, read, and work.
 
 Use **bold**, *italic*, and `inline code` when they help the reader.
 
-- **Ctrl+Shift+M** switches between reading and synchronized editing.
+- **Ctrl+E** switches between reading and synchronized editing.
 - **Ctrl+Shift+P** finds any command.
 - **Ctrl+Shift+E** exports Markdown to PDF.
-- **Ctrl+`** opens the terminal in this file's folder.
+- **Ctrl+Shift+J** opens the terminal in this file's folder.
 
 ## Read
 
@@ -36,8 +36,8 @@ fn main() {
 | --- | --- |
 | Open | Ctrl+O |
 | Save | Ctrl+S |
-| Preview | Ctrl+Shift+M |
+| Preview | Ctrl+E |
 | Outline | Ctrl+Shift+L |
-| Terminal | Ctrl+` |
+| Terminal | Ctrl+Shift+J |
 
 [Made with Rust](https://www.rust-lang.org/).

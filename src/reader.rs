@@ -24,7 +24,7 @@ pub const FIT_PAGE: usize = 7;
 pub const UP: usize = 4;
 pub const DOWN: usize = 5;
 pub const TOGGLE_TOC: usize = 6;
-const CACHE_BYTES: usize = 64 * 1024 * 1024;
+const CACHE_BYTES: usize = 48 * 1024 * 1024;
 const HEADER: i32 = 0;
 const GAP: i32 = 24;
 
@@ -92,7 +92,6 @@ impl Layout {
 
 struct State {
     search_match: Option<crate::pdftext::Match>,
-    search_tint: Buffer,
     hwnd: HWND,
     tree: HWND,
     font: HFONT,
@@ -107,6 +106,7 @@ struct State {
     bookmarks: Vec<Bookmark>,
     toc_visible: bool,
     toc_width: i32,
+    dpi: u32,
     toc_drag: Option<Divider>,
     toc_note: String,
     message: String,
@@ -117,7 +117,7 @@ struct State {
     viewport_width: i32,
     viewport_height: i32,
     wheel_remainder: i32,
-    buffer: Buffer,
+    renderer: crate::render::Renderer,
     paint_count: u64,
     render_count: u64,
     request_count: u64,
@@ -160,6 +160,7 @@ impl Reader {
                 | TVS_HASBUTTONS
                 | TVS_LINESATROOT
                 | TVS_SHOWSELALWAYS
+                | TVS_FULLROWSELECT
                 | TVS_NOTOOLTIPS
                 | TVS_NOHSCROLL,
             0,
@@ -175,11 +176,10 @@ impl Reader {
         SendMessageW(tree, WM_SETFONT, small as usize, 0);
         SendMessageW(tree, TVM_SETBKCOLOR, 0, SURFACE as isize);
         SendMessageW(tree, TVM_SETTEXTCOLOR, 0, INK as isize);
-        SendMessageW(tree, TVM_SETITEMHEIGHT, 24, 0);
+        SendMessageW(tree, TVM_SETITEMHEIGHT, px(hwnd, 26) as usize, 0);
         SetWindowTheme(tree, wide("").as_ptr(), wide("").as_ptr());
         let state = State {
             search_match: None,
-            search_tint: Buffer::default(),
             hwnd,
             tree,
             font,
@@ -193,7 +193,8 @@ impl Reader {
             cache: VecDeque::new(),
             bookmarks: Vec::new(),
             toc_visible: true,
-            toc_width: 242,
+            toc_width: px(hwnd, 242),
+            dpi: dpi(hwnd),
             toc_drag: None,
             toc_note: "".into(),
             message: "Loading…".into(),
@@ -204,7 +205,7 @@ impl Reader {
             viewport_width: 0,
             viewport_height: 0,
             wheel_remainder: 0,
-            buffer: Buffer::default(),
+            renderer: crate::render::Renderer::default(),
             paint_count: 0,
             render_count: 0,
             request_count: 0,
@@ -223,6 +224,7 @@ impl Reader {
             s.document_id += 1;
             s.generation += 1;
             s.cache.clear();
+            s.renderer.release();
             s.sizes.clear();
             s.layout = Layout::default();
             s.bookmarks.clear();
@@ -251,6 +253,7 @@ impl Reader {
             s.document_id += 1;
             s.worker.close();
             s.cache.clear();
+            s.renderer.release();
             s.sizes.clear();
             s.layout = Layout::default();
             s.bookmarks.clear();
@@ -302,8 +305,10 @@ unsafe fn with(hwnd: HWND, f: impl FnOnce(&mut State)) {
 impl State {
     fn sidebar(&self) -> i32 {
         if self.toc_visible {
-            self.toc_width
-                .min((unsafe { client(self.hwnd).right } - 240).max(140))
+            self.toc_width.min(
+                (unsafe { client(self.hwnd).right - px(self.hwnd, 240) })
+                    .max(unsafe { px(self.hwnd, 140) }),
+            )
         } else {
             0
         }
@@ -313,10 +318,10 @@ impl State {
         let side = self.sidebar();
         crate::scroll::resize(
             self.tree,
-            12,
-            HEADER + 64,
-            (side - 24).max(1),
-            (rc.bottom - HEADER - 104).max(1),
+            px(self.hwnd, 12),
+            HEADER + px(self.hwnd, 64),
+            (side - px(self.hwnd, 24)).max(1),
+            (rc.bottom - HEADER - px(self.hwnd, 104)).max(1),
         );
         ShowWindow(self.tree, if self.toc_visible { SW_SHOW } else { SW_HIDE });
         // MoveWindow suppresses repaint; the parent's paint excludes this child.
@@ -405,6 +410,7 @@ impl State {
         });
     }
     fn keep(&mut self, page: pdf::Page) {
+        self.renderer.forget_bitmap(page.index as u64);
         self.cache.retain(|p| p.index != page.index);
         self.cache.push_back(page);
         let center = self.layout.at(self.y + self.viewport_height / 2) as u32;
@@ -416,7 +422,9 @@ impl State {
                 .max_by_key(|(_, p)| p.index.abs_diff(center))
                 .map(|(i, _)| i)
                 .unwrap();
-            self.cache.remove(farthest);
+            if let Some(page) = self.cache.remove(farthest) {
+                self.renderer.forget_bitmap(page.index as u64);
+            }
         }
     }
     unsafe fn replies(&mut self) {
@@ -629,12 +637,13 @@ impl State {
     }
     unsafe fn paint(&mut self, target: HDC, dirty: &RECT) {
         let rc = client(self.hwnd);
-        if !self.buffer.ensure(target, rc.right, rc.bottom) {
-            return;
-        }
         self.paint_count += 1;
-        let dc = self.buffer.dc;
-        fill(dc, rc, SURFACE);
+        let mut renderer = std::mem::take(&mut self.renderer);
+        renderer.paint(self.hwnd, target, dirty, |canvas| self.draw(canvas, rc));
+        self.renderer = renderer;
+    }
+    unsafe fn draw(&self, canvas: &mut crate::render::Canvas, rc: RECT) {
+        canvas.fill(rc, SURFACE);
         let side = self.sidebar();
         let body = RECT {
             left: side,
@@ -642,15 +651,14 @@ impl State {
             right: rc.right,
             bottom: rc.bottom,
         };
-        fill(dc, body, CANVAS);
+        canvas.fill(body, CANVAS);
         let current = if self.sizes.is_empty() {
             0
         } else {
             self.current_page() + 1
         };
         if self.toc_visible {
-            label(
-                dc,
+            canvas.label(
                 &format!(
                     "{} / {}   ·   {:.0}%",
                     current,
@@ -658,10 +666,10 @@ impl State {
                     self.zoom * 100.
                 ),
                 RECT {
-                    left: 18,
-                    top: 36,
-                    right: side - 12,
-                    bottom: 60,
+                    left: px(self.hwnd, 18),
+                    top: px(self.hwnd, 36),
+                    right: side - px(self.hwnd, 12),
+                    bottom: px(self.hwnd, 60),
                 },
                 self.small,
                 MUTED,
@@ -669,34 +677,31 @@ impl State {
             );
         }
         if self.toc_visible {
-            label(
-                dc,
+            canvas.label(
                 "Outline",
                 RECT {
-                    left: 18,
-                    top: HEADER + 10,
-                    right: side - 12,
-                    bottom: HEADER + 34,
+                    left: px(self.hwnd, 18),
+                    top: HEADER + px(self.hwnd, 10),
+                    right: side - px(self.hwnd, 12),
+                    bottom: HEADER + px(self.hwnd, 34),
                 },
                 self.font,
                 ACCENT,
                 DT_SINGLELINE,
             );
-            label(
-                dc,
+            canvas.label(
                 &self.toc_note,
                 RECT {
-                    left: 18,
-                    top: rc.bottom - 25,
-                    right: side - 12,
-                    bottom: rc.bottom - 3,
+                    left: px(self.hwnd, 18),
+                    top: rc.bottom - px(self.hwnd, 25),
+                    right: side - px(self.hwnd, 12),
+                    bottom: rc.bottom - px(self.hwnd, 3),
                 },
                 self.small,
                 MUTED,
                 DT_SINGLELINE | DT_END_ELLIPSIS,
             );
-            fill(
-                dc,
+            canvas.fill(
                 RECT {
                     left: side - 1,
                     top: HEADER,
@@ -706,24 +711,21 @@ impl State {
                 LINE,
             );
         }
-        let saved = SaveDC(dc);
-        IntersectClipRect(dc, body.left, body.top, body.right, body.bottom);
+        canvas.clip(body);
         for i in self.layout.visible(self.y, self.viewport_height) {
             let rect = self.layout.pages[i];
             let x = side + ((self.viewport_width - rect.width) / 2).max(GAP) - self.x;
             let y = HEADER + rect.top - self.y;
-            fill(
-                dc,
+            canvas.shadow(
                 RECT {
-                    left: x + 3,
-                    top: y + 4,
-                    right: x + rect.width + 3,
-                    bottom: y + rect.height + 4,
+                    left: x,
+                    top: y,
+                    right: x + rect.width,
+                    bottom: y + rect.height,
                 },
-                rgb(0, 0, 0),
+                px(self.hwnd, 1),
             );
-            fill(
-                dc,
+            canvas.fill(
                 RECT {
                     left: x,
                     top: y,
@@ -733,38 +735,21 @@ impl State {
                 WHITE,
             );
             if let Some(page) = self.cache.iter().find(|p| p.index as usize == i) {
-                let bitmap = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: page.width as i32,
-                        biHeight: -(page.height as i32),
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: BI_RGB,
-                        ..zeroed()
+                canvas.bitmap(
+                    page.index as u64,
+                    &page.pixels,
+                    page.width,
+                    page.height,
+                    false,
+                    RECT {
+                        left: x,
+                        top: y,
+                        right: x + rect.width,
+                        bottom: y + rect.height,
                     },
-                    ..zeroed()
-                };
-                SetStretchBltMode(dc, HALFTONE);
-                SetBrushOrgEx(dc, 0, 0, null_mut());
-                StretchDIBits(
-                    dc,
-                    x,
-                    y,
-                    rect.width,
-                    rect.height,
-                    0,
-                    0,
-                    page.width as i32,
-                    page.height as i32,
-                    page.pixels.as_ptr().cast(),
-                    &bitmap,
-                    DIB_RGB_COLORS,
-                    SRCCOPY,
                 );
             } else {
-                label(
-                    dc,
+                canvas.label(
                     &format!("Page {}", i + 1),
                     RECT {
                         left: x + 20,
@@ -780,65 +765,36 @@ impl State {
         }
         if let Some(hit) = &self.search_match {
             if let Some(page) = self.layout.pages.get(hit.page) {
-                if self.search_tint.ensure(dc, 1, 1) {
-                    fill(
-                        self.search_tint.dc,
-                        RECT {
-                            left: 0,
-                            top: 0,
-                            right: 1,
-                            bottom: 1,
-                        },
-                        ACCENT,
-                    );
-                    let x = side + ((self.viewport_width - page.width) / 2).max(GAP) - self.x;
-                    let y = HEADER + page.top - self.y;
-                    for b in &hit.boxes {
-                        let l = x + (b[0].clamp(0., 1.) * page.width as f32) as i32;
-                        let t = y + (b[1].clamp(0., 1.) * page.height as f32) as i32;
-                        let r = x + (b[2].clamp(0., 1.) * page.width as f32).ceil() as i32;
-                        let bottom = y + (b[3].clamp(0., 1.) * page.height as f32).ceil() as i32;
-                        if r > l && bottom > t {
-                            GdiAlphaBlend(
-                                dc,
-                                l,
-                                t,
-                                r - l,
-                                bottom - t,
-                                self.search_tint.dc,
-                                0,
-                                0,
-                                1,
-                                1,
-                                BLENDFUNCTION {
-                                    BlendOp: AC_SRC_OVER as u8,
-                                    BlendFlags: 0,
-                                    SourceConstantAlpha: 90,
-                                    AlphaFormat: 0,
-                                },
-                            );
-                        }
+                let x = side + ((self.viewport_width - page.width) / 2).max(GAP) - self.x;
+                let y = HEADER + page.top - self.y;
+                for b in &hit.boxes {
+                    let r = RECT {
+                        left: x + (b[0].clamp(0., 1.) * page.width as f32) as i32,
+                        top: y + (b[1].clamp(0., 1.) * page.height as f32) as i32,
+                        right: x + (b[2].clamp(0., 1.) * page.width as f32).ceil() as i32,
+                        bottom: y + (b[3].clamp(0., 1.) * page.height as f32).ceil() as i32,
+                    };
+                    if r.right > r.left && r.bottom > r.top {
+                        canvas.tint(r, ACCENT, 90);
                     }
                 }
             }
         }
         if !self.message.is_empty() {
-            label(
-                dc,
+            canvas.label(
                 &self.message,
                 RECT {
                     left: side + 35,
-                    top: HEADER + 45,
+                    top: HEADER + px(self.hwnd, 45),
                     right: rc.right - 35,
-                    bottom: HEADER + 145,
+                    bottom: HEADER + px(self.hwnd, 145),
                 },
                 self.font,
                 MUTED,
                 DT_WORDBREAK,
             );
         }
-        RestoreDC(dc, saved);
-        self.buffer.blit(target, dirty);
+        canvas.unclip();
     }
 }
 
@@ -877,6 +833,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         return DefWindowProcW(hwnd, msg, wp, lp);
     };
     match msg {
+        WM_SHOWWINDOW if wp == 0 => s.renderer.release(),
         SCROLL_TO => {
             if wp != 0 {
                 s.y = lp as i32
@@ -891,6 +848,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             s.jump(wp);
             // Cancel any in-flight wheel animation before applying the destination.
             PostMessageW(hwnd, crate::scroll::POSITION, 1, s.y as isize);
+        }
+        FONTS_CHANGED => {
+            let next = dpi(hwnd);
+            s.toc_width = (s.toc_width as i64 * next as i64 / s.dpi as i64) as i32;
+            s.dpi = next;
+            s.font = wp as HFONT;
+            s.small = lp as HFONT;
+            s.resize();
+            invalidate(hwnd);
         }
         RESIZE => s.resize(),
         pdf::READY => s.replies(),
@@ -975,9 +941,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         WM_MOUSEMOVE => {
             let x = lp as u16 as i16 as i32;
             if let Some(guide) = &mut s.toc_drag {
-                guide.move_to(hwnd, x.clamp(140, (client(hwnd).right - 240).max(140)));
+                guide.move_to(
+                    hwnd,
+                    x.clamp(
+                        px(hwnd, 140),
+                        (client(hwnd).right - px(hwnd, 240)).max(px(hwnd, 140)),
+                    ),
+                );
             }
-            if s.toc_visible && (s.toc_drag.is_some() || (x - s.sidebar()).abs() <= 7) {
+            if s.toc_visible && (s.toc_drag.is_some() || (x - s.sidebar()).abs() <= px(hwnd, 7)) {
                 SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
             }
         }
@@ -994,7 +966,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         WM_LBUTTONDOWN => {
             let x = lp as u16 as i16 as i32;
-            if s.toc_visible && (x - s.sidebar()).abs() <= 7 {
+            if s.toc_visible && (x - s.sidebar()).abs() <= px(hwnd, 7) {
                 s.toc_drag = Some(Divider::new(hwnd, s.sidebar()));
                 SetCapture(hwnd);
             }

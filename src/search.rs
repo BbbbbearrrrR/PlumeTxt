@@ -455,6 +455,7 @@ impl Search {
             )
         };
         let edit = child("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL as u32, 1);
+        attach_button(edit);
         SendMessageW(edit, EM_SETLIMITTEXT, 512, 0);
         SendMessageW(
             edit,
@@ -474,6 +475,7 @@ impl Search {
                 | TVS_HASBUTTONS
                 | TVS_LINESATROOT
                 | TVS_SHOWSELALWAYS
+                | TVS_FULLROWSELECT
                 | TVS_NOTOOLTIPS
                 | TVS_NOHSCROLL,
             2,
@@ -481,7 +483,7 @@ impl Search {
         SetWindowTheme(tree, wide("").as_ptr(), wide("").as_ptr());
         SendMessageW(tree, TVM_SETBKCOLOR, 0, SURFACE as isize);
         SendMessageW(tree, TVM_SETTEXTCOLOR, 0, INK as isize);
-        SendMessageW(tree, TVM_SETITEMHEIGHT, 25, 0);
+        SendMessageW(tree, TVM_SETITEMHEIGHT, px(hwnd, 26) as usize, 0);
         SendMessageW(
             tree,
             TVM_SETEXTENDEDSTYLE,
@@ -777,14 +779,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         WM_SIZE => with(hwnd, |s| {
             let mut rc = zeroed();
             GetClientRect(hwnd, &mut rc);
-            move_window(s.edit, 12, 16, (rc.right - 24).max(1), 25, 0);
-            move_window(s.status, 12, 49, (rc.right - 24).max(1), 20, 0);
+            move_window(
+                s.edit,
+                px(hwnd, 12),
+                px(hwnd, 16),
+                (rc.right - px(hwnd, 24)).max(1),
+                px(hwnd, 25),
+                0,
+            );
+            move_window(
+                s.status,
+                px(hwnd, 12),
+                px(hwnd, 49),
+                (rc.right - px(hwnd, 24)).max(1),
+                px(hwnd, 20),
+                0,
+            );
             crate::scroll::resize(
                 s.tree,
-                4,
-                78,
-                (rc.right - 8).max(1),
-                (rc.bottom - 82).max(1),
+                px(hwnd, 4),
+                px(hwnd, 78),
+                (rc.right - px(hwnd, 8)).max(1),
+                (rc.bottom - px(hwnd, 82)).max(1),
             );
         }),
         WM_COMMAND if wp >> 16 == EN_CHANGE as usize => with(hwnd, |s| {
@@ -839,8 +855,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
             let dc = wp as HDC;
             SetTextColor(dc, if msg == WM_CTLCOLORSTATIC { MUTED } else { INK });
-            SetBkColor(dc, SURFACE);
-            SetDCBrushColor(dc, SURFACE);
+            let bg = if msg == WM_CTLCOLOREDIT {
+                FIELD
+            } else {
+                SURFACE
+            };
+            SetBkColor(dc, bg);
+            SetDCBrushColor(dc, bg);
             return GetStockObject(DC_BRUSH) as isize;
         }
         WM_ERASEBKGND => {
@@ -853,6 +874,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             let mut ps = zeroed();
             let dc = BeginPaint(hwnd, &mut ps);
             fill(dc, ps.rcPaint, SURFACE);
+            with(hwnd, |s| input_frame(hwnd, dc, s.edit));
             EndPaint(hwnd, &ps);
         }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),

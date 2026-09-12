@@ -30,6 +30,7 @@ struct Host {
     target: f64,
     wheel: i32,
     animating: bool,
+    last_frame: std::time::Instant,
     layout_dirty: bool,
     saved_position: POINT,
     background: u32,
@@ -204,6 +205,7 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
         target: 0.,
         wheel: 0,
         animating: false,
+        last_frame: std::time::Instant::now(),
         layout_dirty: true,
         saved_position: POINT { x: 0, y: 0 },
         background: bg,
@@ -220,7 +222,7 @@ pub unsafe fn resize(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
     let extra_height = if !GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
         && GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL == 0
     {
-        GetSystemMetrics(SM_CYHSCROLL)
+        windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CYHSCROLL, dpi(hwnd))
     } else {
         0
     };
@@ -234,7 +236,9 @@ pub unsafe fn resize(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
     let mut region: RECT = zeroed();
     if origin.x == x
         && origin.y == y
-        && outer.right - outer.left == width + GetSystemMetrics(SM_CXVSCROLL)
+        && outer.right - outer.left
+            == width
+                + windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, dpi(hwnd))
         && outer.bottom - outer.top == height + extra_height
         && GetWindowRgnBox(hwnd, &mut region) != 0
         && region.right == width
@@ -248,14 +252,14 @@ pub unsafe fn resize(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
         hwnd,
         x,
         y,
-        width + GetSystemMetrics(SM_CXVSCROLL),
+        width + windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, dpi(hwnd)),
         height
             + if GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
                 || GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL != 0
             {
                 0
             } else {
-                GetSystemMetrics(SM_CYHSCROLL)
+                windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CYHSCROLL, dpi(hwnd))
             },
         0,
     );
@@ -268,15 +272,21 @@ unsafe fn editor_viewport(hwnd: HWND) -> RECT {
     GetWindowRect(hwnd, &mut outer);
     // The native track is outside our viewport even while RichEdit hides/recreates it.
     // Using the transient client width here exposes its light gutter for one frame.
-    rc.right = rc
-        .right
-        .min((outer.right - outer.left - GetSystemMetrics(SM_CXVSCROLL)).max(1));
+    rc.right = rc.right.min(
+        (outer.right
+            - outer.left
+            - windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, dpi(hwnd)))
+        .max(1),
+    );
     if !GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
         && GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL == 0
     {
-        rc.bottom = rc
-            .bottom
-            .min((outer.bottom - outer.top - GetSystemMetrics(SM_CYHSCROLL)).max(1));
+        rc.bottom = rc.bottom.min(
+            (outer.bottom
+                - outer.top
+                - windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CYHSCROLL, dpi(hwnd)))
+            .max(1),
+        );
     }
     rc
 }
@@ -375,17 +385,21 @@ unsafe fn refresh(hwnd: HWND, s: &mut Host) {
             && (vertical || s.kind == 2);
         crate::theme::move_window(
             bar,
-            origin.x + if vertical { r.right - 12 } else { 0 },
-            origin.y + if vertical { 0 } else { r.bottom - 12 },
-            if vertical { 12 } else { r.right - 12 },
+            origin.x + if vertical { r.right - px(hwnd, 12) } else { 0 },
+            origin.y + if vertical { 0 } else { r.bottom - px(hwnd, 12) },
+            if vertical {
+                px(hwnd, 12)
+            } else {
+                r.right - px(hwnd, 12)
+            },
             if vertical {
                 if s.kind == 2 || s.kind == 3 {
-                    r.bottom - 12
+                    r.bottom - px(hwnd, 12)
                 } else {
                     r.bottom
                 }
             } else {
-                12
+                px(hwnd, 12)
             },
             0,
         );
@@ -553,6 +567,7 @@ unsafe extern "system" fn host_proc(
         let delta = (wp >> 16) as u16 as i16 as f64;
         let i = info(hwnd, true);
         if !s.animating {
+            s.last_frame = std::time::Instant::now();
             s.target = i.nPos as f64;
         }
         s.target = (s.target - delta * 0.8).clamp(0., limit(&i) as f64);
@@ -566,12 +581,14 @@ unsafe extern "system" fn host_proc(
         }
         let current = info(hwnd, true).nPos;
         let remaining = s.target - current as f64;
-        let next = if remaining.abs() < 2. {
+        let elapsed = s.last_frame.elapsed().as_secs_f64();
+        s.last_frame = std::time::Instant::now();
+        let next = if remaining.abs() < 2. || !animations_enabled() {
             s.animating = false;
             KillTimer(hwnd, TIMER);
             s.target as i32
         } else {
-            current + (remaining * 0.35).round() as i32
+            current + (remaining * (1. - (-elapsed / 0.035).exp())).round() as i32
         };
         position(hwnd, s.kind, true, next);
         if s.kind == 0 {
@@ -694,12 +711,12 @@ unsafe extern "system" fn host_proc(
     }
     result
 }
-fn thumb(length: i32, i: &SCROLLINFO) -> (i32, i32) {
-    let length = (length - 8).max(1);
+fn thumb(length: i32, i: &SCROLLINFO, dpi: u32) -> (i32, i32) {
+    let length = (length - scale(8, dpi)).max(1);
     let size = ((length as f64 * i.nPage as f64 / (i.nMax + 1).max(1) as f64) as i32)
-        .clamp(24.min(length), length);
+        .clamp(scale(24, dpi).min(length), length);
     (
-        4 + ((length - size) as f64 * i.nPos as f64 / limit(i).max(1) as f64) as i32,
+        scale(4, dpi) + ((length - size) as f64 * i.nPos as f64 / limit(i).max(1) as f64) as i32,
         size,
     )
 }
@@ -725,7 +742,7 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
     let rc = client(hwnd);
     let length = if s.vertical { rc.bottom } else { rc.right };
     let i = info(s.owner, s.vertical);
-    let (start, size) = thumb(length, &i);
+    let (start, size) = thumb(length, &i, dpi(hwnd));
     match msg {
         WM_ERASEBKGND => return 1,
         WM_PAINT => {
@@ -735,8 +752,8 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
                 fill(s.buffer.dc, rc, s.bg);
                 let r = if s.vertical {
                     RECT {
-                        left: 4,
-                        right: 8,
+                        left: px(hwnd, 4),
+                        right: px(hwnd, 8),
                         top: start,
                         bottom: start + size,
                     }
@@ -744,8 +761,8 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
                     RECT {
                         left: start,
                         right: start + size,
-                        top: 4,
-                        bottom: 8,
+                        top: px(hwnd, 4),
+                        bottom: px(hwnd, 8),
                     }
                 };
                 rounded(
@@ -754,11 +771,11 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
                     if s.drag {
                         ACCENT
                     } else if tree {
-                        LINE
+                        rgb(105, 130, 146)
                     } else {
                         MUTED
                     },
-                    4,
+                    px(hwnd, 4),
                 );
                 s.buffer.blit(dc, &ps.rcPaint);
             }
@@ -777,7 +794,8 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
                 size / 2
             };
             SetCapture(hwnd);
-            let pos = ((p - s.offset - 4) as f64 / (length - size - 8).max(1) as f64
+            let pos = ((p - s.offset - px(hwnd, 4)) as f64
+                / (length - size - px(hwnd, 8)).max(1) as f64
                 * limit(&i) as f64) as i32;
             set_position(s.owner, s.vertical, pos);
             PostMessageW(GetAncestor(s.owner, GA_ROOT), SYNC, s.owner as usize, 0);
@@ -789,7 +807,8 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
             } else {
                 lp as u16 as i16 as i32
             };
-            let pos = ((p - s.offset - 4) as f64 / (length - size - 8).max(1) as f64
+            let pos = ((p - s.offset - px(hwnd, 4)) as f64
+                / (length - size - px(hwnd, 8)).max(1) as f64
                 * limit(&i) as f64) as i32;
             set_position(s.owner, s.vertical, pos);
             PostMessageW(GetAncestor(s.owner, GA_ROOT), SYNC, s.owner as usize, 0);
@@ -816,9 +835,10 @@ fn thumb_reaches_both_ends() {
         nPage: 100,
         ..unsafe { zeroed() }
     };
-    assert_eq!(thumb(408, &i), (4, 40));
+    assert_eq!(thumb(408, &i, 96), (4, 40));
     i.nPos = 900;
-    assert_eq!(thumb(408, &i), (364, 40));
+    assert_eq!(thumb(408, &i, 96), (364, 40));
+    assert_eq!(thumb(816, &i, 192), (728, 80));
 }
 
 #[test]

@@ -20,7 +20,7 @@ struct State {
     x: i32,
     y: i32,
     drag: Option<(i32, i32)>,
-    buffer: Buffer,
+    renderer: crate::render::Renderer,
 }
 impl ImageView {
     pub unsafe fn open(parent: HWND, path: &Path) -> Result<Self, String> {
@@ -61,7 +61,7 @@ impl ImageView {
                 x: 0,
                 y: 0,
                 drag: None,
-                buffer: Buffer::default(),
+                renderer: crate::render::Renderer::default(),
             })) as isize,
         );
         Ok(Self(hwnd))
@@ -101,6 +101,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
     let s = &mut *ptr;
     match msg {
         WM_ERASEBKGND => return 1,
+        WM_SHOWWINDOW if wp == 0 => {
+            s.renderer.release();
+        }
         WM_SIZE => {
             invalidate(hwnd);
             return 0;
@@ -151,43 +154,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             let mut ps = zeroed();
             let dc = BeginPaint(hwnd, &mut ps);
             let rc = client(hwnd);
-            if s.buffer.ensure(dc, rc.right, rc.bottom) {
-                fill(s.buffer.dc, rc, CANVAS);
-                let fit = ((rc.right - 32).max(1) as f64 / s.width as f64)
-                    .min((rc.bottom - 32).max(1) as f64 / s.height as f64)
+            s.renderer.paint(hwnd, dc, &ps.rcPaint, |canvas| {
+                canvas.fill(rc, CANVAS);
+                let fit = ((rc.right - px(hwnd, 40)).max(1) as f64 / s.width as f64)
+                    .min((rc.bottom - px(hwnd, 40)).max(1) as f64 / s.height as f64)
                     .min(1.);
                 let w = (s.width as f64 * fit * s.zoom).round().max(1.) as i32;
                 let h = (s.height as f64 * fit * s.zoom).round().max(1.) as i32;
-                let info = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: 40,
-                        biWidth: s.width as i32,
-                        biHeight: s.height as i32,
-                        biPlanes: 1,
-                        biBitCount: 24,
-                        ..zeroed()
-                    },
-                    ..zeroed()
+                let left = (rc.right - w) / 2 + s.x;
+                let top = (rc.bottom - h) / 2 + s.y;
+                let bounds = RECT {
+                    left,
+                    top,
+                    right: left + w,
+                    bottom: top + h,
                 };
-                SetStretchBltMode(s.buffer.dc, HALFTONE);
-                SetBrushOrgEx(s.buffer.dc, 0, 0, null_mut());
-                StretchDIBits(
-                    s.buffer.dc,
-                    (rc.right - w) / 2 + s.x,
-                    (rc.bottom - h) / 2 + s.y,
-                    w,
-                    h,
-                    0,
-                    0,
-                    s.width as i32,
-                    s.height as i32,
-                    s.dib[40..].as_ptr() as _,
-                    &info,
-                    DIB_RGB_COLORS,
-                    SRCCOPY,
-                );
-                s.buffer.blit(dc, &ps.rcPaint);
-            }
+                canvas.shadow(bounds, px(hwnd, 1));
+                canvas.bitmap(0, &s.dib[40..], s.width, s.height, true, bounds);
+            });
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -224,8 +208,9 @@ fn native_image_open_zoom_resize_and_close() {
             ShowWindow(view.0, SW_SHOW);
             UpdateWindow(view.0);
             let state = GetWindowLongPtrW(view.0, GWLP_USERDATA) as *const State;
-            assert!(!(*state).buffer.dc.is_null());
-            assert_ne!(GetPixel((*state).buffer.dc, 300, 200), CANVAS);
+            let dc = GetDC(view.0);
+            assert_ne!(GetPixel(dc, 300, 200), CANVAS);
+            ReleaseDC(view.0, dc);
             view.zoom(1.15);
             assert!((*state).zoom > 1.);
             MoveWindow(view.0, 0, 0, 320, 400, 0);
