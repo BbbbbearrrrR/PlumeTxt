@@ -13,30 +13,60 @@ Open `FeatherPad.exe`, drop a document onto the window, or pass a path:
 
 Windows 10 version 1809 or later / Windows 11, x64. PDF export requires Microsoft Print to PDF and Print Spooler. No browser runtime or external PDF reader is needed.
 
+Keep the `runtime` folder beside `FeatherPad.exe` when moving or distributing the app; it contains the PDF text-search library and its licenses. This library loads on demand for searches.
+
 ## Controls
 
 | Action | Shortcut |
 | --- | --- |
-| Commands | Ctrl+Shift+P or Alt |
+| Commands | Ctrl+Shift+P |
 | New / Open | Ctrl+N / Ctrl+O |
+| Open folder / workspace | Ctrl+Shift+O |
+| Search workspace | Ctrl+Shift+F |
+| Find in current file (or workspace if no file is open) | Ctrl+F |
 | Save / Save as | Ctrl+S / Ctrl+Shift+S |
 | Markdown preview | Ctrl+Shift+M |
 | Refresh preview | Ctrl+Shift+R |
-| Export Markdown to PDF | Ctrl+P |
+| Export Markdown to PDF | Ctrl+Shift+E |
+| Print image / PDF | Ctrl+P |
+| File tree | Ctrl+Shift+B |
+| Text size / Reset | Ctrl + or -, Ctrl+0 |
 | PDF outline | Ctrl+Shift+L |
 | PDF zoom / Fit width | Ctrl + or -, Ctrl+0 |
 | Return to editor | Ctrl+E |
-| Large-file overview | Ctrl+Shift+E |
+| Large-file overview | Commands → Document overview |
 | Terminal | Ctrl+J, Ctrl+backtick, or the bottom-right `>_` button |
 | Insert image | Ctrl+Shift+I |
 | Paste image / text | Ctrl+V |
 | Quit | Ctrl+Q |
 
-Normal and region editing use the same Save, Save as, Preview, Refresh, Export, Terminal, Insert image and Paste shortcuts. Ctrl+E always focuses/returns to the editor; Ctrl+Shift+E is the separate large-file overview command.
+Normal and region editing use the same Save, Save as, Preview, Refresh, Export, Terminal, Insert image and Paste shortcuts. Ctrl+E always focuses/returns to the editor. Ctrl+Shift+E exports PDF; the large-file overview is available from Commands.
 
-The command panel supports search, arrow keys, Enter, mouse selection, and Escape. Font and text-size commands are available there. Status messages disappear automatically.
+The command panel supports search, Up/Down to select, Enter to execute, and Escape to close. Arrow navigation keeps the search field focused. A mouse click selects; a double-click executes. The panel contains only essential actions for the current document and workspace. Formatting, zoom steps, New and Quit remain available through their shortcuts; they no longer fill the command list. The footer shows the current reading/editing state (or live PDF page number), only the most relevant shortcuts, a file-type tag (`*` means unsaved edits), and fixed Commands/Terminal controls. Narrow windows show fewer hints. Temporary status messages replace the contextual hints and then clear. Alt alone no longer opens Commands; AltGr and terminal editing combinations stay with their input control.
 
 ## Markdown
+
+Preview headings have a clickable disclosure arrow. Collapsing a heading hides its body and subordinate headings until the next heading of the same or higher level; clicking again expands it. Folding affects neither the source nor PDF export. Code-block contents are not headings. Folds reset when the source changes, preventing stale positions from hiding another section. Region previews support the same folding behavior within their loaded content.
+
+## Workspace
+
+Opening a file normally keeps the single-file layout. Use Ctrl+Shift+O / **Open folder**, drop a folder onto the window, or pass a folder as the command-line argument to open a workspace. Its dark left file tree shows folders first and file-type icons, with compact text. Drag the right divider to widen the file tree or PDF outline for long names. A cyan guide follows the pointer; document layout changes once on release to avoid tearing and repeated PDF rendering; neither directory panel has a horizontal scrollbar. Native hover tooltips are disabled. Subdirectories are read only when expanded; selecting a file uses the normal open path, including unsaved-change prompts and all supported viewers.
+
+Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-file-types.ps1` once to add **Open with FeatherPad** to Explorer's folder, folder background and drive context menus for the current user. On Windows 11, this classic menu entry is under **Show more options**. It opens the chosen directory as a workspace with the feather icon in the menu.
+
+Use **Toggle file tree** / Ctrl+Shift+B to hide or show the file tree, and **Toggle PDF outline** / Ctrl+Shift+L to hide or show the PDF outline. Hidden panels retain their width and tree state.
+
+**Ctrl+Shift+F** opens workspace search in the left sidebar, including before any file has been opened. **Ctrl+F** searches the current file, or the workspace when no file is open. Type to search saved text files and PDF text (case-insensitive literal text); results stream in, grouped by relative file path, with line/column numbers or PDF page numbers and cyan matches. Press Enter in the search field to refresh and jump to the first match. Click another result, or press Down and Enter, to jump to its line/page and highlight the matching content. The position and highlight remain when switching focus between search and the editor. Markdown results open for editing; large-file results load only the matching region. Escape or Ctrl+Shift+B returns to the file tree, or closes the search sidebar in single-file mode. Reopening the same search scope retains the query. With neither a file nor a workspace, Find asks for a folder.
+
+Search supports UTF-8 and BOM-marked UTF-16, uses bounded reads, and cancels superseded queries. It excludes `.git`, `node_modules`, `target`, `.cargo-cache`, `.venv`, and `__pycache__`, and does not follow junctions/symlinks. Results stop at 2,000 (`+` indicates the limit); binary/unreadable files and lines over 1 MiB are reported as skipped. Unsaved editor changes are not included; save and press Enter to refresh. Regex, replacement, and custom `.gitignore` rules are not implemented.
+
+PDF search reads the text layer one page at a time and highlights the actual text rectangles, including page crop and rotation. Scanned PDFs without a text layer require OCR, which is not included. Password-protected PDFs and PDFs of 4 GiB or larger are not supported by search. PDFium calls are serialized off the UI thread; cancellation takes effect between native PDF operations.
+
+Use **Refresh files** in the command panel to reload directory entries and **Close folder** to return to single-file mode while keeping the current document. Opening a folder does not discard the current document or automatically restore a workspace at the next launch. A new terminal uses the current document's directory, or the workspace root when no document has a path.
+
+## Markdown preview
+
+Markdown opens in a single preview column. Ctrl+Shift+M switches between reading and side-by-side editing; Ctrl+E also enters editing. Folding applies only to the preview.
 
 The source and preview share scroll progress. Scroll either pane or drag the single rightmost track. The synchronization uses document progress, not an exact source-line mapping; Markdown constructs can have different rendered heights.
 
@@ -74,11 +104,11 @@ Files larger than 8 MiB open directly in the editor, including gigabyte Markdown
 
 Use the wheel, arrow keys, Page Up/Down, Home/End, or drag the right scrollbar. Position is based on byte offsets, so a jump does not require scanning preceding lines. Long lines wrap into bounded display rows. UTF-8 and BOM-marked UTF-16 are decoded locally; malformed sequences display replacement characters. Disk changes are reflected in subsequent reads, without mapping mutable file memory.
 
-The regular editor supports typing, deletion, selection, copy/paste and undo within the loaded region. Ctrl+Shift+E optionally opens an overview for navigating elsewhere; double-click a row or press Ctrl+E again to edit there. The overview reads at most 512 KiB per request and retains at most 256 display rows. Ctrl+S streams the unchanged prefix and suffix around the replacement into a temporary file, flushes it, then replaces the destination. Save as writes the whole file too. Encoding is preserved; line endings within the edited region use its detected style. External changes detected before saving are rejected rather than overwritten. Saving runs in the background; editing and document switching wait until it finishes. A close/open request that initiates saving must be repeated after completion. Failures retain your edits.
+The regular editor supports typing, deletion, selection, copy/paste and undo within the loaded region. **Document overview** in Commands opens an overview for navigating elsewhere; double-click a row or press Ctrl+E again to edit there. The overview reads at most 512 KiB per request and retains at most 256 display rows. Ctrl+S streams the unchanged prefix and suffix around the replacement into a temporary file, flushes it, then replaces the destination. Save as writes the whole file too. Encoding is preserved; line endings within the edited region use its detected style. External changes detected before saving are rejected rather than overwritten. Saving runs in the background; editing and document switching wait until it finishes. A close/open request that initiates saving must be repeated after completion. Failures retain your edits.
 
-Ctrl+Shift+E opens the large viewport, with a save/discard prompt if needed; successful saving keeps the edited position in an editable view. This is region editing, not a full-file editable buffer: cross-region selection/undo, search and a full-document preview remain unavailable. The integrated terminal starts in the large file's folder when creating a new session.
+**Document overview** opens the large viewport, with a save/discard prompt if needed; successful saving keeps the edited position in an editable view. This is region editing, not a full-file editable buffer: cross-region selection/undo, search and a full-document preview remain unavailable. The integrated terminal starts in the large file's folder when creating a new session.
 
-Ctrl+Shift+M previews the current region with synchronized scrolling and live local edits; Ctrl+Shift+R refreshes it. Ctrl+P exports the **whole document**, including the current unsaved region, from a temporary snapshot without saving changes to the original file. Export reads bounded sections and sends their rendered pages through one PDF print job on a worker. Sections prefer paragraph boundaries and start new pages. Markdown context restarts between sections: fences, tables, links or other constructs spanning a boundary can format differently from an in-memory full-document render. Temporary snapshots are removed after completion or failure; the destination is replaced only after a complete PDF is available.
+Ctrl+Shift+M previews the current region with synchronized scrolling and live local edits; Ctrl+Shift+R refreshes it. Ctrl+Shift+E exports the **whole document**, including the current unsaved region, from a temporary snapshot without saving changes to the original file. Export reads bounded sections and sends their rendered pages through one PDF print job on a worker. Sections prefer paragraph boundaries and start new pages. Markdown context restarts between sections: fences, tables, links or other constructs spanning a boundary can format differently from an in-memory full-document render. Temporary snapshots are removed after completion or failure; the destination is replaced only after a complete PDF is available.
 
 Files up to 8 MiB are read/decoded on a worker and inserted in adaptive batches through native text ranges, keeping the window responsive and displaying text before the entire buffer is ready. Editing is enabled after insertion completes. New/Open cancels the pending load without allowing an old result to replace the new document. Highlighting and Markdown preview run after insertion.
 
@@ -94,7 +124,7 @@ Measured locally on 2026-09-12 (release build, one warm-cache run): 1 GiB first 
 
 PDFs render inside FeatherPad using Windows.Data.Pdf. Pages scroll continuously. The outline reads local PDF bookmarks and falls back to page numbers. Visible pages and neighboring pages are rendered on demand.
 
-The raster cache is capped at 64 MiB; each page is capped at about 8 million pixels. These limits exclude system decoder memory, in-flight frames, and window buffers. Text selection, PDF search, annotations, forms, and password entry are not implemented.
+The raster cache is capped at 64 MiB; each page is capped at about 8 million pixels. These limits exclude system decoder memory, in-flight frames, and window buffers. PDF text search and match highlighting are available with Ctrl+F. Arbitrary PDF text selection, annotations, forms, and password entry are not implemented.
 
 ## Terminal
 
@@ -152,3 +182,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-file-types.
 Registration is per user and verifies all 93 embedded icons first. Explorer icons are installed under `%LOCALAPPDATA%\FeatherPad\FileIcons` using content-hashed names so an updated design receives a new cache key. Registration then queries the effective Windows associations and reports legacy icons still in use. In Windows Settings > Apps > Default apps > FeatherPad, choose the extensions you want it to open. Select the named format entry, such as `FeatherPad (PDF)`, rather than the legacy `FeatherPad.exe` entry (scroll the choice list if needed). Extension-specific auto associations pointing to this exact executable also get their icon repaired. Registration does not overwrite protected Windows default choices or other applications' defaults. Keep the executable at its registered path; rerun registration after moving it.
 
 Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-shell-icons.ps1` to register and verify the actual Shell-returned MD and TOML icons against the installed artwork. This requires those two formats already associated with FeatherPad. The test writes example files and diagnostic PNGs under `tmp/shell-icon-check/`, and allows only one RGB level of native alpha-rounding difference.
+
+## Printing images and PDFs
+
+Press Ctrl+P while viewing an image or PDF, or choose **Print image or PDF** in the command panel. The Windows print dialog provides printer selection, paper/orientation settings, copies and PDF page ranges. Pages fit the printable area without cropping; transparent images print on white. Images print the displayed first frame. PDF printing rasterizes one page at a time using a bounded buffer (target 300 DPI, reduced for very large pages). Rendering/spooling runs in the background. **Cancel print** stops at the next page boundary; already spooled pages may require cancellation in the Windows print queue. Markdown PDF export uses Ctrl+Shift+E; Ctrl+P is reserved for printing images and PDFs.
+
+PDFs open centered with margins at a reading scale showing about three quarters of a page vertically, limited by the available width to avoid horizontal overflow. The default adapts to panel/window resizing until you zoom manually. Ctrl+Shift+0 restores whole-page reading; Ctrl+0 fits the page width.

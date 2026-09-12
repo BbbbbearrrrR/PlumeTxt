@@ -6,9 +6,9 @@ A quiet place to write, read, and work.
 
 Use **bold**, *italic*, and `inline code` when they help the reader.
 
-- **Ctrl+Shift+M** opens a synchronized preview.
+- **Ctrl+Shift+M** switches between reading and synchronized editing.
 - **Ctrl+Shift+P** finds any command.
-- **Ctrl+P** exports Markdown to PDF.
+- **Ctrl+Shift+E** exports Markdown to PDF.
 - **Ctrl+`** opens the terminal in this file's folder.
 
 ## Read

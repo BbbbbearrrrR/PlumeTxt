@@ -25,6 +25,7 @@ struct State {
     small: HFONT,
     items: Vec<Command>,
     filtered: Vec<usize>,
+    query: String,
     dispatch: u32,
     buffer: Buffer,
     reveal: i32,
@@ -105,6 +106,7 @@ impl Palette {
             null(),
         );
         dark_scrollbars(list, SURFACE);
+        crate::scroll::resize(list, 12, 76, 574, 288);
         SendMessageW(list, WM_SETFONT, font as usize, 0);
         SendMessageW(list, LB_SETITEMHEIGHT, 0, 48);
         let state = State {
@@ -118,6 +120,7 @@ impl Palette {
             small,
             items,
             filtered: Vec::new(),
+            query: String::new(),
             dispatch,
             buffer: Buffer::default(),
             reveal: 388,
@@ -128,6 +131,9 @@ impl Palette {
             Box::into_raw(Box::new(RefCell::new(state))) as isize,
         );
         Self(hwnd)
+    }
+    pub unsafe fn set_commands(&self, items: Vec<Command>) {
+        with(self.0, |s| s.items = items);
     }
     pub unsafe fn show(&self) {
         with(self.0, |s| {
@@ -158,7 +164,7 @@ impl Palette {
         });
     }
     pub unsafe fn key(&self, msg: &MSG) -> bool {
-        if IsWindowVisible(self.0) == 0 || (msg.hwnd != self.0 && IsChild(self.0, msg.hwnd) == 0) {
+        if IsWindowVisible(self.0) == 0 {
             return false;
         }
         if msg.message == WM_MOUSEWHEEL {
@@ -195,14 +201,18 @@ unsafe fn with(hwnd: HWND, f: impl FnOnce(&mut State)) {
     }
 }
 fn matches(command: &Command, query: &str) -> bool {
-    let haystack = format!("{} {} {}", command.1, command.2, command.3).to_lowercase();
+    let haystack = command.1.to_lowercase();
     query.split_whitespace().all(|word| haystack.contains(word))
 }
 impl State {
-    unsafe fn refresh(&mut self) {
+    unsafe fn current_query(&self) -> String {
         let mut value = vec![0u16; GetWindowTextLengthW(self.edit) as usize + 1];
         GetWindowTextW(self.edit, value.as_mut_ptr(), value.len() as i32);
-        let query = String::from_utf16_lossy(&value[..value.len() - 1]).to_lowercase();
+        String::from_utf16_lossy(&value[..value.len() - 1]).to_lowercase()
+    }
+    unsafe fn refresh(&mut self) {
+        let query = self.current_query();
+        self.query = query.clone();
         self.filtered = self
             .items
             .iter()
@@ -300,26 +310,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         WM_MOUSEWHEEL => {
             SendMessageW(s.list, WM_MOUSEWHEEL, wp, lp);
         }
-        REFRESH => s.refresh(),
+        REFRESH => {
+            if s.current_query() != s.query {
+                s.refresh();
+            }
+        }
         WM_CLOSE => s.hide(),
         WM_ACTIVATE if wp & 0xffff == WA_INACTIVE as usize => {
             ShowWindow(hwnd, SW_HIDE);
         }
-        WM_COMMAND if matches!((wp >> 16) as u32, LBN_SELCHANGE | LBN_DBLCLK) => s.execute(),
-        KEY => match wp as u16 {
-            VK_ESCAPE => s.hide(),
-            VK_RETURN => s.execute(),
-            VK_UP | VK_DOWN => {
-                let current = SendMessageW(s.list, LB_GETCURSEL, 0, 0);
-                let step = if wp as u16 == VK_UP { -1 } else { 1 };
-                let next = (current + step).clamp(0, s.filtered.len().saturating_sub(1) as isize);
-                SendMessageW(s.list, LB_SETCURSEL, next as usize, 0);
+        WM_COMMAND if (wp >> 16) as u32 == LBN_DBLCLK => s.execute(),
+        KEY => {
+            if s.current_query() != s.query {
+                s.refresh();
             }
-            VK_TAB => {
-                SetFocus(if GetFocus() == s.edit { s.list } else { s.edit });
+            match wp as u16 {
+                VK_ESCAPE => s.hide(),
+                VK_RETURN => s.execute(),
+                VK_UP | VK_DOWN => {
+                    let current = SendMessageW(s.list, LB_GETCURSEL, 0, 0);
+                    let step = if wp as u16 == VK_UP { -1 } else { 1 };
+                    let next =
+                        (current + step).clamp(0, s.filtered.len().saturating_sub(1) as isize);
+                    SendMessageW(s.list, LB_SETCURSEL, next as usize, 0);
+                    invalidate(s.list);
+                    SetFocus(s.edit);
+                }
+                VK_TAB => {
+                    SetFocus(if GetFocus() == s.edit { s.list } else { s.edit });
+                }
+                _ => (),
             }
-            _ => (),
-        },
+        }
         WM_DRAWITEM => {
             let d = &*(lp as *const DRAWITEMSTRUCT);
             if let Some(&index) = s.filtered.get(d.itemID as usize) {
@@ -436,7 +458,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
 fn command_search_matches_all_words() {
     let c = (1, "Markdown 导出 PDF", "Ctrl+P", "export print");
     assert!(matches(&c, "导出 pdf"));
-    assert!(matches(&c, "export"));
+    assert!(matches(&c, "markdown"));
+    assert!(!matches(&c, "export"));
+    assert!(!matches(&c, "ctrl+p"));
     assert!(!matches(&c, "导出 保存"));
 }
 
@@ -471,7 +495,7 @@ fn native_search_executes_without_editing_document() {
         );
         palette.show();
         with(palette.0, |s| {
-            SetWindowTextW(s.edit, wide("export").as_ptr());
+            SetWindowTextW(s.edit, wide("PDF").as_ptr());
             s.refresh();
             assert_eq!(s.filtered, vec![0]);
             assert_eq!(SendMessageW(s.list, LB_GETCOUNT, 0, 0), 1);
@@ -583,6 +607,71 @@ fn native_search_executes_without_editing_document() {
         );
         DestroyWindow(editor);
         FreeLibrary(library);
+        drop(palette);
+        DestroyWindow(parent);
+    }
+}
+
+#[test]
+#[ignore = "Requires Windows native controls"]
+fn native_palette_arrows_select_and_enter_executes_once() {
+    unsafe {
+        let parent = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            wide("Keys test").as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            800,
+            600,
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        let fonts = Fonts::new();
+        let palette = Palette::create(
+            parent,
+            fonts.ui,
+            fonts.small,
+            vec![(41, "First", "", ""), (42, "Second", "", "")],
+            WM_APP + 100,
+        );
+        palette.show();
+        let key = |key| MSG {
+            hwnd: parent,
+            message: WM_KEYDOWN,
+            wParam: key as usize,
+            ..zeroed()
+        };
+        // A delayed focus transfer from the terminal must not bypass palette navigation.
+        SetFocus(parent);
+        assert!(palette.key(&key(VK_DOWN)));
+        SendMessageW(palette.0, REFRESH, 0, 0);
+        with(palette.0, |s| {
+            assert_eq!(SendMessageW(s.list, LB_GETCURSEL, 0, 0), 1);
+            assert_eq!(GetFocus(), s.edit);
+            assert!(s.current_query().is_empty());
+        });
+        let mut msg: MSG = zeroed();
+        assert_eq!(
+            PeekMessageW(&mut msg, parent, WM_APP + 100, WM_APP + 100, PM_REMOVE),
+            0
+        );
+        assert!(palette.key(&key(VK_UP)));
+        assert!(palette.key(&key(VK_DOWN)));
+        assert!(palette.key(&key(VK_RETURN)));
+        assert_ne!(
+            PeekMessageW(&mut msg, parent, WM_APP + 100, WM_APP + 100, PM_REMOVE),
+            0
+        );
+        assert_eq!(msg.wParam, 42);
+        assert_eq!(
+            PeekMessageW(&mut msg, parent, WM_APP + 100, WM_APP + 100, PM_REMOVE),
+            0
+        );
+        assert_eq!(IsWindowVisible(palette.0), 0);
         drop(palette);
         DestroyWindow(parent);
     }

@@ -9,13 +9,17 @@ mod markdown;
 mod outline;
 mod palette;
 mod pdf;
+mod pdftext;
+mod printing;
 mod reader;
 mod scroll;
+mod search;
 mod selection;
 mod syntax;
 mod terminal;
 mod theme;
 mod ui;
+mod workspace;
 
 fn main() {
     ui::run();

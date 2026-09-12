@@ -555,6 +555,10 @@ impl Decoded {
 fn decode(bytes: &[u8], pixel_budget: u64) -> Result<Decoded, String> {
     decode_scaled(bytes, pixel_budget, 1600)
 }
+pub fn print_picture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+    let image = decode_scaled(&read(path)?, MAX_PIXELS, u32::MAX)?;
+    Ok((image.dib(false), image.width, image.height))
+}
 pub fn load_picture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     let image = decode_scaled(&read(path)?, MAX_PIXELS, u32::MAX)?;
     Ok((image.dib(true), image.width, image.height))

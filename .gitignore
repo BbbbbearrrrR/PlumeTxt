@@ -1,5 +1,6 @@
 /target/
 /.cargo-cache/
 /tmp/
+__pycache__/
 /FeatherPad.exe
 /FeatherPad.previous-*.exe

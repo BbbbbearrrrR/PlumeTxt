@@ -244,3 +244,66 @@ fn nested_bookmarks_named_destinations_and_cycles() {
         2
     );
 }
+
+#[test]
+#[ignore = "Set FEATHERPAD_PDF_REGRESSION to verify a local PDF's outline geometry"]
+fn local_pdf_destination_units_match_winrt() {
+    let Ok(path) = std::env::var("FEATHERPAD_PDF_REGRESSION") else {
+        return;
+    };
+    let d = Document::load(&path).unwrap();
+    let pages = d.get_pages();
+    let bookmarks = extract(&d).unwrap();
+    unsafe {
+        windows::Win32::System::WinRT::RoInitialize(
+            windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+        )
+        .unwrap();
+    }
+    {
+        let f = windows::Storage::StorageFile::GetFileFromPathAsync(&windows::core::HSTRING::from(
+            path,
+        ))
+        .unwrap()
+        .join()
+        .unwrap();
+        let pdf = windows::Data::Pdf::PdfDocument::LoadFromFileAsync(&f)
+            .unwrap()
+            .join()
+            .unwrap();
+        let mut checked = 0;
+        for b in bookmarks {
+            let (Some(index), Some(top)) = (b.page, b.top) else {
+                continue;
+            };
+            let dict = d
+                .get_object(pages[&(index + 1)])
+                .unwrap()
+                .as_dict()
+                .unwrap();
+            let bounds = dict.get(b"MediaBox").unwrap().as_array().unwrap();
+            let number = |v: &Object| match v {
+                Object::Integer(v) => *v as f32,
+                Object::Real(v) => *v,
+                _ => panic!("Invalid page bounds"),
+            };
+            let height = number(&bounds[3]) - number(&bounds[1]);
+            let page = pdf.GetPage(index).unwrap();
+            let display_height = page.Size().unwrap().Height;
+            page.Close().unwrap();
+            let expected = 1. - top / height;
+            let actual = 1. - top * (96. / 72.) / display_height;
+            assert!(
+                (actual - expected).abs() < 0.0001,
+                "Destination mismatch: {}",
+                b.title
+            );
+            checked += 1;
+        }
+        assert!(checked > 0);
+        eprintln!("Verified {checked} chapter destinations against PDF point geometry.");
+    }
+    unsafe {
+        windows::Win32::System::WinRT::RoUninitialize();
+    }
+}

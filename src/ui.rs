@@ -5,7 +5,8 @@ use crate::{
     markdown, palette, reader, scroll, terminal, theme,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
@@ -53,7 +54,18 @@ const IMAGE: usize = 123;
 const KEEP_CURRENT: usize = 124;
 const USE_DISK: usize = 125;
 const OVERVIEW: usize = 126;
+const OPEN_FOLDER: usize = 127;
+const CLOSE_FOLDER: usize = 128;
+const TOGGLE_FILES: usize = 130;
+const PRINT: usize = 131;
+const CANCEL_PRINT: usize = 132;
+const FIT_PAGE: usize = 133;
+const TEXT_RESET: usize = 134;
+const SEARCH: usize = 135;
+const FIND: usize = 136;
+const REFRESH_FILES: usize = 129;
 pub const PASTE: u32 = WM_APP + 8;
+const FOLD_HEADING: u32 = WM_APP + 9;
 const DISPATCH: u32 = WM_APP + 2;
 const LAYOUT: usize = 200;
 const CHANGE: usize = 201;
@@ -69,7 +81,7 @@ thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
-fn path_wide(path: &Path) -> Vec<u16> {
+pub(crate) fn path_wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
@@ -140,11 +152,23 @@ unsafe fn append_load_batch(
 }
 
 struct App {
+    search: Option<crate::search::Search>,
+    search_visible: bool,
+    search_hit: Option<crate::search::Hit>,
+    workspace: Option<crate::workspace::Workspace>,
+    workspace_width: i32,
+    workspace_visible: bool,
+    workspace_drag: Option<theme::Divider>,
+    folded: RefCell<BTreeSet<usize>>,
+    fold_revision: Cell<u64>,
     hwnd: HWND,
     edit: HWND,
     highlighter: crate::syntax::Highlighter,
     preview: HWND,
+    preview_only: bool,
     status: HWND,
+    commands_button: HWND,
+    status_message: RefCell<String>,
     file_type: HWND,
     terminal_button: HWND,
     terminal: Option<terminal::Terminal>,
@@ -170,6 +194,7 @@ struct App {
     monospace: bool,
     text_zoom: i32,
     buffer: theme::Buffer,
+    printing: Option<crate::printing::Job>,
     exporting: bool,
     export_result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
     loading: Option<Loading>,
@@ -178,6 +203,137 @@ struct App {
 }
 
 impl App {
+    unsafe fn focus_content(&self) {
+        let target = if self.pdf_path.is_some() {
+            self.viewer.as_ref().map_or(self.hwnd, |v| v.0)
+        } else if let Some(image) = &self.image {
+            image.0
+        } else if let Some(large) = &self.large {
+            large.0
+        } else if self.preview_only && !self.preview.is_null() {
+            self.preview
+        } else {
+            self.edit
+        };
+        SetFocus(target);
+    }
+    fn sidebar_visible(&self) -> bool {
+        self.workspace_visible
+            && if self.search_visible {
+                self.search.is_some()
+            } else {
+                self.workspace.is_some()
+            }
+    }
+    unsafe fn search_in(&mut self, path: PathBuf) {
+        if !self.search.as_ref().is_some_and(|s| s.is_scope(&path)) {
+            self.search.take();
+            self.workspace_width = self.workspace_width.max(340);
+            self.search = Some(crate::search::Search::create(
+                self.hwnd,
+                path,
+                self.fonts.small,
+            ));
+        }
+        self.search_visible = true;
+        self.workspace_visible = true;
+        self.layout();
+        self.search.as_ref().unwrap().focus();
+    }
+    unsafe fn select_search_result(&mut self, selection: Option<(i32, i32)>) {
+        self.preview_only = false;
+        self.show_editor();
+        if let Some((start, end)) = selection {
+            SendMessageW(self.edit, EM_SETSEL, start as usize, end as isize);
+            SendMessageW(self.edit, EM_SCROLLCARET, 0, 0);
+            theme::invalidate(self.edit);
+        } else {
+            self.status("File changed · Search again");
+        }
+    }
+    unsafe fn open_search_result(&mut self, hit: crate::search::Hit) {
+        if let Some(pdf) = hit.pdf {
+            if self.pdf_path.as_ref() != Some(&hit.path) {
+                self.open(hit.path.clone());
+            }
+            if self.pdf_path.as_ref() == Some(&hit.path) {
+                if let Some(viewer) = &self.viewer {
+                    viewer.highlight(pdf);
+                }
+            }
+            return;
+        }
+        if self.path.as_ref() == Some(&hit.path)
+            && self.chunk.is_none()
+            && self.loading.is_none()
+            && self.pdf_path.is_none()
+            && self.image.is_none()
+            && self.large.is_none()
+        {
+            self.select_search_result(hit.current_selection(&text(self.edit)));
+            return;
+        }
+        if !self.confirm_save() {
+            return;
+        }
+        self.cancel_loading();
+        let offset = std::fs::metadata(&hit.path)
+            .ok()
+            .filter(|m| m.len() > crate::large::THRESHOLD)
+            .map(|_| hit.offset.saturating_sub(4096));
+        self.begin_load(hit.path.clone(), offset);
+        self.search_hit = Some(hit);
+    }
+    unsafe fn open_folder(&mut self, path: PathBuf) {
+        match crate::workspace::Workspace::create(self.hwnd, path, self.fonts.small) {
+            Ok(workspace) => {
+                self.search.take();
+                self.search_visible = false;
+                self.workspace = Some(workspace);
+                self.workspace_visible = true;
+                self.layout();
+                self.status("");
+            }
+            Err(e) => error(self.hwnd, &e),
+        }
+    }
+    unsafe fn toggle_heading(&self, start: i32, end: i32) -> bool {
+        use windows::Win32::UI::Controls::RichEdit::ITextRange2;
+        use windows_core::Interface;
+        let key = (|| {
+            let doc = crate::syntax::document(self.preview)?;
+            let range: ITextRange2 = doc.Range(start, end).ok()?.cast().ok()?;
+            let url = range.GetURL().ok()?.to_string();
+            url.trim_matches('"')
+                .strip_prefix("featherpad-fold:")?
+                .parse::<usize>()
+                .ok()
+        })();
+        let Some(key) = key else {
+            return false;
+        };
+        let mut position: POINT = zeroed();
+        SendMessageW(
+            self.preview,
+            WM_USER + 221,
+            0,
+            &mut position as *mut _ as isize,
+        );
+        {
+            let mut folded = self.folded.borrow_mut();
+            if !folded.remove(&key) {
+                folded.insert(key);
+            }
+        }
+        self.refresh_preview();
+        SendMessageW(
+            self.preview,
+            WM_USER + 222,
+            0,
+            &position as *const _ as isize,
+        );
+        true
+    }
     unsafe fn cancel_loading(&mut self) {
         let loading = self.loading.take().is_some();
         if loading || self.chunk.take().is_some() {
@@ -192,6 +348,9 @@ impl App {
         }
     }
     unsafe fn begin_load(&mut self, path: PathBuf, offset: Option<u64>) {
+        self.search_hit = None;
+        self.preview_only = false;
+        self.folded.borrow_mut().clear();
         self.loading = None;
         self.chunk = None;
         self.close_comparison();
@@ -283,6 +442,17 @@ impl App {
             let factor = (0.008 / began.elapsed().as_secs_f64().max(0.0001)).clamp(0.5, 2.0);
             loading.batch = ((loading.batch as f64 * factor) as usize).clamp(8192, 256 * 1024);
             if loading.inserted == data.units.len() {
+                let search_selection = self.search_hit.take().map(|hit| {
+                    let start = data.chunk.as_ref().map_or(
+                        match data.encoding {
+                            Encoding::Utf8 => 0,
+                            Encoding::Utf8Bom => 3,
+                            _ => 2,
+                        },
+                        |chunk| chunk.start,
+                    );
+                    hit.selection(&String::from_utf16_lossy(&data.units), data.encoding, start)
+                });
                 self.encoding = data.encoding;
                 self.crlf = data.crlf;
                 self.original = data.original;
@@ -295,6 +465,21 @@ impl App {
                     self.watch = Some(crate::external::Watch::new(path.clone(), original));
                 }
                 self.highlighter.clear();
+                self.preview_only = self.is_markdown() && search_selection.is_none();
+                scroll::pair(self.edit, null_mut());
+                if !self.preview.is_null() {
+                    scroll::pair(self.preview, null_mut());
+                }
+                if self.preview_only && self.preview.is_null() {
+                    self.preview = rich_edit(self.hwnd, true, self.font);
+                    SendMessageW(self.preview, WM_USER + 225, self.text_zoom as usize, 100);
+                }
+                if !self.preview_only && !self.preview.is_null() {
+                    scroll::pair(self.edit, null_mut());
+                    DestroyWindow(self.preview);
+                    self.preview = null_mut();
+                }
+                self.layout();
                 if !self.preview.is_null() {
                     ShowWindow(self.preview, SW_SHOW);
                     self.layout();
@@ -303,6 +488,9 @@ impl App {
                 self.refresh_preview();
                 self.title();
                 self.status("");
+                if let Some(selection) = search_selection {
+                    self.select_search_result(selection);
+                }
                 return;
             }
         }
@@ -475,7 +663,12 @@ impl App {
             .unwrap_or_else(|| "Untitled".into());
         SetWindowTextW(
             self.file_type,
-            wide(&file_type(path.map(PathBuf::as_path))).as_ptr(),
+            wide(&format!(
+                "{}{}",
+                file_type(path.map(PathBuf::as_path)),
+                if dirty { " *" } else { "" }
+            ))
+            .as_ptr(),
         );
         SetWindowTextW(
             self.hwnd,
@@ -494,43 +687,102 @@ impl App {
             .as_ptr(),
         );
     }
-    fn hints(&self) -> &'static str {
+    unsafe fn hints(&self) -> String {
+        if self.printing.is_some() {
+            return "Printing…".into();
+        }
+        if self.exporting {
+            return "Exporting PDF…".into();
+        }
+        if self.saving.is_some() {
+            return "Saving…".into();
+        }
+        if self.loading.is_some() {
+            return "Loading…".into();
+        }
+        let wide = theme::client(self.hwnd).right >= 1050;
         if self.image.is_some() {
-            "Wheel Zoom    Drag Pan    Ctrl+0 Fit    Ctrl+E Editor    Ctrl+J Terminal"
+            if wide {
+                "Image  ·  Print Ctrl+P  ·  Fit Ctrl+0"
+            } else {
+                "Image  ·  Print Ctrl+P"
+            }
+            .into()
         } else if self.pdf_path.is_some() {
-            "Ctrl+O Open    Ctrl+Shift+L Outline    Ctrl+J Terminal    Ctrl+Shift+P Commands"
+            let position = self
+                .viewer
+                .as_ref()
+                .map(|v| v.page_status())
+                .unwrap_or_else(|| "PDF".into());
+            format!(
+                "{position}  ·  Print Ctrl+P{}",
+                if wide {
+                    "  ·  Outline Ctrl+Shift+L"
+                } else {
+                    ""
+                }
+            )
         } else if self.large.is_some() {
-            "Double-click / Ctrl+E Edit region    Ctrl+O Open    Ctrl+J Terminal"
+            "Overview  ·  Edit region Ctrl+E".into()
+        } else if self.comparison.is_some() {
+            "Review external changes".into()
+        } else if self.preview_only {
+            if wide {
+                "Reading  ·  Edit Ctrl+E  ·  Export Ctrl+Shift+E"
+            } else {
+                "Reading  ·  Edit Ctrl+E"
+            }
+            .into()
+        } else if self.is_markdown() {
+            if wide {
+                "Editing  ·  Save Ctrl+S  ·  Preview Ctrl+Shift+M"
+            } else {
+                "Editing  ·  Save Ctrl+S"
+            }
+            .into()
         } else {
-            "Ctrl+S Save    Ctrl+Shift+M Preview    Ctrl+P PDF    Ctrl+J Terminal    Ctrl+Shift+P Commands"
+            "Editing  ·  Save Ctrl+S".into()
+        }
+    }
+    unsafe fn refresh_status(&self) {
+        let message = self.status_message.borrow();
+        let value = if message.is_empty() {
+            self.hints()
+        } else {
+            message.clone()
+        };
+        if text(self.status) != value {
+            SetWindowTextW(self.status, wide(&value).as_ptr());
         }
     }
     unsafe fn status(&self, message: &str) {
-        SetWindowTextW(
-            self.status,
-            wide(if message.is_empty() {
-                self.hints()
-            } else {
-                message
-            })
-            .as_ptr(),
-        );
+        *self.status_message.borrow_mut() = message.into();
+        self.refresh_status();
         if !message.is_empty() {
             SetTimer(self.hwnd, 8, 3000, None);
         }
     }
     unsafe fn layout(&mut self) {
         let rc = theme::client(self.hwnd);
-        MoveWindow(
+        theme::move_window(
             self.status,
-            24,
+            16,
             rc.bottom - 27,
-            (rc.right - 230).max(1),
+            (rc.right - 398).max(1),
             24,
             0,
         );
-        MoveWindow(self.file_type, rc.right - 188, rc.bottom - 27, 120, 24, 0);
-        MoveWindow(
+        theme::move_window(self.file_type, rc.right - 366, rc.bottom - 27, 120, 24, 0);
+        theme::move_window(
+            self.commands_button,
+            rc.right - 236,
+            rc.bottom - 29,
+            176,
+            24,
+            0,
+        );
+        self.refresh_status();
+        theme::move_window(
             self.terminal_button,
             rc.right - 52,
             rc.bottom - 29,
@@ -539,16 +791,53 @@ impl App {
             0,
         );
         let bottom = rc.bottom;
-        let right = (rc.right - self.terminal_width).max(1);
+        let left = if self.sidebar_visible() {
+            self.workspace_width.min((rc.right - 360).max(160))
+        } else {
+            0
+        };
+        let right = (rc.right - self.terminal_width).max(left + 1);
+        if let Some(workspace) = &self.workspace {
+            ShowWindow(
+                workspace.hwnd,
+                if self.workspace_visible && !self.search_visible {
+                    SW_SHOWNA
+                } else {
+                    SW_HIDE
+                },
+            );
+            if self.workspace_visible && !self.search_visible {
+                scroll::resize(
+                    workspace.hwnd,
+                    8,
+                    12,
+                    (left - 16).max(1),
+                    (bottom - 54).max(1),
+                );
+            }
+        }
+        if let Some(search) = &self.search {
+            ShowWindow(
+                search.0,
+                if self.workspace_visible && self.search_visible {
+                    SW_SHOWNA
+                } else {
+                    SW_HIDE
+                },
+            );
+            if self.workspace_visible && self.search_visible {
+                theme::move_window(search.0, 0, 0, left - 4, (bottom - 34).max(1), 0);
+            }
+        }
         if let Some(view) = &self.image {
-            MoveWindow(view.0, 0, 0, right, (bottom - 34).max(1), 0);
+            theme::move_window(view.0, left, 0, right - left, (bottom - 34).max(1), 0);
             theme::invalidate(view.0);
         }
         if let Some(view) = &self.large {
-            MoveWindow(view.0, 0, 0, right, (bottom - 34).max(1), 0);
+            theme::move_window(view.0, left, 0, right - left, (bottom - 34).max(1), 0);
         }
         if let Some(terminal) = &self.terminal {
-            MoveWindow(
+            theme::move_window(
                 terminal.0,
                 right + 8,
                 12,
@@ -558,17 +847,17 @@ impl App {
             );
         }
         if let Some(viewer) = &self.viewer {
-            MoveWindow(viewer.0, 0, 0, right, (bottom - 34).max(1), 0);
+            theme::move_window(viewer.0, left, 0, right - left, (bottom - 34).max(1), 0);
         }
         let inset = if self.preview.is_null() {
-            ((right - 960) / 2).max(16)
+            left + ((right - left - 960) / 2).max(16)
         } else {
-            16
+            left + 16
         };
         let split = if self.preview.is_null() {
-            right - inset
+            right - (inset - left)
         } else {
-            right / 2
+            left + (right - left) / 2
         };
         scroll::resize(
             self.edit,
@@ -577,12 +866,16 @@ impl App {
             (split - inset).max(1),
             (bottom - 64).max(1),
         );
+        let reading = self.preview_only && self.comparison.is_none();
+        if self.image.is_none() && self.pdf_path.is_none() && self.large.is_none() {
+            ShowWindow(self.edit, if reading { SW_HIDE } else { SW_SHOWNA });
+        }
         if !self.preview.is_null() {
             scroll::resize(
                 self.preview,
-                split + 1,
+                if reading { left + 16 } else { split + 1 },
                 if self.comparison.is_some() { 40 } else { 24 },
-                (right - split - 17).max(1),
+                (right - if reading { left + 32 } else { split + 17 }).max(1),
                 (bottom - if self.comparison.is_some() { 80 } else { 64 }).max(1),
             );
         }
@@ -591,19 +884,15 @@ impl App {
             && self.pdf_path.is_none()
             && self.large.is_none();
         for (i, action) in self.compare_actions.iter().enumerate() {
-            MoveWindow(*action, split + 12 + i as i32 * 134, 6, 128, 26, 0);
+            theme::move_window(*action, split + 12 + i as i32 * 134, 6, 128, 26, 0);
             ShowWindow(*action, if comparing { SW_SHOWNA } else { SW_HIDE });
         }
-        scroll::show(self.edit, self.preview.is_null() || comparing);
-        InvalidateRect(self.edit, null(), 1);
-        if !self.preview.is_null() {
-            InvalidateRect(self.preview, null(), 1);
-        }
+        scroll::show(self.edit, !reading && (self.preview.is_null() || comparing));
         theme::invalidate(self.hwnd);
         SetTimer(self.hwnd, 9, 80, None);
     }
     unsafe fn sync_scroll(&self, source: HWND) {
-        if self.comparison.is_some() {
+        if self.comparison.is_some() || self.preview_only {
             return;
         }
         if self.preview.is_null() || (source != self.edit && source != self.preview) {
@@ -791,6 +1080,11 @@ impl App {
         }
     }
     unsafe fn open(&mut self, path: PathBuf) {
+        self.search_hit = None;
+        if path.is_dir() {
+            self.open_folder(path);
+            return;
+        }
         if !self.confirm_save() {
             return;
         }
@@ -919,14 +1213,19 @@ impl App {
             let dpi = GetDeviceCaps(dc, LOGPIXELSX as i32).max(1);
             ReleaseDC(self.preview, dc);
             let width = ((rc.right - 48).max(16) * 1440 / dpi) as usize;
+            let source = text(self.edit);
+            let revision = document::fingerprint(source.as_bytes());
+            if self.fold_revision.replace(revision) != revision {
+                self.folded.borrow_mut().clear();
+            }
             SendMessageW(self.preview, WM_SETREDRAW, 0, 0);
             let result = set_rtf(
                 self.preview,
-                &markdown::with_images(
-                    &text(self.edit),
+                &markdown::folding_preview(
+                    &source,
                     width,
-                    true,
                     self.path.as_deref().and_then(Path::parent),
+                    &self.folded.borrow(),
                 ),
             );
             self.sync_scroll(self.edit);
@@ -1000,9 +1299,131 @@ impl App {
         );
         SetFocus(self.edit);
     }
+    fn essential_commands(&self) -> Vec<palette::Command> {
+        let mut items = vec![(OPEN, "Open file", "Ctrl+O", "open")];
+        if self.pdf_path.is_some() || self.path.is_some() || self.workspace.is_some() {
+            items.push((FIND, "Find", "Ctrl+F", ""));
+        }
+        if self.workspace.is_some() {
+            items.extend([
+                (SEARCH, "Search workspace", "Ctrl+Shift+F", ""),
+                (
+                    TOGGLE_FILES,
+                    "Toggle file tree",
+                    "Ctrl+Shift+B",
+                    "workspace sidebar hide show",
+                ),
+                (REFRESH_FILES, "Refresh files", "", "workspace reload"),
+                (CLOSE_FOLDER, "Close folder", "", "workspace single file"),
+            ]);
+        } else {
+            items.push((OPEN_FOLDER, "Open folder", "Ctrl+Shift+O", "workspace"));
+        }
+        if self.loading.is_none() && self.saving.is_none() {
+            if self.pdf_path.is_some() || self.image.is_some() {
+                if self.printing.is_none() {
+                    items.push((PRINT, "Print", "Ctrl+P", "printer pages copies"));
+                }
+                items.push((FIT, "Fit width", "Ctrl+0", "fit image"));
+                if self.pdf_path.is_some() {
+                    items.extend([
+                        (
+                            TOC,
+                            "Toggle outline",
+                            "Ctrl+Shift+L",
+                            "pdf directory hide show",
+                        ),
+                        (FIT_PAGE, "Fit page", "Ctrl+Shift+0", "pdf whole page"),
+                    ]);
+                }
+            } else if self.large.is_some() {
+                items.push((EDITOR, "Edit region", "Ctrl+E", "large file"));
+            } else if self.comparison.is_some() {
+                items.extend([
+                    (KEEP_CURRENT, "Keep current", "", "external changes"),
+                    (USE_DISK, "Use disk", "", "external changes"),
+                ]);
+            } else {
+                items.extend([
+                    (SAVE, "Save", "Ctrl+S", "save"),
+                    (SAVE_AS, "Save as", "Ctrl+Shift+S", "save copy"),
+                ]);
+                if self.is_markdown() {
+                    items.extend([
+                        (
+                            PREVIEW,
+                            if self.preview_only {
+                                "Edit Markdown"
+                            } else {
+                                "Read Markdown"
+                            },
+                            "Ctrl+Shift+M",
+                            "preview reading editing",
+                        ),
+                        (EXPORT, "Export PDF", "Ctrl+Shift+E", "export"),
+                        (IMAGE, "Insert image", "Ctrl+Shift+I", "picture"),
+                    ]);
+                }
+                if self.chunk.is_some() {
+                    items.push((OVERVIEW, "Document overview", "", "large file navigate"));
+                }
+            }
+        }
+        items.push((TERMINAL, "Toggle terminal", "Ctrl+J", "shell"));
+        if self.printing.is_some() {
+            items.push((CANCEL_PRINT, "Cancel print", "", "stop printer"));
+        }
+        items
+    }
     unsafe fn command(&mut self, id: usize) {
+        if id == PRINT {
+            if self.printing.is_some() {
+                self.status("Printing…");
+                return;
+            }
+            let Some(path) = self.pdf_path.as_ref().or(self.image_path.as_ref()).cloned() else {
+                self.status("Open an image or PDF to print.");
+                return;
+            };
+            let pdf = self.pdf_path.is_some();
+            let pages = if pdf {
+                self.viewer.as_ref().map_or(0, |v| v.page_count())
+            } else {
+                1
+            };
+            match crate::printing::choose(self.hwnd, path, pdf, pages) {
+                Ok(Some(job)) => {
+                    self.printing = Some(job);
+                    self.status("Printing…");
+                    SetTimer(self.hwnd, 13, 200, None);
+                }
+                Ok(None) => (),
+                Err(e) => error(self.hwnd, &e),
+            }
+            return;
+        }
+        if id == CANCEL_PRINT {
+            if let Some(job) = &self.printing {
+                job.cancel();
+                self.status("Cancelling print…");
+            }
+            return;
+        }
         if (self.loading.is_some() || self.saving.is_some())
-            && !matches!(id, OPEN | NEW | EXIT | TERMINAL | COMMANDS | LAYOUT)
+            && !matches!(
+                id,
+                OPEN | NEW
+                    | EXIT
+                    | TERMINAL
+                    | COMMANDS
+                    | LAYOUT
+                    | OPEN_FOLDER
+                    | CLOSE_FOLDER
+                    | TOGGLE_FILES
+                    | REFRESH_FILES
+                    | SEARCH
+                    | FIND
+            )
         {
             return;
         }
@@ -1035,6 +1456,62 @@ impl App {
         }
 
         match id {
+            FIND => {
+                let path = self
+                    .pdf_path
+                    .as_ref()
+                    .or(self.path.as_ref())
+                    .cloned()
+                    .or_else(|| self.workspace.as_ref().map(|w| w.root.clone()));
+                if let Some(path) = path {
+                    self.search_in(path);
+                } else {
+                    self.command(SEARCH);
+                }
+            }
+            SEARCH => {
+                if self.workspace.is_none() {
+                    if let Some(path) = crate::workspace::choose_folder(self.hwnd) {
+                        self.open_folder(path);
+                    }
+                }
+                if let Some(workspace) = &self.workspace {
+                    self.search_in(workspace.root.clone());
+                }
+            }
+            OPEN_FOLDER => {
+                if let Some(path) = crate::workspace::choose_folder(self.hwnd) {
+                    self.open_folder(path);
+                }
+            }
+            TOGGLE_FILES => {
+                if self.workspace.is_some() || self.search.is_some() {
+                    self.workspace_visible = self.search_visible || !self.workspace_visible;
+                    self.search_visible = false;
+                    self.workspace_drag.take();
+                    if GetCapture() == self.hwnd {
+                        ReleaseCapture();
+                    }
+                    if !self.sidebar_visible() {
+                        self.focus_content();
+                    }
+                    self.layout();
+                }
+            }
+            CLOSE_FOLDER => {
+                self.search.take();
+                self.search_visible = false;
+                self.workspace.take();
+                self.layout();
+                self.focus_content();
+            }
+            REFRESH_FILES => {
+                if let Some(workspace) = &mut self.workspace {
+                    if let Err(e) = workspace.refresh() {
+                        error(self.hwnd, &e);
+                    }
+                }
+            }
             KEEP_CURRENT | USE_DISK => self.resolve_external(id == USE_DISK),
             OPEN => {
                 if let Some(path) = dialog(self.hwnd, false, false) {
@@ -1045,6 +1522,8 @@ impl App {
                 if self.confirm_save() {
                     self.cancel_loading();
                     self.chunk = None;
+                    self.preview_only = false;
+                    self.folded.borrow_mut().clear();
                     SetWindowTextW(self.edit, wide("").as_ptr());
                     SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
                     self.close_comparison();
@@ -1064,6 +1543,7 @@ impl App {
                 self.save(true);
             }
             EDITOR => {
+                self.preview_only = false;
                 if let (Some(view), Some(path)) = (&self.large, &self.large_path) {
                     let offset = view.offset();
                     self.begin_load(path.clone(), Some(offset));
@@ -1086,6 +1566,33 @@ impl App {
             }
             PREVIEW => {
                 self.show_editor();
+                if self.is_markdown() && !self.preview.is_null() {
+                    self.preview_only = !self.preview_only;
+                    scroll::pair(
+                        self.edit,
+                        if self.preview_only {
+                            null_mut()
+                        } else {
+                            self.preview
+                        },
+                    );
+                    scroll::pair(
+                        self.preview,
+                        if self.preview_only {
+                            null_mut()
+                        } else {
+                            self.edit
+                        },
+                    );
+                    self.layout();
+                    self.refresh_preview();
+                    SetFocus(if self.preview_only {
+                        self.preview
+                    } else {
+                        self.edit
+                    });
+                    return;
+                }
                 if self.preview.is_null() {
                     self.preview = rich_edit(self.hwnd, true, self.font);
                     scroll::pair(self.preview, self.edit);
@@ -1100,6 +1607,10 @@ impl App {
                 self.refresh_preview();
             }
             EXPORT => {
+                if self.pdf_path.is_some() || self.image.is_some() {
+                    self.status("Open Markdown to export. Use Ctrl+P to print this file.");
+                    return;
+                }
                 if self.exporting {
                     self.status("Exporting…");
                     return;
@@ -1195,6 +1706,11 @@ impl App {
                         .or(self.path.as_ref())
                         .and_then(|p| p.parent())
                         .and_then(|p| std::path::absolute(p).ok())
+                        .or_else(|| {
+                            self.workspace
+                                .as_ref()
+                                .map(|workspace| workspace.root.clone())
+                        })
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     self.terminal = Some(terminal::Terminal::create(self.hwnd, &cwd));
                 }
@@ -1216,7 +1732,10 @@ impl App {
                     self.insert_image(crate::assets::Paste::File(path));
                 }
             }
-            COMMANDS => self.palette.show(),
+            COMMANDS => {
+                self.palette.set_commands(self.essential_commands());
+                self.palette.show();
+            }
             FONT_MODE => {
                 self.monospace = !self.monospace;
                 SendMessageW(
@@ -1235,17 +1754,27 @@ impl App {
                 self.status(if self.monospace {
                     "Consolas"
                 } else {
-                    "Segoe UI"
+                    "Segoe UI Semilight"
                 });
             }
-            TEXT_LARGER | TEXT_SMALLER => {
-                self.text_zoom =
-                    (self.text_zoom + if id == TEXT_LARGER { 10 } else { -10 }).clamp(70, 200);
+            TEXT_LARGER | TEXT_SMALLER | TEXT_RESET => {
+                self.text_zoom = if id == TEXT_RESET {
+                    100
+                } else {
+                    (self.text_zoom + if id == TEXT_LARGER { 10 } else { -10 }).clamp(70, 200)
+                };
                 SendMessageW(self.edit, WM_USER + 225, self.text_zoom as usize, 100);
                 if !self.preview.is_null() {
                     SendMessageW(self.preview, WM_USER + 225, self.text_zoom as usize, 100);
                 }
                 self.status(&format!("{}%", self.text_zoom));
+            }
+            FIT_PAGE => {
+                if self.pdf_path.is_some() {
+                    if let Some(viewer) = &self.viewer {
+                        viewer.action(reader::FIT_PAGE);
+                    }
+                }
             }
             TOC => {
                 if let Some(viewer) = &self.viewer {
@@ -1264,12 +1793,41 @@ impl App {
         }
         let dc = self.buffer.dc;
         fill(dc, rc, CANVAS);
+        if self.sidebar_visible() {
+            let width = self.workspace_width.min((rc.right - 360).max(160));
+            fill(
+                dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: rc.bottom - 34,
+                },
+                SURFACE,
+            );
+            fill(
+                dc,
+                RECT {
+                    left: width - 1,
+                    top: 0,
+                    right: width,
+                    bottom: rc.bottom - 34,
+                },
+                LINE,
+            );
+        }
         if self.large.is_none()
             && self.pdf_path.is_none()
             && self.image.is_none()
             && !self.preview.is_null()
+            && (!self.preview_only || self.comparison.is_some())
         {
-            let middle = (rc.right - self.terminal_width).max(1) / 2;
+            let left = if self.sidebar_visible() {
+                self.workspace_width.min((rc.right - 360).max(160))
+            } else {
+                0
+            };
+            let middle = left + (rc.right - self.terminal_width - left).max(1) / 2;
             fill(
                 dc,
                 RECT {
@@ -1336,7 +1894,18 @@ unsafe fn rich_edit(parent: HWND, readonly: bool, font: HFONT) -> HWND {
         theme::editor_colors(control);
         theme::dark_scrollbars(control, theme::CANVAS);
     }
-    SendMessageW(control, EM_SETEVENTMASK, 0, 1); // ENM_CHANGE
+    SendMessageW(
+        control,
+        WM_USER + 204,
+        0,
+        windows::Win32::UI::Controls::RichEdit::SES_HYPERLINKTOOLTIPS as isize,
+    );
+    SendMessageW(
+        control,
+        EM_SETEVENTMASK,
+        0,
+        if readonly { 1 | 0x04000000 } else { 1 },
+    ); // ENM_CHANGE | ENM_LINK
     let margin = RECT {
         left: 32,
         top: 20,
@@ -1777,16 +2346,78 @@ fn native_terminal_button_paints_during_reentrant_layout() {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
+        WM_NOTIFY if lp != 0 => {
+            return APP.with(|slot| {
+                let Ok(mut slot) = slot.try_borrow_mut() else {
+                    return 0;
+                };
+                let Some(app) = slot.as_mut() else {
+                    return 0;
+                };
+                let hdr = &*(lp as *const NMHDR);
+                if app
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|tree| tree.hwnd == hdr.hwndFrom)
+                {
+                    if hdr.code == NM_CUSTOMDRAW {
+                        let draw = &mut *(lp as *mut NMTVCUSTOMDRAW);
+                        if draw.nmcd.dwDrawStage == CDDS_PREPAINT {
+                            return CDRF_NOTIFYITEMDRAW as isize;
+                        }
+                        if draw.nmcd.dwDrawStage == CDDS_ITEMPREPAINT {
+                            let selected = draw.nmcd.uItemState & (CDIS_SELECTED | CDIS_FOCUS) != 0;
+                            draw.nmcd.uItemState &= !(CDIS_HOT | CDIS_FOCUS);
+                            draw.clrText = if selected { theme::ACCENT } else { theme::INK };
+                            draw.clrTextBk = if selected {
+                                theme::SELECTED
+                            } else {
+                                theme::SURFACE
+                            };
+                            return CDRF_NEWFONT as isize;
+                        }
+                    }
+                    match app.workspace.as_mut().unwrap().notify(lp) {
+                        Ok(Some(path)) => app.open(path),
+                        Err(e) => {
+                            app.status(&e);
+                            return 1;
+                        }
+                        _ => (),
+                    }
+                }
+                use windows::Win32::UI::Controls::RichEdit::{ENLINK, EN_LINK};
+                if hdr.hwndFrom == app.preview && hdr.code == EN_LINK && app.comparison.is_none() {
+                    let link = &*(lp as *const ENLINK);
+                    if link.msg == WM_LBUTTONUP
+                        || (link.msg == WM_KEYDOWN && link.wParam.0 == VK_RETURN as usize)
+                    {
+                        // Rebuild after RichEdit finishes dispatching its link event.
+                        PostMessageW(
+                            hwnd,
+                            FOLD_HEADING,
+                            link.chrg.cpMin as usize,
+                            link.chrg.cpMax as isize,
+                        );
+                        return 1;
+                    }
+                }
+                0
+            });
+        }
         WM_DRAWITEM if !((lp as *const DRAWITEMSTRUCT).is_null()) => {
             let draw = &*(lp as *const DRAWITEMSTRUCT);
-            if [TERMINAL as u32, KEEP_CURRENT as u32, USE_DISK as u32].contains(&draw.CtlID) {
+            if [
+                TERMINAL as u32,
+                COMMANDS as u32,
+                KEEP_CURRENT as u32,
+                USE_DISK as u32,
+            ]
+            .contains(&draw.CtlID)
+            {
                 draw_terminal_button(draw);
                 return 1;
             }
-        }
-        WM_SYSKEYUP if wp as u16 == VK_MENU => {
-            PostMessageW(hwnd, DISPATCH, COMMANDS, 0);
-            return 0;
         }
         WM_ERASEBKGND => {
             theme::fill(wp as HDC, theme::client(hwnd), theme::CANVAS);
@@ -1871,6 +2502,63 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             return false;
         };
         match msg {
+            crate::search::CLOSE => {
+                app.search_visible = false;
+                app.layout();
+                if let Some(workspace) = &app.workspace {
+                    SetFocus(workspace.hwnd);
+                } else {
+                    app.focus_content();
+                }
+            }
+            crate::search::OPEN_RESULT => {
+                if let Some(hit) = app
+                    .search
+                    .as_ref()
+                    .filter(|search| search.0 as usize == wp)
+                    .and_then(|search| search.take_hit())
+                {
+                    app.open_search_result(hit);
+                }
+            }
+            WM_LBUTTONDOWN if app.sidebar_visible() => {
+                let x = lp as u16 as i16 as i32;
+                let width = app
+                    .workspace_width
+                    .min((theme::client(hwnd).right - 360).max(160));
+                if (x - width).abs() <= 7 {
+                    app.workspace_drag = Some(theme::Divider::new(hwnd, width));
+                    SetCapture(hwnd);
+                }
+            }
+            WM_MOUSEMOVE if app.sidebar_visible() => {
+                let x = lp as u16 as i16 as i32;
+                let rc = theme::client(hwnd);
+                if let Some(guide) = &mut app.workspace_drag {
+                    guide.move_to(hwnd, x.clamp(160, (rc.right - 360).max(160)));
+                }
+                if app.workspace_drag.is_some()
+                    || (x - app.workspace_width.min((rc.right - 360).max(160))).abs() <= 7
+                {
+                    SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                }
+            }
+            WM_LBUTTONUP | WM_CAPTURECHANGED if app.workspace_drag.is_some() => {
+                let guide = app.workspace_drag.take().unwrap();
+                let width = guide.x;
+                drop(guide);
+                if msg == WM_LBUTTONUP {
+                    app.workspace_width = width;
+                    ReleaseCapture();
+                    app.layout();
+                    SetTimer(hwnd, 1, 100, None);
+                }
+            }
+            FOLD_HEADING => {
+                if !app.preview.is_null() && app.comparison.is_none() {
+                    app.toggle_heading(wp as i32, lp as i32);
+                }
+            }
             crate::large::EDIT_CURRENT => {
                 if app.large.is_some() {
                     if let Some(path) = app.large_path.clone() {
@@ -1921,8 +2609,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                 match wp {
                     11 => app.load_tick(),
                     12 => app.save_tick(),
+                    13 => {
+                        let result = app.printing.as_ref().map(|job| job.result.try_recv());
+                        match result {
+                            Some(Ok(result)) => {
+                                app.printing.take();
+                                match result {
+                                    Ok(()) => app.status("Sent to printer"),
+                                    Err(e) => {
+                                        app.status("Print stopped");
+                                        error(hwnd, &e);
+                                    }
+                                }
+                            }
+                            Some(Err(TryRecvError::Empty)) => {
+                                SetTimer(hwnd, 13, 200, None);
+                            }
+                            Some(Err(TryRecvError::Disconnected)) => {
+                                app.printing.take();
+                                app.status("Print worker stopped");
+                            }
+                            None => (),
+                        }
+                    }
                     10 => {
                         self::App::poll_external(app);
+                        app.refresh_status();
                         SetTimer(hwnd, 10, 400, None);
                     }
                     1 => app.refresh_preview(),
@@ -2004,6 +2716,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     && app.image.is_none()
                     && app.large.is_none()
                     && crate::assets::supported(&path)
+                    && path.is_file()
                 {
                     app.insert_image(crate::assets::Paste::File(path));
                 } else {
@@ -2119,17 +2832,32 @@ pub fn run() {
             0,
             wide("STATIC").as_ptr(),
             wide("").as_ptr(),
-            WS_CHILD | WS_VISIBLE | 0x100 | 0xc000,
+            WS_CHILD | WS_VISIBLE | 0xc000,
             0,
             0,
             1,
             1,
             hwnd,
-            COMMANDS as _,
+            null_mut(),
             instance,
             null(),
         );
         SendMessageW(status, WM_SETFONT, fonts.small as usize, 0);
+        let commands_button = CreateWindowExW(
+            0,
+            wide("BUTTON").as_ptr(),
+            wide("Commands  Ctrl+Shift+P").as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW as u32,
+            0,
+            0,
+            176,
+            24,
+            hwnd,
+            COMMANDS as _,
+            instance,
+            null(),
+        );
+        SendMessageW(commands_button, WM_SETFONT, fonts.small as usize, 0);
         let file_type = CreateWindowExW(
             0,
             wide("STATIC").as_ptr(),
@@ -2179,53 +2907,26 @@ pub fn run() {
                 SendMessageW(button, WM_SETFONT, fonts.small as usize, 0);
                 button
             });
-        let palette = palette::Palette::create(
-            hwnd,
-            fonts.ui,
-            fonts.small,
-            vec![
-                (OPEN, "Open", "Ctrl+O", "open file pdf markdown image photo"),
-                (NEW, "New", "Ctrl+N", "new"),
-                (SAVE, "Save", "Ctrl+S", "save"),
-                (SAVE_AS, "Save as", "Ctrl+Shift+S", "save as"),
-                (PREVIEW, "Preview", "Ctrl+Shift+M", "preview"),
-                (EXPORT, "Export PDF", "Ctrl+P", "export print"),
-                (TOC, "Outline", "Ctrl+Shift+L", "outline sidebar"),
-                (FIT, "Fit width", "Ctrl+0", "fit"),
-                (ZOOM_IN, "Zoom in", "Ctrl +", "zoom in"),
-                (ZOOM_OUT, "Zoom out", "Ctrl -", "zoom out"),
-                (FONT_MODE, "Font", "", "font segoe consolas"),
-                (TEXT_LARGER, "Larger text", "", "font larger size"),
-                (TEXT_SMALLER, "Smaller text", "", "font smaller size"),
-                (EDITOR, "Editor", "Ctrl+E", "editor"),
-                (
-                    OVERVIEW,
-                    "Document overview",
-                    "Ctrl+Shift+E",
-                    "large file region navigate",
-                ),
-                (202, "Refresh", "Ctrl+Shift+R", "refresh"),
-                (BOLD, "Bold", "Ctrl+B", "bold"),
-                (ITALIC, "Italic", "Ctrl+I", "italic"),
-                (CODE, "Inline code", "Ctrl+K", "code"),
-                (TERMINAL, "Terminal", "Ctrl+J", "shell powershell"),
-                (
-                    IMAGE,
-                    "Insert image",
-                    "Ctrl+Shift+I",
-                    "picture photo png jpeg",
-                ),
-                (EXIT, "Quit", "Ctrl+Q", "exit"),
-            ],
-            DISPATCH,
-        );
+        let palette = palette::Palette::create(hwnd, fonts.ui, fonts.small, Vec::new(), DISPATCH);
         APP.with(|slot| {
             *slot.borrow_mut() = Some(App {
+                search: None,
+                search_visible: false,
+                search_hit: None,
+                workspace: None,
+                workspace_width: 240,
+                workspace_visible: true,
+                workspace_drag: None,
+                folded: RefCell::new(BTreeSet::new()),
+                fold_revision: Cell::new(0),
                 hwnd,
                 edit,
                 highlighter: crate::syntax::Highlighter::default(),
                 preview: null_mut(),
+                preview_only: false,
                 status,
+                commands_button,
+                status_message: RefCell::new(String::new()),
                 file_type,
                 terminal_button,
                 terminal: None,
@@ -2251,6 +2952,7 @@ pub fn run() {
                 monospace: false,
                 text_zoom: 100,
                 buffer: theme::Buffer::default(),
+                printing: None,
                 exporting: false,
                 export_result: Arc::new(Mutex::new(None)),
                 loading: None,
@@ -2282,17 +2984,27 @@ pub fn run() {
             if status <= 0 {
                 break;
             }
-            if msg.message == WM_SYSKEYUP && msg.wParam == VK_MENU as usize {
-                SendMessageW(hwnd, DISPATCH, COMMANDS, 0);
+            if APP.with(|s| s.borrow().as_ref().is_some_and(|a| a.palette.key(&msg))) {
                 continue;
             }
-            if APP.with(|s| s.borrow().as_ref().is_some_and(|a| a.palette.key(&msg))) {
+            if APP.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .is_some_and(|a| a.search.as_ref().is_some_and(|search| search.key(&msg)))
+            }) {
                 continue;
             }
             let in_terminal = APP.with(|s| {
                 s.borrow()
                     .as_ref()
                     .is_some_and(|a| a.terminal.as_ref().is_some_and(|t| t.contains(msg.hwnd)))
+            });
+            let in_search = APP.with(|s| {
+                s.borrow().as_ref().is_some_and(|a| {
+                    a.search
+                        .as_ref()
+                        .is_some_and(|search| search.contains(msg.hwnd))
+                })
             });
             if msg.message == WM_KEYDOWN {
                 let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
@@ -2302,7 +3014,30 @@ pub fn run() {
                         .as_ref()
                         .is_some_and(|a| a.pdf_path.is_some() || a.image.is_some())
                 });
-                let command = shortcut(msg.wParam as u16, ctrl, shift, pdf_mode, in_terminal);
+                let mut command = if GetKeyState(VK_MENU as i32) < 0 {
+                    0
+                } else {
+                    shortcut(msg.wParam as u16, ctrl, shift, pdf_mode, in_terminal)
+                };
+                if in_search
+                    && !matches!(
+                        command,
+                        SEARCH
+                            | FIND
+                            | COMMANDS
+                            | TOGGLE_FILES
+                            | TERMINAL
+                            | OPEN
+                            | OPEN_FOLDER
+                            | CLOSE_FOLDER
+                            | SAVE
+                            | SAVE_AS
+                            | EXIT
+                            | NEW
+                    )
+                {
+                    command = 0;
+                }
                 if command != 0 {
                     SendMessageW(hwnd, DISPATCH, command, 0);
                     continue;
@@ -2458,6 +3193,49 @@ fn native_region_export_includes_whole_document_and_unsaved_edits() {
     std::fs::remove_file(input).unwrap();
     std::fs::remove_file(output).unwrap();
     std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
+#[ignore = "Requires Windows RichEdit"]
+fn native_preview_heading_arrow_has_actionable_link() {
+    use windows::Win32::UI::Controls::RichEdit::ITextRange2;
+    use windows_core::Interface;
+    let _ole = crate::assets::Ole::new().unwrap();
+    unsafe {
+        LoadLibraryW(wide("Msftedit.dll").as_ptr());
+        let control = rich_edit(null_mut(), true, GetStockObject(DEFAULT_GUI_FONT));
+        let source = "# Heading\n\nBODY_MARKER\n\n# Next\n\nNEXT_MARKER";
+        set_rtf(
+            control,
+            &markdown::folding_preview(source, 9000, None, &BTreeSet::new()),
+        )
+        .unwrap();
+        let doc = crate::syntax::document(control).unwrap();
+        let range = doc.Range(0, 0).unwrap();
+        assert!(
+            range
+                .FindText(
+                    &windows_core::BSTR::from("▾"),
+                    1000,
+                    windows::Win32::UI::Controls::RichEdit::tomConstants(0)
+                )
+                .unwrap()
+                > 0
+        );
+        let link: ITextRange2 = range.cast().unwrap();
+        assert_eq!(
+            link.GetURL().unwrap().to_string().trim_matches('"'),
+            "featherpad-fold:0"
+        );
+        set_rtf(
+            control,
+            &markdown::folding_preview(source, 9000, None, &BTreeSet::from([0])),
+        )
+        .unwrap();
+        assert!(!text(control).contains("BODY_MARKER"));
+        assert!(text(control).contains("NEXT_MARKER"));
+        DestroyWindow(control);
+    }
 }
 
 #[test]
@@ -2820,20 +3598,24 @@ fn native_highlighting_preserves_text_selection_scroll_and_undo() {
 
 fn shortcut(key: u16, ctrl: bool, shift: bool, pdf: bool, terminal: bool) -> usize {
     match (ctrl, shift, key) {
-        (true, _, VK_OEM_3 | 0x4a) => TERMINAL,
-        (true, _, 0x4e) => NEW,
-        (true, _, 0x4f) => OPEN,
+        (true, false, VK_OEM_3 | 0x4a) => TERMINAL,
+        (true, false, 0x4e) => NEW,
+        (true, true, 0x4f) => OPEN_FOLDER,
+        (true, false, 0x4f) => OPEN,
         (true, true, 0x53) => SAVE_AS,
         (true, false, 0x53) => SAVE,
         (true, true, 0x50) => COMMANDS,
+        (true, true, 0x46) => SEARCH,
+        (true, false, 0x46) => FIND,
         (true, false, 0x51) => EXIT,
-        (true, false, 0x50) => EXPORT,
-        (true, true, 0x45) => OVERVIEW,
+        (true, false, 0x50) => PRINT,
+        (true, true, 0x45) => EXPORT,
         (true, false, 0x45) => EDITOR,
         (true, true, 0x49) => IMAGE,
-        (true, _, 0x42) if !terminal => BOLD,
-        (true, false, 0x49) if !terminal => ITALIC,
-        (true, _, 0x4b) if !terminal => CODE,
+        (true, true, 0x42) => TOGGLE_FILES,
+        (true, false, 0x42) if !terminal && !pdf => BOLD,
+        (true, false, 0x49) if !terminal && !pdf => ITALIC,
+        (true, false, 0x4b) if !terminal && !pdf => CODE,
         (true, true, 0x4d) => PREVIEW,
         (true, true, 0x52) => 202,
         (true, true, 0x4c) if pdf => TOC,
@@ -2841,7 +3623,11 @@ fn shortcut(key: u16, ctrl: bool, shift: bool, pdf: bool, terminal: bool) -> usi
         (false, _, VK_NEXT) if pdf && !terminal => NEXT,
         (true, _, VK_OEM_PLUS | VK_ADD) if pdf => ZOOM_IN,
         (true, _, VK_OEM_MINUS | VK_SUBTRACT) if pdf => ZOOM_OUT,
-        (true, _, 0x30) if pdf => FIT,
+        (true, true, 0x30) if pdf => FIT_PAGE,
+        (true, false, 0x30) if pdf => FIT,
+        (true, _, VK_OEM_PLUS | VK_ADD) if !terminal => TEXT_LARGER,
+        (true, _, VK_OEM_MINUS | VK_SUBTRACT) if !terminal => TEXT_SMALLER,
+        (true, false, 0x30) if !terminal => TEXT_RESET,
         _ => 0,
     }
 }
@@ -2865,10 +3651,17 @@ unsafe fn image_dialog(hwnd: HWND) -> Option<PathBuf> {
 #[test]
 fn shortcuts_work_with_terminal_focus() {
     for terminal in [false, true] {
+        for pdf in [false, true] {
+            assert_eq!(shortcut(0x46, true, false, pdf, terminal), FIND);
+            assert_eq!(shortcut(0x46, true, true, pdf, terminal), SEARCH);
+        }
+        assert_eq!(shortcut(0x42, true, true, false, terminal), TOGGLE_FILES);
+        assert_eq!(shortcut(0x4f, true, false, false, terminal), OPEN);
+        assert_eq!(shortcut(0x4f, true, true, false, terminal), OPEN_FOLDER);
         assert_eq!(shortcut(0x45, true, false, false, terminal), EDITOR);
-        assert_eq!(shortcut(0x45, true, true, false, terminal), OVERVIEW);
+        assert_eq!(shortcut(0x45, true, true, false, terminal), EXPORT);
         assert_eq!(shortcut(0x53, true, true, false, terminal), SAVE_AS);
-        assert_eq!(shortcut(0x50, true, false, false, terminal), EXPORT);
+        assert_eq!(shortcut(0x50, true, false, false, terminal), PRINT);
         assert_eq!(shortcut(0x50, true, true, false, terminal), COMMANDS);
         assert_eq!(shortcut(0x4a, true, false, false, terminal), TERMINAL);
         assert_eq!(shortcut(0x53, true, false, false, terminal), SAVE);
@@ -2884,6 +3677,14 @@ fn shortcuts_work_with_terminal_focus() {
             }
         }
     }
+    assert_eq!(shortcut(0x4b, true, true, false, false), 0);
+    assert_eq!(shortcut(0x4a, true, true, false, false), 0);
+    assert_eq!(shortcut(0x42, true, false, true, false), 0);
+    assert_eq!(
+        shortcut(VK_OEM_PLUS, true, false, false, false),
+        TEXT_LARGER
+    );
+    assert_eq!(shortcut(0x30, true, false, false, false), TEXT_RESET);
     assert_eq!(shortcut(0x43, true, false, false, true), 0); // Shell Ctrl+C stays native.
     assert_eq!(shortcut(0x56, true, false, false, true), 0); // Shell paste stays native.
     assert_eq!(shortcut(0x49, true, false, false, false), ITALIC);

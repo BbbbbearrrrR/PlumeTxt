@@ -83,7 +83,25 @@ foreach ($type in $types) {
     }
 }
 Set-RegistryText 'Software\RegisteredApplications' 'FeatherPad' $capabilities
+# Reuse the application's folder argument for Explorer workspace entry points.
+foreach ($entry in @(
+    @{ Class = 'Directory'; Argument = '%1' },
+    @{ Class = 'Directory\Background'; Argument = '%V' },
+    @{ Class = 'Drive'; Argument = '%1' }
+)) {
+    $verb = "Software\Classes\$($entry.Class)\shell\FeatherPad"
+    # Appending \. keeps a drive root's trailing slash away from the closing quote.
+    $folderCommand = '"{0}" "{1}\."' -f $appPath, $entry.Argument
+    Set-RegistryText $verb '' 'Open with FeatherPad'
+    Set-RegistryText $verb 'Icon' ('"{0}",-1' -f $appPath)
+    Set-RegistryText "$verb\command" '' $folderCommand
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$verb\command")
+    try {
+        if ($key.GetValue('') -ne $folderCommand) { throw "Folder menu registration failed: $($entry.Class)" }
+    } finally { $key.Dispose() }
+}
 [FeatherPadFileIcons]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+Write-Output 'Registered Open with FeatherPad for folders, folder backgrounds and drives.'
 Write-Output "Verified $($types.Count) embedded icons; registered $registered extensions for the current user."
 foreach ($type in $types) {
     foreach ($extension in $type.extensions.Split(' ')) {

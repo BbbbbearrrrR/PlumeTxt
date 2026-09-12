@@ -64,10 +64,10 @@ pub struct Fonts {
 impl Fonts {
     pub unsafe fn new() -> Self {
         Self {
-            ui: font(17, 400, "Segoe UI"),
+            ui: font(16, 350, "Segoe UI Semilight"),
             small: font(13, 400, "Segoe UI"),
             code: font(20, 400, "Consolas"),
-            body: font(20, 400, "Segoe UI"),
+            body: font(20, 350, "Segoe UI Semilight"),
         }
     }
 }
@@ -165,6 +165,35 @@ pub unsafe fn invalidate(hwnd: HWND) {
     InvalidateRect(hwnd, null(), 0);
 }
 
+pub unsafe fn move_window(hwnd: HWND, x: i32, y: i32, width: i32, height: i32, _repaint: i32) {
+    let mut previous: RECT = zeroed();
+    GetWindowRect(hwnd, &mut previous);
+    let mut origin = POINT {
+        x: previous.left,
+        y: previous.top,
+    };
+    ScreenToClient(GetParent(hwnd), &mut origin);
+    if origin.x == x
+        && origin.y == y
+        && previous.right - previous.left == width
+        && previous.bottom - previous.top == height
+    {
+        return;
+    }
+    // Do not stretch/copy old glyphs while the new layout is pending.
+    SetWindowPos(
+        hwnd,
+        null_mut(),
+        x,
+        y,
+        width,
+        height,
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW | SWP_NOCOPYBITS,
+    );
+    invalidate(hwnd);
+    invalidate(GetParent(hwnd));
+}
+
 // CHARFORMATW has the same layout on Win32 and Win64.
 #[repr(C)]
 struct CharacterFormat {
@@ -194,6 +223,76 @@ pub unsafe fn editor_colors(hwnd: HWND) {
 
 pub unsafe fn dark_scrollbars(hwnd: HWND, background: u32) {
     crate::scroll::attach(hwnd, background);
+}
+
+// A compositor-backed divider guide keeps expensive document reflow out of mouse motion.
+pub struct Divider {
+    hwnd: HWND,
+    pub x: i32,
+}
+impl Divider {
+    pub unsafe fn new(parent: HWND, x: i32) -> Self {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        let name = wide("FeatherPadDivider");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(divider_proc),
+            hInstance: GetModuleHandleW(null()),
+            lpszClassName: name.as_ptr(),
+            ..zeroed()
+        });
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+            name.as_ptr(),
+            wide("").as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            2,
+            1,
+            parent,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        SetLayeredWindowAttributes(hwnd, 0, 200, LWA_ALPHA);
+        let mut guide = Self { hwnd, x };
+        guide.move_to(parent, x);
+        guide
+    }
+    pub unsafe fn move_to(&mut self, parent: HWND, x: i32) {
+        self.x = x;
+        let mut origin = POINT { x, y: 0 };
+        ClientToScreen(parent, &mut origin);
+        SetWindowPos(
+            self.hwnd,
+            HWND_TOP,
+            origin.x,
+            origin.y,
+            2,
+            client(parent).bottom.max(1),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+impl Drop for Divider {
+    fn drop(&mut self) {
+        unsafe {
+            DestroyWindow(self.hwnd);
+        }
+    }
+}
+unsafe extern "system" fn divider_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    if msg == WM_PAINT {
+        let mut paint = zeroed();
+        let dc = BeginPaint(hwnd, &mut paint);
+        fill(dc, client(hwnd), ACCENT);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    if msg == WM_ERASEBKGND {
+        return 1;
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
 }
 pub unsafe fn rounded(dc: HDC, rect: RECT, color: u32, radius: i32) {
     let brush = CreateSolidBrush(color);

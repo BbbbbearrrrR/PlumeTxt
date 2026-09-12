@@ -1,4 +1,20 @@
 fn main() {
+    let source = std::path::Path::new("runtime/pdfium");
+    println!("cargo:rerun-if-changed=runtime/pdfium");
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let runtime = out.ancestors().nth(3).unwrap().join("runtime/pdfium");
+    std::fs::create_dir_all(runtime.join("licenses")).unwrap();
+    for name in ["pdfium.dll", "LICENSE", "VERSION"] {
+        std::fs::copy(source.join(name), runtime.join(name)).expect("copy PDF search runtime");
+    }
+    for entry in std::fs::read_dir(source.join("licenses")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(
+            entry.path(),
+            runtime.join("licenses").join(entry.file_name()),
+        )
+        .unwrap();
+    }
     println!("cargo:rerun-if-changed=assets/feather.ico");
     println!("cargo:rerun-if-changed=assets/file-types.tsv");
     let mut resources = winresource::WindowsResource::new();

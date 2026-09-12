@@ -196,7 +196,7 @@ pub fn dimensions(width: f32, height: f32, requested: u32) -> (u32, u32) {
     (w as u32, (w * ratio).max(1.0) as u32)
 }
 
-fn render(doc: &PdfDocument, index: u32, requested: u32) -> Result<Page> {
+pub(crate) fn render(doc: &PdfDocument, index: u32, requested: u32) -> Result<Page> {
     let count = doc.PageCount()?;
     let index = index.min(count.saturating_sub(1));
     let page = doc.GetPage(index)?;

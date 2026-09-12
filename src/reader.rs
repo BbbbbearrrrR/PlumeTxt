@@ -14,11 +14,13 @@ use windows_sys::Win32::{
 };
 
 pub const SCROLL_TO: u32 = WM_APP + 94;
+const JUMP: u32 = WM_APP + 23;
 const RESIZE: u32 = WM_APP + 21;
 pub const ACTION: u32 = WM_APP + 22;
 pub const SMALLER: usize = 1;
 pub const LARGER: usize = 2;
 pub const FIT: usize = 3;
+pub const FIT_PAGE: usize = 7;
 pub const UP: usize = 4;
 pub const DOWN: usize = 5;
 pub const TOGGLE_TOC: usize = 6;
@@ -54,6 +56,16 @@ impl Layout {
         result.total = top;
         result
     }
+    fn reading_zoom(sizes: &[(f32, f32)], width: i32, height: i32, fraction: f32) -> f32 {
+        let Some(&(w, h)) = sizes.first() else {
+            return 1.;
+        };
+        let available = (width - 2 * GAP).max(1) as f32;
+        let widest = sizes.iter().map(|p| p.0).fold(1.0f32, f32::max);
+        let scale =
+            (available / w.max(1.)).min((height - 2 * GAP).max(1) as f32 / (h.max(1.) * fraction));
+        scale * widest / (width - 2 * GAP).max(64) as f32
+    }
     pub fn at(&self, y: i32) -> usize {
         self.pages.partition_point(|p| p.top <= y).saturating_sub(1)
     }
@@ -79,6 +91,8 @@ impl Layout {
 }
 
 struct State {
+    search_match: Option<crate::pdftext::Match>,
+    search_tint: Buffer,
     hwnd: HWND,
     tree: HWND,
     font: HFONT,
@@ -92,9 +106,12 @@ struct State {
     cache: VecDeque<pdf::Page>,
     bookmarks: Vec<Bookmark>,
     toc_visible: bool,
+    toc_width: i32,
+    toc_drag: Option<Divider>,
     toc_note: String,
     message: String,
     zoom: f32,
+    auto_page_fraction: Option<f32>,
     x: i32,
     y: i32,
     viewport_width: i32,
@@ -142,7 +159,9 @@ impl Reader {
                 | WS_TABSTOP
                 | TVS_HASBUTTONS
                 | TVS_LINESATROOT
-                | TVS_SHOWSELALWAYS,
+                | TVS_SHOWSELALWAYS
+                | TVS_NOTOOLTIPS
+                | TVS_NOHSCROLL,
             0,
             0,
             1,
@@ -153,12 +172,14 @@ impl Reader {
             null(),
         );
         dark_scrollbars(tree, SURFACE);
-        SendMessageW(tree, WM_SETFONT, font as usize, 0);
+        SendMessageW(tree, WM_SETFONT, small as usize, 0);
         SendMessageW(tree, TVM_SETBKCOLOR, 0, SURFACE as isize);
         SendMessageW(tree, TVM_SETTEXTCOLOR, 0, INK as isize);
-        SendMessageW(tree, TVM_SETITEMHEIGHT, 30, 0);
+        SendMessageW(tree, TVM_SETITEMHEIGHT, 24, 0);
         SetWindowTheme(tree, wide("").as_ptr(), wide("").as_ptr());
         let state = State {
+            search_match: None,
+            search_tint: Buffer::default(),
             hwnd,
             tree,
             font,
@@ -172,9 +193,12 @@ impl Reader {
             cache: VecDeque::new(),
             bookmarks: Vec::new(),
             toc_visible: true,
+            toc_width: 242,
+            toc_drag: None,
             toc_note: "".into(),
             message: "Loading…".into(),
             zoom: 1.,
+            auto_page_fraction: Some(0.75),
             x: 0,
             y: 0,
             viewport_width: 0,
@@ -194,6 +218,7 @@ impl Reader {
     }
     pub unsafe fn open(&self, path: PathBuf) {
         with(self.0, |s| {
+            s.search_match = None;
             s.path = path;
             s.document_id += 1;
             s.generation += 1;
@@ -204,6 +229,7 @@ impl Reader {
             s.x = 0;
             s.y = 0;
             s.zoom = 1.;
+            s.auto_page_fraction = Some(0.75);
             s.message = "Loading…".into();
             s.toc_note = "".into();
             SendMessageW(s.tree, TVM_DELETEITEM, 0, TVI_ROOT);
@@ -221,6 +247,7 @@ impl Reader {
     }
     pub unsafe fn close(&self) {
         with(self.0, |s| {
+            s.search_match = None;
             s.document_id += 1;
             s.worker.close();
             s.cache.clear();
@@ -229,6 +256,27 @@ impl Reader {
             s.bookmarks.clear();
         });
         ShowWindow(self.0, SW_HIDE);
+    }
+    pub unsafe fn page_status(&self) -> String {
+        let mut status = "PDF".into();
+        with(self.0, |s| {
+            if !s.layout.pages.is_empty() {
+                status = format!("Page {} / {}", s.current_page() + 1, s.sizes.len());
+            }
+        });
+        status
+    }
+    pub unsafe fn highlight(&self, hit: crate::pdftext::Match) {
+        with(self.0, |s| {
+            s.search_match = Some(hit);
+            s.reveal_match();
+        });
+        SetFocus(self.0);
+    }
+    pub unsafe fn page_count(&self) -> u32 {
+        let mut count = 0;
+        with(self.0, |s| count = s.sizes.len() as u32);
+        count
     }
     pub unsafe fn action(&self, action: usize) {
         SendMessageW(self.0, ACTION, action, 0);
@@ -254,7 +302,8 @@ unsafe fn with(hwnd: HWND, f: impl FnOnce(&mut State)) {
 impl State {
     fn sidebar(&self) -> i32 {
         if self.toc_visible {
-            242
+            self.toc_width
+                .min((unsafe { client(self.hwnd).right } - 240).max(140))
         } else {
             0
         }
@@ -262,24 +311,26 @@ impl State {
     unsafe fn resize(&mut self) {
         let rc = client(self.hwnd);
         let side = self.sidebar();
-        MoveWindow(
+        crate::scroll::resize(
             self.tree,
             12,
             HEADER + 64,
             (side - 24).max(1),
             (rc.bottom - HEADER - 104).max(1),
-            0,
         );
         ShowWindow(self.tree, if self.toc_visible { SW_SHOW } else { SW_HIDE });
         // MoveWindow suppresses repaint; the parent's paint excludes this child.
         // Repaint newly exposed outline space when a docked panel closes.
-        InvalidateRect(self.tree, null(), 1);
+        InvalidateRect(self.tree, null(), 0);
         let width = (rc.right - side).max(64);
         let height = (rc.bottom - HEADER).max(1);
         if width != self.viewport_width || height != self.viewport_height {
             let anchor = self.layout.anchor(self.y + self.viewport_height / 3);
             self.viewport_width = width;
             self.viewport_height = height;
+            if let Some(fraction) = self.auto_page_fraction {
+                self.zoom = Layout::reading_zoom(&self.sizes, width, height, fraction);
+            }
             self.layout = Layout::new(&self.sizes, width, self.zoom);
             self.y = self.layout.restore(anchor) - height / 3;
             self.generation += 1;
@@ -373,11 +424,20 @@ impl State {
             match reply {
                 pdf::Reply::Info(id, sizes) if id == self.document_id => {
                     self.sizes = sizes;
+                    if let Some(fraction) = self.auto_page_fraction {
+                        self.zoom = Layout::reading_zoom(
+                            &self.sizes,
+                            self.viewport_width,
+                            self.viewport_height,
+                            fraction,
+                        );
+                    }
                     self.layout = Layout::new(&self.sizes, self.viewport_width, self.zoom);
                     self.y = 0;
                     self.message.clear();
                     self.scrollbars();
                     self.schedule();
+                    self.reveal_match();
                 }
                 pdf::Reply::Page(id, generation, page)
                     if id == self.document_id && generation == self.generation =>
@@ -457,7 +517,10 @@ impl State {
                 self.y = page.1.top - GAP;
                 if let Some(top) = bookmark.top {
                     let size = self.sizes[page.0 as usize];
-                    self.y += (page.1.height as f32 * (1. - top / size.1).clamp(0., 1.)) as i32;
+                    // PDF destinations use 72-point units; WinRT page sizes use 96-DPI DIPs.
+                    self.y += (page.1.height as f32
+                        * (1. - top * (96. / 72.) / size.1).clamp(0., 1.))
+                        as i32;
                 }
                 self.scrollbars();
                 self.schedule();
@@ -465,7 +528,38 @@ impl State {
             }
         }
     }
+    unsafe fn reveal_match(&mut self) {
+        let Some(hit) = &self.search_match else {
+            return;
+        };
+        let Some(page) = self.layout.pages.get(hit.page) else {
+            return;
+        };
+        let top = hit.boxes.first().map_or(0., |b| b[1].clamp(0., 1.));
+        self.y = page.top + (top * page.height as f32) as i32 - self.viewport_height / 3;
+        if let Some(bounds) = hit.boxes.first() {
+            let center = (bounds[0] + bounds[2]) * 0.5;
+            self.x = ((center * page.width as f32) as i32 - self.viewport_width / 2).max(0);
+        }
+        self.scrollbars();
+        self.schedule();
+        PostMessageW(self.hwnd, crate::scroll::POSITION, 1, self.y as isize);
+        invalidate(self.hwnd);
+    }
+    fn current_page(&self) -> usize {
+        if let Some(hit) = &self.search_match {
+            if let Some(page) = self.layout.pages.get(hit.page) {
+                let top =
+                    page.top + (hit.boxes.first().map_or(0., |b| b[1]) * page.height as f32) as i32;
+                if top >= self.y && top < self.y + self.viewport_height {
+                    return hit.page;
+                }
+            }
+        }
+        self.layout.at(self.y + GAP)
+    }
     unsafe fn zoom(&mut self, factor: f32, anchor_y: i32) {
+        self.auto_page_fraction = None;
         let anchor = self.layout.anchor(self.y + anchor_y);
         self.zoom = factor.clamp(0.25, 4.);
         self.layout = Layout::new(&self.sizes, self.viewport_width, self.zoom);
@@ -510,9 +604,23 @@ impl State {
             SMALLER => self.zoom(self.zoom / 1.2, self.viewport_height / 3),
             LARGER => self.zoom(self.zoom * 1.2, self.viewport_height / 3),
             FIT => self.zoom(1., self.viewport_height / 3),
+            FIT_PAGE => {
+                let zoom = Layout::reading_zoom(
+                    &self.sizes,
+                    self.viewport_width,
+                    self.viewport_height,
+                    1.,
+                );
+                self.zoom(zoom, self.viewport_height / 3);
+                self.auto_page_fraction = Some(1.);
+            }
             UP => self.scroll(SB_VERT, SB_PAGEUP, 0),
             DOWN => self.scroll(SB_VERT, SB_PAGEDOWN, 0),
             TOGGLE_TOC => {
+                self.toc_drag.take();
+                if GetCapture() == self.hwnd {
+                    ReleaseCapture();
+                }
                 self.toc_visible = !self.toc_visible;
                 self.resize();
             }
@@ -538,7 +646,7 @@ impl State {
         let current = if self.sizes.is_empty() {
             0
         } else {
-            self.layout.at(self.y + GAP) + 1
+            self.current_page() + 1
         };
         if self.toc_visible {
             label(
@@ -670,6 +778,50 @@ impl State {
                 );
             }
         }
+        if let Some(hit) = &self.search_match {
+            if let Some(page) = self.layout.pages.get(hit.page) {
+                if self.search_tint.ensure(dc, 1, 1) {
+                    fill(
+                        self.search_tint.dc,
+                        RECT {
+                            left: 0,
+                            top: 0,
+                            right: 1,
+                            bottom: 1,
+                        },
+                        ACCENT,
+                    );
+                    let x = side + ((self.viewport_width - page.width) / 2).max(GAP) - self.x;
+                    let y = HEADER + page.top - self.y;
+                    for b in &hit.boxes {
+                        let l = x + (b[0].clamp(0., 1.) * page.width as f32) as i32;
+                        let t = y + (b[1].clamp(0., 1.) * page.height as f32) as i32;
+                        let r = x + (b[2].clamp(0., 1.) * page.width as f32).ceil() as i32;
+                        let bottom = y + (b[3].clamp(0., 1.) * page.height as f32).ceil() as i32;
+                        if r > l && bottom > t {
+                            GdiAlphaBlend(
+                                dc,
+                                l,
+                                t,
+                                r - l,
+                                bottom - t,
+                                self.search_tint.dc,
+                                0,
+                                0,
+                                1,
+                                1,
+                                BLENDFUNCTION {
+                                    BlendOp: AC_SRC_OVER as u8,
+                                    BlendFlags: 0,
+                                    SourceConstantAlpha: 90,
+                                    AlphaFormat: 0,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if !self.message.is_empty() {
             label(
                 dc,
@@ -735,6 +887,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             s.schedule();
             invalidate(hwnd);
         }
+        JUMP => {
+            s.jump(wp);
+            // Cancel any in-flight wheel animation before applying the destination.
+            PostMessageW(hwnd, crate::scroll::POSITION, 1, s.y as isize);
+        }
         RESIZE => s.resize(),
         pdf::READY => s.replies(),
         ACTION | WM_COMMAND => s.action(wp & 0xffff),
@@ -747,14 +904,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                 }
                 if draw.nmcd.dwDrawStage == CDDS_ITEMPREPAINT {
                     let selected = draw.nmcd.uItemState & (CDIS_SELECTED | CDIS_FOCUS) != 0;
+                    draw.nmcd.uItemState &= !(CDIS_HOT | CDIS_FOCUS);
                     draw.clrText = if selected { ACCENT } else { INK };
                     draw.clrTextBk = if selected { SELECTED } else { SURFACE };
                     return CDRF_NEWFONT as isize;
                 }
             }
+            if hdr.hwndFrom == s.tree && hdr.code == NM_CLICK {
+                let mut hit: TVHITTESTINFO = zeroed();
+                GetCursorPos(&mut hit.pt);
+                ScreenToClient(s.tree, &mut hit.pt);
+                SendMessageW(s.tree, TVM_HITTEST, 0, &mut hit as *mut _ as isize);
+                if hit.flags & (TVHT_ONITEMLABEL | TVHT_ONITEMICON) != 0 {
+                    let mut item = TVITEMW {
+                        mask: TVIF_PARAM,
+                        hItem: hit.hItem,
+                        ..zeroed()
+                    };
+                    if SendMessageW(s.tree, TVM_GETITEMW, 0, &mut item as *mut _ as isize) != 0 {
+                        PostMessageW(hwnd, JUMP, item.lParam as usize, 0);
+                    }
+                }
+            }
             if hdr.hwndFrom == s.tree && hdr.code == TVN_SELCHANGEDW {
                 let tv = &*(lp as *const NMTREEVIEWW);
-                s.jump(tv.itemNew.lParam as usize);
+                PostMessageW(hwnd, JUMP, tv.itemNew.lParam as usize, 0);
             }
         }
         WM_VSCROLL | WM_HSCROLL => s.scroll(
@@ -798,7 +972,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             VK_END => s.scroll(SB_VERT, SB_BOTTOM, 0),
             _ => return DefWindowProcW(hwnd, msg, wp, lp),
         },
+        WM_MOUSEMOVE => {
+            let x = lp as u16 as i16 as i32;
+            if let Some(guide) = &mut s.toc_drag {
+                guide.move_to(hwnd, x.clamp(140, (client(hwnd).right - 240).max(140)));
+            }
+            if s.toc_visible && (s.toc_drag.is_some() || (x - s.sidebar()).abs() <= 7) {
+                SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+            }
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED if s.toc_drag.is_some() => {
+            let guide = s.toc_drag.take().unwrap();
+            let width = guide.x;
+            drop(guide);
+            if msg == WM_LBUTTONUP {
+                s.toc_width = width;
+                ReleaseCapture();
+                s.resize();
+                invalidate(hwnd);
+            }
+        }
         WM_LBUTTONDOWN => {
+            let x = lp as u16 as i16 as i32;
+            if s.toc_visible && (x - s.sidebar()).abs() <= 7 {
+                s.toc_drag = Some(Divider::new(hwnd, s.sidebar()));
+                SetCapture(hwnd);
+            }
             SetFocus(hwnd);
         }
         WM_TIMER => {
@@ -944,9 +1143,56 @@ fn native_continuous_reader_settles_after_scrolling() {
             let anchor = s.layout.anchor(s.y + 200);
             s.zoom(1.2, 200);
             assert!((s.layout.anchor(s.y + 200).1 - anchor.1).abs() < 0.002);
+            // Check the page-internal destination, not just the target page index.
+            let original_top = s.bookmarks[2].top;
+            s.bookmarks[2].top = Some(s.sizes[5].1 * (72. / 96.) * 0.75);
+            s.jump(2);
+            let destination = s.layout.pages[5];
+            let expected = destination.top - GAP + (destination.height as f32 * 0.25) as i32;
+            // Last-page scrolling is clamped by the viewport as usual.
+            assert!((s.y - expected.min((s.layout.total - s.viewport_height).max(0))).abs() <= 1);
+            s.bookmarks[2].top = original_top;
             s.jump(2);
             assert_eq!(s.layout.at(s.y + GAP), 5);
             assert!(s.cache.iter().map(|p| p.pixels.len()).sum::<usize>() <= CACHE_BYTES);
+        });
+        SendMessageW(
+            reader.0,
+            WM_MOUSEWHEEL,
+            ((-120i16 as u16 as usize) << 16) as _,
+            0,
+        );
+        SendMessageW(reader.0, JUMP, 2, 0);
+        pump(Duration::from_millis(250));
+        with(reader.0, |s| assert_eq!(s.layout.at(s.y + GAP), 5));
+        SendMessageW(reader.0, JUMP, 0, 0);
+        pump(Duration::from_millis(100));
+        SendMessageW(reader.0, JUMP, 2, 0);
+        pump(Duration::from_millis(250));
+        with(reader.0, |s| assert_eq!(s.layout.at(s.y + GAP), 5));
+        SendMessageW(reader.0, WM_LBUTTONDOWN, 1, (100 << 16) | 242);
+        SendMessageW(reader.0, WM_MOUSEMOVE, 1, (100 << 16) | 350);
+        with(reader.0, |s| {
+            assert_eq!(s.sidebar(), 242);
+            assert_eq!(s.toc_drag.as_ref().unwrap().x, 350);
+        });
+        SendMessageW(reader.0, WM_LBUTTONUP, 0, (100 << 16) | 350);
+        with(reader.0, |s| {
+            assert_eq!(s.sidebar(), 350);
+            assert_ne!(GetWindowLongW(s.tree, GWL_STYLE) as u32 & TVS_NOTOOLTIPS, 0);
+            assert_ne!(GetWindowLongW(s.tree, GWL_STYLE) as u32 & TVS_NOHSCROLL, 0);
+        });
+        with(reader.0, |s| {
+            let selected = SendMessageW(s.tree, TVM_GETNEXTITEM, TVGN_CARET as usize, 0);
+            s.action(TOGGLE_TOC);
+            assert_eq!(s.sidebar(), 0);
+            assert_eq!(GetWindowLongW(s.tree, GWL_STYLE) as u32 & WS_VISIBLE, 0);
+            s.action(TOGGLE_TOC);
+            assert_eq!(s.sidebar(), 350);
+            assert_eq!(
+                SendMessageW(s.tree, TVM_GETNEXTITEM, TVGN_CARET as usize, 0),
+                selected
+            );
         });
         ShowWindow(parent, SW_SHOWNOACTIVATE);
         // Terminal close expands the outline after its old bounds were painted.
@@ -983,5 +1229,23 @@ fn native_continuous_reader_settles_after_scrolling() {
         assert_eq!(SendMessageW(reader.0, WM_ERASEBKGND, 0, 0), 1);
         drop(reader);
         DestroyWindow(parent);
+    }
+}
+
+#[test]
+fn default_pdf_reading_view_shows_three_quarters_of_a_page() {
+    for (width, height) in [(800, 600), (1600, 1000), (2400, 1800)] {
+        let sizes = [(595., 842.), (842., 595.)];
+        let zoom = Layout::reading_zoom(&sizes, width, height, 0.75);
+        let layout = Layout::new(&sizes, width, zoom);
+        let visible = (height - 2 * GAP) as f32 / layout.pages[0].height as f32;
+        assert!((visible - 0.75).abs() < 0.002);
+        assert!(layout.pages[0].width + 2 * GAP <= width);
+        let whole = Layout::new(
+            &sizes,
+            width,
+            Layout::reading_zoom(&sizes, width, height, 1.),
+        );
+        assert!(whole.pages[0].height + 2 * GAP <= height);
     }
 }

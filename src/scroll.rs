@@ -19,6 +19,7 @@ pub const SYNC: u32 = WM_APP + 91;
 pub const POSITION: u32 = WM_APP + 92;
 const UPDATE: u32 = WM_APP + 93;
 const TIMER: usize = 904;
+const TREE_IDLE: usize = 905;
 pub const ES_DISABLENOSCROLL: u32 = 0x2000;
 const MEASURE: u32 = WM_APP + 95;
 struct Host {
@@ -108,12 +109,22 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
     } else {
         3
     };
-    if kind == 0 {
+    if kind == 0 || kind == 1 {
         SetPropW(
             hwnd,
             wide("FeatherPadClippedScroll").as_ptr(),
             (bg as usize + 1) as _,
         );
+    }
+    if kind == 3 {
+        SetPropW(
+            hwnd,
+            wide("FeatherPadTreeScroll").as_ptr(),
+            (bg as usize + 1) as _,
+        );
+    }
+    if kind == 1 || kind == 3 {
+        SetPropW(hwnd, wide("FeatherPadQuietScroll").as_ptr(), 1usize as _);
     }
     let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
     SetWindowLongW(
@@ -121,6 +132,9 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
         GWL_STYLE,
         if kind == 0 {
             ((style & !WS_HSCROLL) | WS_VSCROLL | ES_DISABLENOSCROLL | WS_CLIPSIBLINGS) as i32
+        } else if kind == 1 {
+            ((style & !WS_HSCROLL) | WS_VSCROLL | LBS_DISABLENOSCROLL as u32 | WS_CLIPCHILDREN)
+                as i32
         } else {
             (style & !(WS_VSCROLL | WS_HSCROLL) | WS_CLIPCHILDREN) as i32
         },
@@ -186,7 +200,7 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
         v: make(true),
         h: make(false),
         kind,
-        visible: true,
+        visible: kind != 3 && kind != 1,
         target: 0.,
         wheel: 0,
         animating: false,
@@ -203,14 +217,46 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
     PostMessageW(hwnd, UPDATE, 0, 0);
 }
 pub unsafe fn resize(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
+    let extra_height = if !GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
+        && GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL == 0
+    {
+        GetSystemMetrics(SM_CYHSCROLL)
+    } else {
+        0
+    };
+    let mut outer: RECT = zeroed();
+    GetWindowRect(hwnd, &mut outer);
+    let mut origin = POINT {
+        x: outer.left,
+        y: outer.top,
+    };
+    ScreenToClient(GetParent(hwnd), &mut origin);
+    let mut region: RECT = zeroed();
+    if origin.x == x
+        && origin.y == y
+        && outer.right - outer.left == width + GetSystemMetrics(SM_CXVSCROLL)
+        && outer.bottom - outer.top == height + extra_height
+        && GetWindowRgnBox(hwnd, &mut region) != 0
+        && region.right == width
+        && region.bottom == height
+    {
+        return;
+    }
     // Clip before resizing: shrinking can otherwise expose the old native track for one paint.
     SetWindowRgn(hwnd, CreateRectRgn(0, 0, width.max(1), height.max(1)), 0);
-    MoveWindow(
+    crate::theme::move_window(
         hwnd,
         x,
         y,
         width + GetSystemMetrics(SM_CXVSCROLL),
-        height,
+        height
+            + if GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
+                || GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL != 0
+            {
+                0
+            } else {
+                GetSystemMetrics(SM_CYHSCROLL)
+            },
         0,
     );
     let rc = editor_viewport(hwnd);
@@ -225,6 +271,13 @@ unsafe fn editor_viewport(hwnd: HWND) -> RECT {
     rc.right = rc
         .right
         .min((outer.right - outer.left - GetSystemMetrics(SM_CXVSCROLL)).max(1));
+    if !GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr()).is_null()
+        && GetWindowLongW(hwnd, GWL_STYLE) as u32 & TVS_NOHSCROLL == 0
+    {
+        rc.bottom = rc
+            .bottom
+            .min((outer.bottom - outer.top - GetSystemMetrics(SM_CYHSCROLL)).max(1));
+    }
     rc
 }
 pub unsafe fn show(hwnd: HWND, visible: bool) {
@@ -266,10 +319,28 @@ unsafe fn position(hwnd: HWND, kind: u8, vertical: bool, pos: i32) {
                 pos as isize,
             );
         }
+        3 if vertical => {
+            // TreeView ignores synthetic thumb positions; select its first visible row directly.
+            let current = info(hwnd, true).nPos;
+            let mut item = SendMessageW(hwnd, TVM_GETNEXTITEM, TVGN_FIRSTVISIBLE as usize, 0);
+            let direction = if pos > current {
+                TVGN_NEXTVISIBLE
+            } else {
+                TVGN_PREVIOUSVISIBLE
+            };
+            for _ in 0..(pos - current).unsigned_abs() {
+                let next = SendMessageW(hwnd, TVM_GETNEXTITEM, direction as usize, item);
+                if next == 0 {
+                    break;
+                }
+                item = next;
+            }
+            SendMessageW(hwnd, TVM_SELECTITEM, TVGN_FIRSTVISIBLE as usize, item);
+        }
         _ => {
             SendMessageW(
                 hwnd,
-                WM_VSCROLL,
+                if vertical { WM_VSCROLL } else { WM_HSCROLL },
                 SB_THUMBPOSITION as usize | ((pos as usize) << 16),
                 0,
             );
@@ -285,10 +356,10 @@ unsafe fn refresh(hwnd: HWND, s: &mut Host) {
             let rc = editor_viewport(hwnd);
             SetWindowRgn(hwnd, CreateRectRgn(0, 0, rc.right, rc.bottom), 0);
         }
-    } else {
+    } else if s.kind != 3 && s.kind != 1 {
         ShowScrollBar(hwnd, SB_BOTH, 0);
     }
-    let r = if s.kind == 0 {
+    let r = if s.kind == 0 || s.kind == 1 || s.kind == 3 {
         editor_viewport(hwnd)
     } else {
         client(hwnd)
@@ -302,13 +373,13 @@ unsafe fn refresh(hwnd: HWND, s: &mut Host) {
             && (s.kind != 0 || IsWindowVisible(hwnd) != 0)
             && limit(&info(hwnd, vertical)) > 0
             && (vertical || s.kind == 2);
-        MoveWindow(
+        crate::theme::move_window(
             bar,
             origin.x + if vertical { r.right - 12 } else { 0 },
             origin.y + if vertical { 0 } else { r.bottom - 12 },
             if vertical { 12 } else { r.right - 12 },
             if vertical {
-                if s.kind == 2 {
+                if s.kind == 2 || s.kind == 3 {
                     r.bottom - 12
                 } else {
                     r.bottom
@@ -348,12 +419,25 @@ unsafe extern "system" fn host_proc(
             return 0;
         }
         if msg == WM_ERASEBKGND {
-            fill(
-                wp as HDC,
-                editor_viewport(hwnd),
-                (clipped as usize - 1) as u32,
-            );
+            // Preserve existing glyphs until the buffered paint is ready. Only guard the edge.
+            let mut edge = editor_viewport(hwnd);
+            edge.left = (edge.right - 1).max(0);
+            fill(wp as HDC, edge, (clipped as usize - 1) as u32);
             return 1;
+        }
+        if msg == WM_SIZE {
+            let rc = editor_viewport(hwnd);
+            SetWindowRgn(hwnd, CreateRectRgn(0, 0, rc.right, rc.bottom), 0);
+        }
+    }
+    let tree_background = GetPropW(hwnd, wide("FeatherPadTreeScroll").as_ptr());
+    if !tree_background.is_null() {
+        if msg == WM_ERASEBKGND {
+            return 1;
+        }
+        // Keep native ranges, but clip both native tracks outside the tree viewport.
+        if msg == WM_NCPAINT {
+            return 0;
         }
         if msg == WM_SIZE {
             let rc = editor_viewport(hwnd);
@@ -362,6 +446,8 @@ unsafe extern "system" fn host_proc(
     }
     if msg == WM_NCDESTROY {
         RemovePropW(hwnd, wide("FeatherPadClippedScroll").as_ptr());
+        RemovePropW(hwnd, wide("FeatherPadTreeScroll").as_ptr());
+        RemovePropW(hwnd, wide("FeatherPadQuietScroll").as_ptr());
         RemoveWindowSubclass(hwnd, Some(host_proc), 902);
         let state = (*ptr).borrow();
         if state.kind == 0 {
@@ -376,24 +462,35 @@ unsafe extern "system" fn host_proc(
     let Ok(mut s) = (*ptr).try_borrow_mut() else {
         return DefSubclassProc(hwnd, msg, wp, lp);
     };
+    if s.kind == 3 || s.kind == 1 {
+        if matches!(msg, WM_MOUSEWHEEL | WM_KEYDOWN | WM_LBUTTONDOWN) || (msg == UPDATE && wp == 2)
+        {
+            s.visible = true;
+            SetTimer(hwnd, TREE_IDLE, 900, None);
+            PostMessageW(hwnd, UPDATE, 0, 0);
+        }
+        if msg == WM_TIMER && wp == TREE_IDLE {
+            if GetCapture() != s.v && GetCapture() != s.h {
+                KillTimer(hwnd, TREE_IDLE);
+                s.visible = false;
+                refresh(hwnd, &mut s);
+            }
+            return 0;
+        }
+    }
     if msg == MEASURE {
         if s.kind == 0 && s.layout_dirty {
             refresh(hwnd, &mut s);
         }
         return 0;
     }
-    if msg == WM_ERASEBKGND && s.kind == 1 {
-        fill(wp as HDC, client(hwnd), s.background);
+    if msg == WM_ERASEBKGND && (s.kind == 1 || s.kind == 3) {
         return 1;
     }
-    if msg == WM_PAINT && (s.kind == 0 || s.kind == 1) {
+    if msg == WM_PAINT && (s.kind == 0 || s.kind == 1 || s.kind == 3) {
         let mut ps = zeroed();
         let dc = BeginPaint(hwnd, &mut ps);
-        let rc = if s.kind == 0 {
-            editor_viewport(hwnd)
-        } else {
-            client(hwnd)
-        };
+        let rc = editor_viewport(hwnd);
         if s.buffer.ensure(dc, rc.right, rc.bottom) {
             fill(s.buffer.dc, rc, s.background);
             DefSubclassProc(
@@ -489,6 +586,14 @@ unsafe extern "system" fn host_proc(
     }
     // IMR_QUERYCHARPOSITION can scroll RichEdit to an off-screen caret.
     // A position query must preserve the reading viewport, just like focus restoration.
+    if s.kind == 0 && msg == EM_SCROLLCARET {
+        if s.layout_dirty {
+            refresh(hwnd, &mut s);
+        }
+        s.animating = false;
+        s.wheel = 0;
+        KillTimer(hwnd, TIMER);
+    }
     let focus_position =
         if s.kind == 0 && (msg == WM_SETFOCUS || (msg == WM_IME_REQUEST && wp == 6)) {
             Some((
@@ -529,7 +634,7 @@ unsafe extern "system" fn host_proc(
     if s.kind == 0
         && matches!(
             msg,
-            WM_MOUSEWHEEL | WM_VSCROLL | WM_KEYDOWN | WM_CHAR | WM_LBUTTONUP
+            WM_MOUSEWHEEL | WM_VSCROLL | WM_KEYDOWN | WM_CHAR | WM_LBUTTONUP | EM_SCROLLCARET
         )
     {
         s.saved_position = POINT {
@@ -613,6 +718,10 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
     let Ok(mut s) = (*ptr).try_borrow_mut() else {
         return DefWindowProcW(hwnd, msg, wp, lp);
     };
+    let tree = !GetPropW(s.owner, wide("FeatherPadQuietScroll").as_ptr()).is_null();
+    if tree && matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
+        PostMessageW(s.owner, UPDATE, 2, 0);
+    }
     let rc = client(hwnd);
     let length = if s.vertical { rc.bottom } else { rc.right };
     let i = info(s.owner, s.vertical);
@@ -639,7 +748,18 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
                         bottom: 8,
                     }
                 };
-                rounded(s.buffer.dc, r, if s.drag { ACCENT } else { MUTED }, 4);
+                rounded(
+                    s.buffer.dc,
+                    r,
+                    if s.drag {
+                        ACCENT
+                    } else if tree {
+                        LINE
+                    } else {
+                        MUTED
+                    },
+                    4,
+                );
                 s.buffer.blit(dc, &ps.rcPaint);
             }
             EndPaint(hwnd, &ps);
@@ -881,6 +1001,11 @@ fn native_markdown_long_scroll_settles() {
             assert_eq!(SendMessageW(hwnd, WM_ERASEBKGND, buffer.dc as usize, 0), 1);
             let rc = editor_viewport(hwnd);
             assert_eq!(
+                GetPixel(buffer.dc, 20, 20),
+                rgb(255, 255, 255),
+                "Erase must preserve the text area until buffered paint"
+            );
+            assert_eq!(
                 GetPixel(buffer.dc, rc.right - 1, 20),
                 CANVAS,
                 "Reentrant background erase must cover the editor edge with its dark color"
@@ -960,5 +1085,99 @@ fn native_markdown_long_scroll_settles() {
         DestroyWindow(short);
         DestroyWindow(hwnd);
         FreeLibrary(library);
+    }
+}
+
+#[test]
+#[ignore = "Requires Windows native controls"]
+fn native_tree_tracks_are_clipped_and_hide_when_idle() {
+    unsafe {
+        InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_TREEVIEW_CLASSES,
+        });
+        let parent = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            wide("").as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            400,
+            400,
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        let tree = CreateWindowExW(
+            0,
+            wide("SysTreeView32").as_ptr(),
+            wide("").as_ptr(),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            220,
+            200,
+            parent,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        attach(tree, SURFACE);
+        for i in 0..80 {
+            let mut label = wide(&format!("{i} {}", "long filename ".repeat(15)));
+            let item = TVINSERTSTRUCTW {
+                hParent: TVI_ROOT,
+                hInsertAfter: TVI_LAST,
+                Anonymous: TVINSERTSTRUCTW_0 {
+                    item: TVITEMW {
+                        mask: TVIF_TEXT,
+                        pszText: label.as_mut_ptr(),
+                        ..zeroed()
+                    },
+                },
+            };
+            SendMessageW(tree, TVM_INSERTITEMW, 0, &item as *const _ as isize);
+        }
+        resize(tree, 0, 0, 220, 200);
+        ShowWindow(parent, SW_SHOWNOACTIVATE);
+        SendMessageW(tree, UPDATE, 0, 0);
+        ValidateRect(tree, null());
+        resize(tree, 0, 0, 220, 200);
+        assert_eq!(
+            GetUpdateRect(tree, null_mut(), 0),
+            0,
+            "Unchanged tree geometry must not repaint during panel animation"
+        );
+        let region = CreateRectRgn(0, 0, 0, 0);
+        assert_ne!(GetWindowRgn(tree, region), 0);
+        assert_ne!(PtInRegion(region, 219, 199), 0);
+        assert_eq!(PtInRegion(region, 220, 100), 0);
+        assert_eq!(PtInRegion(region, 100, 200), 0);
+        DeleteObject(region);
+        let mut data = 0;
+        windows_sys::Win32::UI::Shell::GetWindowSubclass(tree, Some(host_proc), 902, &mut data);
+        let (v, h) = {
+            let state = (*(data as *const RefCell<Host>)).borrow();
+            (state.v, state.h)
+        };
+        assert_eq!(IsWindowVisible(v), 0);
+        SendMessageW(tree, UPDATE, 2, 0);
+        assert_ne!(IsWindowVisible(v), 0);
+        assert_eq!(IsWindowVisible(h), 0);
+        set_position(tree, true, 30);
+        assert!(
+            info(tree, true).nPos > 0,
+            "vertical range {} page {}",
+            info(tree, true).nMax,
+            info(tree, true).nPage
+        );
+        set_position(tree, false, 150);
+        assert!(info(tree, false).nPos > 0);
+        SendMessageW(tree, WM_TIMER, TREE_IDLE, 0);
+        assert_eq!(IsWindowVisible(v), 0);
+        assert_eq!(IsWindowVisible(h), 0);
+        DestroyWindow(parent);
     }
 }

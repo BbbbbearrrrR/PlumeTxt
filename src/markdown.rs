@@ -1,5 +1,6 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::fmt::Write;
+use std::{borrow::Cow, collections::BTreeSet};
 
 pub(crate) fn escape(out: &mut String, text: &str) {
     for unit in text.encode_utf16() {
@@ -21,11 +22,11 @@ pub(crate) fn escape(out: &mut String, text: &str) {
 
 #[cfg(test)]
 pub fn rtf(source: &str, table_width: usize) -> String {
-    formatted(source, table_width, false, None)
+    formatted(source, table_width, false, None, None)
 }
 #[cfg(test)]
 pub fn preview(source: &str, table_width: usize) -> String {
-    formatted(source, table_width, true, None)
+    formatted(source, table_width, true, None, None)
 }
 pub fn with_images(
     source: &str,
@@ -33,15 +34,61 @@ pub fn with_images(
     dark: bool,
     base: Option<&std::path::Path>,
 ) -> String {
-    formatted(source, width, dark, base)
+    formatted(source, width, dark, base, None)
+}
+pub fn folding_preview(
+    source: &str,
+    width: usize,
+    base: Option<&std::path::Path>,
+    folded: &BTreeSet<usize>,
+) -> String {
+    formatted(
+        &fold_source(source, folded),
+        width,
+        true,
+        base,
+        Some(folded),
+    )
+}
+fn fold_source<'a>(source: &'a str, folded: &BTreeSet<usize>) -> Cow<'a, str> {
+    if folded.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    let headings: Vec<_> = Parser::new(source)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            if let Event::Start(Tag::Heading { level, .. }) = event {
+                Some((range, level as u8))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut bytes = source.as_bytes().to_vec();
+    for (i, (range, level)) in headings.iter().enumerate() {
+        if folded.contains(&range.start) {
+            let end = headings[i + 1..]
+                .iter()
+                .find(|(_, next)| next <= level)
+                .map_or(source.len(), |(r, _)| r.start);
+            for byte in &mut bytes[range.end..end] {
+                if *byte != b'\n' && *byte != b'\r' {
+                    *byte = b' ';
+                }
+            }
+        }
+    }
+    // Spaces preserve original byte offsets and remove hidden Markdown from the preview parser.
+    Cow::Owned(String::from_utf8(bytes).expect("masked UTF-8"))
 }
 fn formatted(
     source: &str,
     table_width: usize,
     dark: bool,
     base: Option<&std::path::Path>,
+    folded: Option<&BTreeSet<usize>>,
 ) -> String {
-    let mut out = String::from("{\\rtf1\\ansi\\deff0\\uc1{\\fonttbl{\\f0 Segoe UI;}{\\f1 Consolas;}}{\\colortbl;\\red34\\green48\\blue64;\\red35\\green96\\blue154;}\\f0\\fs22\\cf1 ");
+    let mut out = String::from("{\\rtf1\\ansi\\deff0\\uc1{\\fonttbl{\\f0 Segoe UI Semilight;}{\\f1 Consolas;}}{\\colortbl;\\red34\\green48\\blue64;\\red35\\green96\\blue154;}\\f0\\fs22\\cf1 ");
     if dark {
         out = out.replace(r"\fs22", r"\fs30").replace(
             r"\red34\green48\blue64;\red35\green96\blue154;",
@@ -52,10 +99,12 @@ fn formatted(
     let mut columns = 0;
     let mut image_budget = (16 * 1024 * 1024, 16 * 1024 * 1024);
     let mut image_rendered = false;
-    for event in Parser::new_ext(
+    for (event, range) in Parser::new_ext(
         source,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
-    ) {
+    )
+    .into_offset_iter()
+    {
         if image_rendered {
             if matches!(event, Event::End(TagEnd::Image)) {
                 image_rendered = false;
@@ -71,6 +120,14 @@ fn formatted(
                         "{{\\pard\\sb200\\sa120\\b\\cf2\\fs{} ",
                         (40 - (level as u8 - 1) * 4).max(if dark { 30 } else { 20 })
                     );
+                    if let Some(folded) = folded {
+                        let arrow = if folded.contains(&range.start) {
+                            9656
+                        } else {
+                            9662
+                        };
+                        let _ = write!(out, "{{\\field{{\\*\\fldinst HYPERLINK \"featherpad-fold:{}\"}}{{\\fldrslt \\u{}?}}}} ", range.start, arrow);
+                    }
                 }
                 Tag::Strong => out.push_str("{\\b "),
                 Tag::Emphasis => out.push_str("{\\i "),
@@ -161,6 +218,33 @@ fn formatted(
     }
     out.push('}');
     out
+}
+
+#[test]
+fn heading_folds_respect_hierarchy_and_leave_export_complete() {
+    let source = "# Parent\n\nPARENT_BODY\n\n## Child\n\nCHILD_BODY\n\n# Next\n\nNEXT_BODY\n\n```md\n# Not a heading\n```\n";
+    let folded = BTreeSet::from([0]);
+    let view = folding_preview(source, 9000, None, &folded);
+    assert!(!view.contains("PARENT_BODY"));
+    assert!(!view.contains("Child"));
+    assert!(view.contains("Next") && view.contains("NEXT_BODY"));
+    assert!(view.contains("featherpad-fold:0") && view.contains("\\u9656?"));
+    let child = source.find("## Child").unwrap();
+    let view = folding_preview(source, 9000, None, &BTreeSet::from([child]));
+    assert!(view.contains("PARENT_BODY") && !view.contains("CHILD_BODY"));
+    assert!(rtf(source, 9000).contains("CHILD_BODY"));
+    assert!(!rtf(source, 9000).contains("featherpad-fold:"));
+    assert!(
+        !folding_preview("```md\n# Fake\n```", 9000, None, &BTreeSet::new())
+            .contains("featherpad-fold:")
+    );
+    let setext = folding_preview(
+        "Heading\n=======\n\nHIDDEN\n\nOther\n=====\nSHOWN",
+        9000,
+        None,
+        &folded,
+    );
+    assert!(!setext.contains("HIDDEN") && setext.contains("SHOWN"));
 }
 
 #[test]
