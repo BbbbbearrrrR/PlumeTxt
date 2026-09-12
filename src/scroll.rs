@@ -109,7 +109,11 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
         3
     };
     if kind == 0 {
-        SetPropW(hwnd, wide("FeatherPadClippedScroll").as_ptr(), 1usize as _);
+        SetPropW(
+            hwnd,
+            wide("FeatherPadClippedScroll").as_ptr(),
+            (bg as usize + 1) as _,
+        );
     }
     let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
     SetWindowLongW(
@@ -209,8 +213,19 @@ pub unsafe fn resize(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
         height,
         0,
     );
-    let rc = client(hwnd);
+    let rc = editor_viewport(hwnd);
     SetWindowRgn(hwnd, CreateRectRgn(0, 0, rc.right, rc.bottom), 0);
+}
+unsafe fn editor_viewport(hwnd: HWND) -> RECT {
+    let mut rc = client(hwnd);
+    let mut outer = zeroed();
+    GetWindowRect(hwnd, &mut outer);
+    // The native track is outside our viewport even while RichEdit hides/recreates it.
+    // Using the transient client width here exposes its light gutter for one frame.
+    rc.right = rc
+        .right
+        .min((outer.right - outer.left - GetSystemMetrics(SM_CXVSCROLL)).max(1));
+    rc
 }
 pub unsafe fn show(hwnd: HWND, visible: bool) {
     SendMessageW(hwnd, UPDATE, 1, visible as isize);
@@ -267,13 +282,17 @@ unsafe fn refresh(hwnd: HWND, s: &mut Host) {
             SendMessageW(hwnd, WM_USER + 96, SB_VERT as usize, 1);
             SendMessageW(hwnd, EM_GETLINECOUNT, 0, 0);
             s.layout_dirty = false;
-            let rc = client(hwnd);
+            let rc = editor_viewport(hwnd);
             SetWindowRgn(hwnd, CreateRectRgn(0, 0, rc.right, rc.bottom), 0);
         }
     } else {
         ShowScrollBar(hwnd, SB_BOTH, 0);
     }
-    let r = client(hwnd);
+    let r = if s.kind == 0 {
+        editor_viewport(hwnd)
+    } else {
+        client(hwnd)
+    };
     let mut origin: POINT = zeroed();
     if GetParent(s.v) != hwnd {
         MapWindowPoints(hwnd, GetParent(s.v), &mut origin, 1);
@@ -323,8 +342,23 @@ unsafe extern "system" fn host_proc(
     let ptr = data as *mut RefCell<Host>;
     // Native scroll painting can reenter while Host is borrowed. Its geometry stays
     // enabled for RichEdit; only our dark sibling controls should ever draw the tracks.
-    if msg == WM_NCPAINT && !GetPropW(hwnd, wide("FeatherPadClippedScroll").as_ptr()).is_null() {
-        return 0;
+    let clipped = GetPropW(hwnd, wide("FeatherPadClippedScroll").as_ptr());
+    if !clipped.is_null() {
+        if msg == WM_NCPAINT {
+            return 0;
+        }
+        if msg == WM_ERASEBKGND {
+            fill(
+                wp as HDC,
+                editor_viewport(hwnd),
+                (clipped as usize - 1) as u32,
+            );
+            return 1;
+        }
+        if msg == WM_SIZE {
+            let rc = editor_viewport(hwnd);
+            SetWindowRgn(hwnd, CreateRectRgn(0, 0, rc.right, rc.bottom), 0);
+        }
     }
     if msg == WM_NCDESTROY {
         RemovePropW(hwnd, wide("FeatherPadClippedScroll").as_ptr());
@@ -342,10 +376,6 @@ unsafe extern "system" fn host_proc(
     let Ok(mut s) = (*ptr).try_borrow_mut() else {
         return DefSubclassProc(hwnd, msg, wp, lp);
     };
-    if s.kind == 0 && msg == WM_SIZE {
-        let rc = client(hwnd);
-        SetWindowRgn(hwnd, CreateRectRgn(0, 0, rc.right, rc.bottom), 0);
-    }
     if msg == MEASURE {
         if s.kind == 0 && s.layout_dirty {
             refresh(hwnd, &mut s);
@@ -359,7 +389,11 @@ unsafe extern "system" fn host_proc(
     if msg == WM_PAINT && (s.kind == 0 || s.kind == 1) {
         let mut ps = zeroed();
         let dc = BeginPaint(hwnd, &mut ps);
-        let rc = client(hwnd);
+        let rc = if s.kind == 0 {
+            editor_viewport(hwnd)
+        } else {
+            client(hwnd)
+        };
         if s.buffer.ensure(dc, rc.right, rc.bottom) {
             fill(s.buffer.dc, rc, s.background);
             DefSubclassProc(
@@ -736,6 +770,35 @@ fn native_scroll_remains_available_without_native_tracks() {
             "Native scrollbar must stay outside the visible region"
         );
         DeleteObject(region);
+        resize(hwnd, 0, 0, 500, 240);
+        // RichEdit can hide its native track while text/layout is being changed.
+        ShowScrollBar(hwnd, SB_VERT, 0);
+        SetWindowLongW(
+            hwnd,
+            GWL_STYLE,
+            GetWindowLongW(hwnd, GWL_STYLE) & !(WS_VSCROLL as i32),
+        );
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+        SendMessageW(hwnd, WM_SIZE, 0, 0);
+        let region = CreateRectRgn(0, 0, 0, 0);
+        GetWindowRgn(hwnd, region);
+        let mut bounds = zeroed();
+        GetRgnBox(region, &mut bounds);
+        assert!(
+            bounds.right <= 500,
+            "A hidden native track must not expand the visible editor into its gutter: {}",
+            bounds.right
+        );
+        DeleteObject(region);
+        measure(hwnd);
         let mut data = 0;
         windows_sys::Win32::UI::Shell::GetWindowSubclass(hwnd, Some(host_proc), 902, &mut data);
         let bar = (*(data as *const RefCell<Host>)).borrow().v;
@@ -802,6 +865,27 @@ fn native_markdown_long_scroll_settles() {
         {
             let _layout = (*(host_data as *const RefCell<Host>)).borrow_mut();
             SendMessageW(hwnd, WM_NCPAINT, 1, 0);
+            let dc = GetDC(hwnd);
+            let mut buffer = Buffer::default();
+            assert!(buffer.ensure(dc, 500, 400));
+            fill(
+                buffer.dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 500,
+                    bottom: 400,
+                },
+                rgb(255, 255, 255),
+            );
+            assert_eq!(SendMessageW(hwnd, WM_ERASEBKGND, buffer.dc as usize, 0), 1);
+            let rc = editor_viewport(hwnd);
+            assert_eq!(
+                GetPixel(buffer.dc, rc.right - 1, 20),
+                CANVAS,
+                "Reentrant background erase must cover the editor edge with its dark color"
+            );
+            ReleaseDC(hwnd, dc);
         }
         assert_eq!(
             native_paints.get(),

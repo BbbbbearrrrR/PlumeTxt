@@ -9,6 +9,298 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 pub const MAX_TEXT_BYTES: u64 = 32 * 1024 * 1024;
 
+/// A bounded editable slice. Untouched bytes are copied verbatim on save.
+#[derive(Clone)]
+pub struct Chunk {
+    pub path: std::path::PathBuf,
+    pub start: u64,
+    end: u64,
+    len: u64,
+    modified: std::time::SystemTime,
+    pub encoding: Encoding,
+    pub crlf: bool,
+}
+impl Chunk {
+    pub fn sections(
+        path: std::path::PathBuf,
+    ) -> Result<impl Iterator<Item = Result<String, String>>, String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let guard = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let len = guard.metadata().map_err(|e| e.to_string())?.len();
+        let mut offset = 0;
+        let mut done = false;
+        Ok(std::iter::from_fn(move || {
+            let _keep_locked = &guard;
+            if done {
+                return None;
+            }
+            match Self::read(&path, offset) {
+                Ok((chunk, mut text)) => {
+                    // Prefer a paragraph boundary without exceeding the bounded read window.
+                    let mut end = chunk.end;
+                    if end < len {
+                        let boundary = text
+                            .rfind("\n\n")
+                            .map(|at| at + 2)
+                            .or_else(|| text.rfind("\r\n\r\n").map(|at| at + 4));
+                        if let Some(at) = boundary.filter(|at| *at > text.len() / 2) {
+                            let tail_bytes = match chunk.encoding {
+                                Encoding::Utf16Le | Encoding::Utf16Be => {
+                                    text[at..].encode_utf16().count() * 2
+                                }
+                                _ => text.len() - at,
+                            };
+                            end -= tail_bytes as u64;
+                            text.truncate(at);
+                        }
+                    }
+                    done = end >= len;
+                    if !done && end <= offset {
+                        done = true;
+                        return Some(Err("Could not advance through the document".into()));
+                    }
+                    offset = end;
+                    Some(Ok(text))
+                }
+                Err(e) => {
+                    done = true;
+                    Some(Err(e))
+                }
+            }
+        }))
+    }
+    pub fn read(path: &Path, offset: u64) -> Result<(Self, String), String> {
+        use std::io::{Seek, SeekFrom};
+        use std::os::windows::fs::OpenOptionsExt;
+        let run = || -> io::Result<(Self, String)> {
+            let mut file = OpenOptions::new().read(true).share_mode(1).open(path)?;
+            let meta = file.metadata()?;
+            let mut header = [0; 3];
+            let n = file.read(&mut header)?;
+            let (encoding, bom) = if header[..n].starts_with(&[0xff, 0xfe]) {
+                (Encoding::Utf16Le, 2)
+            } else if header[..n].starts_with(&[0xfe, 0xff]) {
+                (Encoding::Utf16Be, 2)
+            } else if header[..n].starts_with(&[0xef, 0xbb, 0xbf]) {
+                (Encoding::Utf8Bom, 3)
+            } else {
+                (Encoding::Utf8, 0)
+            };
+            let utf16 = matches!(encoding, Encoding::Utf16Le | Encoding::Utf16Be);
+            let mut start = offset.min(meta.len()).max(bom);
+            if utf16 {
+                start -= (start - bom) % 2;
+            }
+            file.seek(SeekFrom::Start(start))?;
+            let mut bytes = Vec::new();
+            (&mut file).take(64 * 1024).read_to_end(&mut bytes)?;
+            let unit = |b: &[u8]| {
+                if encoding == Encoding::Utf16Le {
+                    u16::from_le_bytes([b[0], b[1]])
+                } else {
+                    u16::from_be_bytes([b[0], b[1]])
+                }
+            };
+            let skip = if utf16 {
+                usize::from(bytes.len() >= 2 && (0xdc00..=0xdfff).contains(&unit(&bytes))) * 2
+            } else {
+                bytes.iter().take_while(|b| **b & 0xc0 == 0x80).count()
+            };
+            bytes.drain(..skip);
+            start += skip as u64;
+            // Leave an entire CRLF outside the region if navigation landed on its LF.
+            let width = if utf16 { 2 } else { 1 };
+            if start >= bom + width
+                && bytes.len() >= width as usize
+                && (if utf16 {
+                    unit(&bytes) == 10
+                } else {
+                    bytes[0] == b'\n'
+                })
+            {
+                file.seek(SeekFrom::Start(start - width))?;
+                let mut previous = [0u8; 2];
+                file.read_exact(&mut previous[..width as usize])?;
+                if if utf16 {
+                    unit(&previous) == 13
+                } else {
+                    previous[0] == b'\r'
+                } {
+                    bytes.drain(..width as usize);
+                    start += width;
+                }
+            }
+            if start + (bytes.len() as u64) < meta.len() {
+                if utf16 {
+                    bytes.truncate(bytes.len() / 2 * 2);
+                    if bytes.len() >= 2
+                        && (0xd800..=0xdbff).contains(&unit(&bytes[bytes.len() - 2..]))
+                    {
+                        bytes.truncate(bytes.len() - 2);
+                    }
+                    if bytes.len() >= 2 && unit(&bytes[bytes.len() - 2..]) == 13 {
+                        bytes.truncate(bytes.len() - 2);
+                    }
+                } else {
+                    if let Err(e) = std::str::from_utf8(&bytes) {
+                        if e.error_len().is_none() {
+                            bytes.truncate(e.valid_up_to());
+                        }
+                    }
+                    if bytes.last() == Some(&b'\r') {
+                        bytes.pop();
+                    }
+                }
+            }
+            let end = start + bytes.len() as u64;
+            let encoded = match encoding {
+                Encoding::Utf16Le => [vec![0xff, 0xfe], bytes].concat(),
+                Encoding::Utf16Be => [vec![0xfe, 0xff], bytes].concat(),
+                // Add a synthetic BOM so a literal U+FEFF at the slice start is not stripped.
+                _ => [vec![0xef, 0xbb, 0xbf], bytes].concat(),
+            };
+            let (text, _) = decode(&encoded).map_err(io::Error::other)?;
+            Ok((
+                Self {
+                    path: path.into(),
+                    start,
+                    end,
+                    len: meta.len(),
+                    modified: meta.modified()?,
+                    encoding,
+                    crlf: text.contains("\r\n"),
+                },
+                text,
+            ))
+        };
+        run().map_err(|e| e.to_string())
+    }
+
+    pub fn save(&self, destination: &Path, text: &str) -> Result<(), String> {
+        use std::io::{Seek, SeekFrom};
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = destination.with_file_name(format!(
+            ".featherpad-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let run = || -> io::Result<()> {
+            // Deny writes/replacement while streaming, so the copied source is consistent.
+            let mut source = OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&self.path)?;
+            let meta = source.metadata()?;
+            if meta.len() != self.len || meta.modified()? != self.modified {
+                return Err(io::Error::other(
+                    "The file changed on disk. Reopen it before saving this region.",
+                ));
+            }
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            if io::copy(&mut (&mut source).take(self.start), &mut output)? != self.start {
+                return Err(io::Error::other("Source became shorter while saving"));
+            }
+            let bytes = encode(text, self.encoding, self.crlf);
+            let bom = match self.encoding {
+                Encoding::Utf8 => 0,
+                Encoding::Utf8Bom => 3,
+                _ => 2,
+            };
+            output.write_all(&bytes[bom..])?;
+            source.seek(SeekFrom::Start(self.end))?;
+            if io::copy(&mut source, &mut output)? != self.len - self.end {
+                return Err(io::Error::other("Source changed while saving"));
+            }
+            output.sync_all()?;
+            drop(output);
+            drop(source);
+            replace_file(&temp, destination)
+        };
+        let result = run().map_err(|e| e.to_string());
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+}
+
+#[test]
+fn region_edits_preserve_surrounding_bytes_and_reject_external_changes() {
+    let root = std::env::temp_dir().join(format!("featherpad-region-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("source.txt");
+    let copy = root.join("copy.txt");
+    for encoding in [
+        Encoding::Utf8,
+        Encoding::Utf8Bom,
+        Encoding::Utf16Le,
+        Encoding::Utf16Be,
+    ] {
+        let source = "中文😀\r\n\u{feff}Mixed text\r\n".repeat(9000);
+        let original = encode(&source, encoding, true);
+        for offset in [0, 11, 65533, original.len() as u64] {
+            fs::write(&path, &original).unwrap();
+            if offset == 0 {
+                let sections: Vec<_> = Chunk::sections(path.clone())
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert!(sections.len() > 1);
+                assert_eq!(
+                    sections.concat(),
+                    source,
+                    "Streaming must include every character once"
+                );
+            }
+            let (chunk, text) = Chunk::read(&path, offset).unwrap();
+            assert!(chunk.end - chunk.start <= 65536);
+            assert!(!text.contains('\u{fffd}'));
+            chunk.save(&copy, &text).unwrap();
+            assert_eq!(
+                fs::read(&copy).unwrap(),
+                original,
+                "unchanged region must round-trip"
+            );
+            let replacement = format!("Inserted 中文😀\n{text}tail");
+            let encoded = encode(&replacement, chunk.encoding, chunk.crlf);
+            let bom = match encoding {
+                Encoding::Utf8 => 0,
+                Encoding::Utf8Bom => 3,
+                _ => 2,
+            };
+            let expected = [
+                &original[..chunk.start as usize],
+                &encoded[bom..],
+                &original[chunk.end as usize..],
+            ]
+            .concat();
+            chunk.save(&copy, &replacement).unwrap();
+            assert_eq!(fs::read(&copy).unwrap(), expected);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            decode(&expected).unwrap();
+            chunk.save(&path, &replacement).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            let (stale, _) = Chunk::read(&path, 0).unwrap();
+            fs::write(&path, b"external update").unwrap();
+            assert!(stale.save(&path, "must not overwrite").is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"external update");
+        }
+    }
+    fs::remove_file(path).unwrap();
+    fs::remove_file(copy).unwrap();
+    fs::remove_dir(root).unwrap();
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Encoding {
     Utf8,

@@ -9,7 +9,10 @@ use std::{
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::{Arc, Mutex},
+    sync::{
+        mpsc::{self, Receiver, TryRecvError},
+        Arc, Mutex,
+    },
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -49,6 +52,7 @@ const TERMINAL: usize = 122;
 const IMAGE: usize = 123;
 const KEEP_CURRENT: usize = 124;
 const USE_DISK: usize = 125;
+const OVERVIEW: usize = 126;
 pub const PASTE: u32 = WM_APP + 8;
 const DISPATCH: u32 = WM_APP + 2;
 const LAYOUT: usize = 200;
@@ -84,6 +88,57 @@ unsafe fn text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..read])
 }
 
+struct LoadedText {
+    units: Vec<u16>,
+    encoding: Encoding,
+    crlf: bool,
+    original: Option<u64>,
+    chunk: Option<document::Chunk>,
+}
+struct Loading {
+    receiver: Receiver<Result<LoadedText, String>>,
+    data: Option<LoadedText>,
+    inserted: usize,
+    batch: usize,
+}
+
+unsafe fn append_load_batch(
+    edit: HWND,
+    units: &[u16],
+    start: usize,
+    batch: usize,
+) -> Result<usize, String> {
+    // Insert through TOM without moving the caret to EOF (which forces full-document layout).
+    let mut end = (start + batch).min(units.len());
+    if end < units.len()
+        && ((0xd800..=0xdbff).contains(&units[end - 1])
+            || (units[end - 1] == 13 && units[end] == 10))
+    {
+        end -= 1;
+    }
+    if start == end {
+        return Ok(end);
+    }
+    let doc = crate::syntax::document(edit).ok_or("Text services unavailable")?;
+    use windows::Win32::UI::Controls::RichEdit::{tomResume, tomSuspend};
+    doc.Undo(tomSuspend.0).map_err(|e| e.to_string())?;
+    SendMessageW(edit, EM_SETREADONLY, 0, 0);
+    let result = (|| -> windows_core::Result<()> {
+        let selection = doc.GetSelection()?;
+        let a = selection.GetStart()?;
+        let b = selection.GetEnd()?;
+        let length = doc.Range(0, 0)?.GetStoryLength()?.saturating_sub(1);
+        doc.Range(length, length)?
+            .SetText(&windows_core::BSTR::from_wide(&units[start..end]))?;
+        selection.SetRange(a, b)?;
+        Ok(())
+    })();
+    SendMessageW(edit, EM_SETREADONLY, 1, 0);
+    let _ = doc.Undo(tomResume.0);
+    theme::invalidate(edit);
+    result.map(|()| end).map_err(|e| e.to_string())
+}
+
 struct App {
     hwnd: HWND,
     edit: HWND,
@@ -117,9 +172,175 @@ struct App {
     buffer: theme::Buffer,
     exporting: bool,
     export_result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+    loading: Option<Loading>,
+    chunk: Option<document::Chunk>,
+    saving: Option<Receiver<Result<(PathBuf, u64), String>>>,
 }
 
 impl App {
+    unsafe fn cancel_loading(&mut self) {
+        let loading = self.loading.take().is_some();
+        if loading || self.chunk.take().is_some() {
+            KillTimer(self.hwnd, 11);
+            SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+            SetWindowTextW(self.edit, wide("").as_ptr());
+            SendMessageW(self.edit, EM_SETEVENTMASK, 0, 1);
+            SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
+            self.path = None;
+            self.original = None;
+            self.watch = None;
+        }
+    }
+    unsafe fn begin_load(&mut self, path: PathBuf, offset: Option<u64>) {
+        self.loading = None;
+        self.chunk = None;
+        self.close_comparison();
+        self.watch = None;
+        self.original = None;
+        self.path = Some(path.clone());
+        SendMessageW(self.edit, EM_SETEVENTMASK, 0, 0);
+        SetWindowTextW(self.edit, wide("").as_ptr());
+        SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
+        self.show_editor();
+        if !self.preview.is_null() {
+            ShowWindow(self.preview, SW_HIDE);
+        }
+        SendMessageW(self.edit, EM_SETREADONLY, 1, 0);
+        let (tx, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = if let Some(offset) = offset {
+                document::Chunk::read(&path, offset).map(|(chunk, source)| LoadedText {
+                    units: source.encode_utf16().collect(),
+                    encoding: chunk.encoding,
+                    crlf: chunk.crlf,
+                    original: None,
+                    chunk: Some(chunk),
+                })
+            } else {
+                document::read(&path).map(|(source, encoding, original)| LoadedText {
+                    units: source.encode_utf16().collect(),
+                    encoding,
+                    crlf: source.contains("\r\n"),
+                    original: Some(original),
+                    chunk: None,
+                })
+            };
+            let _ = tx.send(result);
+        });
+        self.loading = Some(Loading {
+            receiver,
+            data: None,
+            inserted: 0,
+            batch: 8192,
+        });
+        self.status("Loading…");
+        SetTimer(self.hwnd, 11, 15, None);
+    }
+
+    unsafe fn load_tick(&mut self) {
+        let Some(mut loading) = self.loading.take() else {
+            return;
+        };
+        if loading.data.is_none() {
+            match loading.receiver.try_recv() {
+                Ok(Ok(data)) => loading.data = Some(data),
+                Ok(Err(e)) => {
+                    SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+                    SendMessageW(self.edit, EM_SETEVENTMASK, 0, 1);
+                    self.path = None;
+                    self.title();
+                    self.status(&format!("Open failed: {e}"));
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+                    SendMessageW(self.edit, EM_SETEVENTMASK, 0, 1);
+                    self.path = None;
+                    self.title();
+                    self.status("Open failed: loader stopped");
+                    return;
+                }
+                Err(TryRecvError::Empty) => (),
+            }
+        }
+        if let Some(data) = &loading.data {
+            let began = std::time::Instant::now();
+            loading.inserted =
+                match append_load_batch(self.edit, &data.units, loading.inserted, loading.batch) {
+                    Ok(end) => end,
+                    Err(e) => {
+                        SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+                        SendMessageW(self.edit, EM_SETEVENTMASK, 0, 1);
+                        SetWindowTextW(self.edit, wide("").as_ptr());
+                        SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
+                        self.path = None;
+                        self.title();
+                        self.status(&format!("Open failed: {e}"));
+                        return;
+                    }
+                };
+            // Aim for 8 ms of insertion work, with bounded growth to avoid a long surprise batch.
+            let factor = (0.008 / began.elapsed().as_secs_f64().max(0.0001)).clamp(0.5, 2.0);
+            loading.batch = ((loading.batch as f64 * factor) as usize).clamp(8192, 256 * 1024);
+            if loading.inserted == data.units.len() {
+                self.encoding = data.encoding;
+                self.crlf = data.crlf;
+                self.original = data.original;
+                self.chunk = loading.data.take().unwrap().chunk;
+                SendMessageW(self.edit, EM_EMPTYUNDOBUFFER, 0, 0);
+                SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
+                SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+                SendMessageW(self.edit, EM_SETEVENTMASK, 0, 1);
+                if let (Some(path), Some(original)) = (&self.path, self.original) {
+                    self.watch = Some(crate::external::Watch::new(path.clone(), original));
+                }
+                self.highlighter.clear();
+                if !self.preview.is_null() {
+                    ShowWindow(self.preview, SW_SHOW);
+                    self.layout();
+                }
+                SetTimer(self.hwnd, 9, 80, None);
+                self.refresh_preview();
+                self.title();
+                self.status("");
+                return;
+            }
+        }
+        self.loading = Some(loading);
+        SetTimer(self.hwnd, 11, 15, None);
+    }
+
+    unsafe fn save_tick(&mut self) {
+        let Some(receiver) = self.saving.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok((path, offset))) => {
+                SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+                SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
+                self.cancel_loading();
+                if std::fs::metadata(&path).is_ok_and(|m| m.len() > crate::large::THRESHOLD) {
+                    self.begin_load(path, Some(offset));
+                } else {
+                    self.open(path);
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.saving = Some(receiver);
+                SetTimer(self.hwnd, 12, 30, None);
+            }
+            result => {
+                SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+                self.status("Save failed; your edits are still here");
+                let message = match result {
+                    Ok(Err(e)) => e,
+                    _ => "Save worker stopped".into(),
+                };
+                error(self.hwnd, &message);
+            }
+        }
+    }
+
     unsafe fn close_comparison(&mut self) {
         if self.comparison.take().is_none() {
             return;
@@ -137,6 +358,9 @@ impl App {
         }
     }
     unsafe fn poll_external(&mut self) {
+        if self.loading.is_some() || self.chunk.is_some() || self.saving.is_some() {
+            return;
+        }
         if self.image.is_some() || self.pdf_path.is_some() || self.large.is_some() {
             return;
         }
@@ -260,7 +484,9 @@ impl App {
                 if dirty { "* " } else { "" },
                 name,
                 if self.large.is_some() {
-                    " · Read only"
+                    " · Large file"
+                } else if self.chunk.is_some() {
+                    " · Region"
                 } else {
                     ""
                 }
@@ -274,9 +500,9 @@ impl App {
         } else if self.pdf_path.is_some() {
             "Ctrl+O Open    Ctrl+Shift+L Outline    Ctrl+J Terminal    Ctrl+Shift+P Commands"
         } else if self.large.is_some() {
-            "Ctrl+O Open    Ctrl+E Editor    Ctrl+J Terminal    Ctrl+Shift+P Commands"
+            "Double-click / Ctrl+E Edit region    Ctrl+O Open    Ctrl+J Terminal"
         } else {
-            "Ctrl+S Save    Ctrl+Shift+M Preview    Ctrl+Shift+I Image    Ctrl+J Terminal    Ctrl+Shift+P Commands"
+            "Ctrl+S Save    Ctrl+Shift+M Preview    Ctrl+P PDF    Ctrl+J Terminal    Ctrl+Shift+P Commands"
         }
     }
     unsafe fn status(&self, message: &str) {
@@ -420,6 +646,13 @@ impl App {
         SetTimer(self.hwnd, 9, 80, None);
     }
     unsafe fn confirm_save(&mut self) -> bool {
+        if self.saving.is_some() {
+            self.status("Saving… Please wait before closing or opening another file");
+            return false;
+        }
+        if self.loading.is_some() {
+            return true;
+        }
         if self.large.is_some() {
             return true;
         }
@@ -443,6 +676,10 @@ impl App {
         }
     }
     unsafe fn save(&mut self, save_as: bool) -> bool {
+        if self.loading.is_some() || self.saving.is_some() {
+            self.status("Please wait for loading or saving to finish");
+            return false;
+        }
         if self.comparison.is_some() {
             self.status("Review external changes first: Keep current or Use disk");
             return false;
@@ -452,7 +689,7 @@ impl App {
             return false;
         }
         if self.large.is_some() {
-            self.status("Large file · Read only");
+            self.status("Double-click or Ctrl+E to edit this region");
             return false;
         }
         let destination = if save_as || self.path.is_none() {
@@ -468,6 +705,20 @@ impl App {
             .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
         {
             error(self.hwnd, "Use Export PDF to create a PDF.");
+            return false;
+        }
+        if let Some(chunk) = self.chunk.clone() {
+            let source = text(self.edit);
+            let (tx, receiver) = mpsc::channel();
+            self.saving = Some(receiver);
+            SendMessageW(self.edit, EM_SETREADONLY, 1, 0);
+            self.status("Saving…");
+            std::thread::spawn(move || {
+                let result = chunk.save(&path, &source).map(|()| (path, chunk.start));
+                let _ = tx.send(result);
+            });
+            SetTimer(self.hwnd, 12, 30, None);
+            // Closing/opening waits for the asynchronous save; the current document stays open.
             return false;
         }
         if self.path.as_ref() == Some(&path) {
@@ -510,7 +761,41 @@ impl App {
             }
         }
     }
+    unsafe fn browse_large(&mut self, path: PathBuf, offset: u64) {
+        self.close_comparison();
+        self.watch = None;
+        self.image.take();
+        self.image_path = None;
+        self.large.take();
+        SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
+        if let Some(viewer) = &self.viewer {
+            viewer.close();
+        }
+        self.pdf_path = None;
+        self.large_path = Some(path.clone());
+        self.large = Some(crate::large::Large::create(
+            self.hwnd,
+            path,
+            self.fonts.code,
+        ));
+        ShowWindow(self.edit, SW_HIDE);
+        if !self.preview.is_null() {
+            ShowWindow(self.preview, SW_HIDE);
+        }
+        self.layout();
+        self.title();
+        self.status("");
+        SetFocus(self.large.as_ref().unwrap().0);
+        if let Some(view) = &self.large {
+            view.seek(offset);
+        }
+    }
     unsafe fn open(&mut self, path: PathBuf) {
+        if !self.confirm_save() {
+            return;
+        }
+        self.cancel_loading();
+        self.chunk = None;
         if crate::assets::supported(&path) {
             let path = match std::path::absolute(&path) {
                 Ok(path) => path,
@@ -551,33 +836,7 @@ impl App {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
         if !is_pdf && std::fs::metadata(&path).is_ok_and(|m| m.len() > crate::large::THRESHOLD) {
-            if !self.confirm_save() {
-                return;
-            }
-            self.close_comparison();
-            self.watch = None;
-            self.image.take();
-            self.image_path = None;
-            self.large.take();
-            SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
-            if let Some(viewer) = &self.viewer {
-                viewer.close();
-            }
-            self.pdf_path = None;
-            self.large_path = Some(path.clone());
-            self.large = Some(crate::large::Large::create(
-                self.hwnd,
-                path,
-                self.fonts.code,
-            ));
-            ShowWindow(self.edit, SW_HIDE);
-            if !self.preview.is_null() {
-                ShowWindow(self.preview, SW_HIDE);
-            }
-            self.layout();
-            self.title();
-            self.status("");
-            SetFocus(self.large.as_ref().unwrap().0);
+            self.begin_load(path, Some(0));
             return;
         }
         if is_pdf {
@@ -615,34 +874,13 @@ impl App {
             self.title();
             self.status("");
         } else {
-            if !self.confirm_save() {
-                return;
-            }
-            match document::read(&path) {
-                Ok((source, encoding, original)) => {
-                    if SetWindowTextW(self.edit, wide(&source).as_ptr()) == 0 {
-                        error(self.hwnd, "Could not load text");
-                        return;
-                    }
-                    self.close_comparison();
-                    self.path = Some(path);
-                    self.watch = self
-                        .path
-                        .clone()
-                        .map(|p| crate::external::Watch::new(p, original));
-                    self.encoding = encoding;
-                    self.crlf = source.contains("\r\n");
-                    self.original = Some(original);
-                    SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
-                    SendMessageW(self.edit, EM_EMPTYUNDOBUFFER, 0, 0);
-                    self.show_editor();
-                    self.refresh_preview();
-                }
-                Err(e) => error(self.hwnd, &e),
-            }
+            self.begin_load(path, None);
         }
     }
     unsafe fn refresh_preview(&self) {
+        if self.loading.is_some() {
+            return;
+        }
         if let Some(snapshot) = &self.comparison {
             if self.image.is_none() && self.pdf_path.is_none() && self.large.is_none() {
                 let mut position: POINT = zeroed();
@@ -700,11 +938,12 @@ impl App {
         }
     }
     fn is_markdown(&self) -> bool {
-        self.path.as_ref().is_none_or(|p| {
-            p.extension().and_then(|s| s.to_str()).is_some_and(|s| {
-                matches!(s.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown")
+        self.loading.is_none()
+            && self.path.as_ref().is_none_or(|p| {
+                p.extension().and_then(|s| s.to_str()).is_some_and(|s| {
+                    matches!(s.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdown")
+                })
             })
-        })
     }
     unsafe fn insert_image(&mut self, paste: crate::assets::Paste) {
         if !self.is_markdown() {
@@ -762,6 +1001,11 @@ impl App {
         SetFocus(self.edit);
     }
     unsafe fn command(&mut self, id: usize) {
+        if (self.loading.is_some() || self.saving.is_some())
+            && !matches!(id, OPEN | NEW | EXIT | TERMINAL | COMMANDS | LAYOUT)
+        {
+            return;
+        }
         if self.image.is_some()
             && matches!(
                 id,
@@ -786,7 +1030,7 @@ impl App {
                     | 202
             )
         {
-            self.status("Large file · Read only");
+            self.status("Double-click or Ctrl+E to edit this region");
             return;
         }
 
@@ -799,6 +1043,8 @@ impl App {
             }
             NEW => {
                 if self.confirm_save() {
+                    self.cancel_loading();
+                    self.chunk = None;
                     SetWindowTextW(self.edit, wide("").as_ptr());
                     SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
                     self.close_comparison();
@@ -817,7 +1063,24 @@ impl App {
             SAVE_AS => {
                 self.save(true);
             }
-            EDITOR => self.show_editor(),
+            EDITOR => {
+                if let (Some(view), Some(path)) = (&self.large, &self.large_path) {
+                    let offset = view.offset();
+                    self.begin_load(path.clone(), Some(offset));
+                } else {
+                    self.show_editor();
+                }
+            }
+            OVERVIEW => {
+                if let Some(chunk) = self.chunk.clone() {
+                    if self.confirm_save() {
+                        self.cancel_loading();
+                        self.browse_large(chunk.path, chunk.start);
+                    }
+                } else if self.large.is_none() {
+                    self.status("Overview is available for large files");
+                }
+            }
             PREVIEW if self.comparison.is_some() => {
                 self.status("Review external changes first");
             }
@@ -849,6 +1112,7 @@ impl App {
                     self.exporting = true;
                     self.status("Exporting…");
                     let source = text(self.edit);
+                    let chunk = self.chunk.clone();
                     let base = self
                         .path
                         .as_deref()
@@ -857,8 +1121,12 @@ impl App {
                     let output = self.export_result.clone();
                     let hwnd = self.hwnd as usize;
                     std::thread::spawn(move || {
-                        let result =
-                            export_complete(&source, &path, base.as_deref()).map(|()| path);
+                        let result = if let Some(chunk) = chunk {
+                            export_chunk_document(&chunk, &source, &path, base.as_deref())
+                        } else {
+                            export_complete(&source, &path, base.as_deref())
+                        }
+                        .map(|()| path);
                         *output.lock().unwrap() = Some(result);
                         PostMessageW(hwnd as HWND, EXPORTED, 0, 0);
                     });
@@ -1187,6 +1455,36 @@ pub(crate) fn export_complete(
     output: &Path,
     base: Option<&Path>,
 ) -> Result<(), String> {
+    export_sections(std::iter::once(Ok(source.to_owned())), output, base)
+}
+
+fn export_chunk_document(
+    chunk: &document::Chunk,
+    source: &str,
+    output: &Path,
+    base: Option<&Path>,
+) -> Result<(), String> {
+    let snapshot = std::env::temp_dir().join(format!(
+        "featherpad-export-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let result = (|| {
+        chunk.save(&snapshot, source)?;
+        export_sections(document::Chunk::sections(snapshot.clone())?, output, base)
+    })();
+    let _ = std::fs::remove_file(snapshot);
+    result
+}
+
+fn export_sections(
+    sections: impl Iterator<Item = Result<String, String>>,
+    output: &Path,
+    base: Option<&Path>,
+) -> Result<(), String> {
     let _ole = crate::assets::Ole::new()?;
     use std::{
         io::{Read, Seek, SeekFrom},
@@ -1205,9 +1503,10 @@ pub(crate) fn export_complete(
         unsafe {
             export_pdf(
                 null_mut(),
-                &markdown::with_images(source, 9000, false, base),
+                sections,
                 &temporary,
                 GetStockObject(DEFAULT_GUI_FONT),
+                base,
             )?;
         }
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -1240,14 +1539,19 @@ pub(crate) fn export_complete(
     result
 }
 
-unsafe fn export_pdf(parent: HWND, rtf: &str, output: &Path, font: HFONT) -> Result<(), String> {
+unsafe fn export_pdf(
+    parent: HWND,
+    sections: impl Iterator<Item = Result<String, String>>,
+    output: &Path,
+    font: HFONT,
+    base: Option<&Path>,
+) -> Result<(), String> {
     let control = rich_edit(parent, true, font);
     if control.is_null() {
         return Err("Could not create the layout control".into());
     }
     ShowWindow(control, SW_HIDE);
     let result = (|| {
-        set_rtf(control, rtf)?;
         let dc = CreateDCW(
             wide("WINSPOOL").as_ptr(),
             wide("Microsoft Print to PDF").as_ptr(),
@@ -1274,45 +1578,61 @@ unsafe fn export_pdf(parent: HWND, rtf: &str, output: &Path, font: HFONT) -> Res
             let dy = GetDeviceCaps(dc, LOGPIXELSY as i32).max(1);
             let w = GetDeviceCaps(dc, HORZRES as i32) * 1440 / dx;
             let h = GetDeviceCaps(dc, VERTRES as i32) * 1440 / dy;
-            let length_options = [10u32, 1200u32]; // GTL_PRECISE | GTL_NUMCHARS, UTF-16; no CRLF expansion.
-            let length =
-                SendMessageW(control, WM_USER + 95, length_options.as_ptr() as usize, 0) as i32;
-            let mut range = FormatRange {
-                dc,
-                target: dc,
-                area: RECT {
-                    left: 720,
-                    top: 720,
-                    right: w - 720,
-                    bottom: h - 720,
-                },
-                page: RECT {
-                    left: 0,
-                    top: 0,
-                    right: w,
-                    bottom: h,
-                },
-                start: 0,
-                end: length,
-            };
             let mut success = true;
-            loop {
-                if StartPage(dc) <= 0 {
+            let mut section_error = None;
+            // ponytail: bounded sections restart Markdown context and start a new page;
+            // a streaming block parser is needed for exact cross-section constructs.
+            for section in sections {
+                let rendered = section.and_then(|source| {
+                    set_rtf(control, &markdown::with_images(&source, 9000, false, base))
+                });
+                if let Err(e) = rendered {
+                    section_error = Some(e);
                     success = false;
                     break;
                 }
-                let next =
-                    SendMessageW(control, EM_FORMATRANGE, 1, &range as *const _ as isize) as i32;
-                if EndPage(dc) <= 0 || (next <= range.start && range.start < range.end) {
-                    success = false;
-                    break;
+                let length_options = [10u32, 1200u32]; // GTL_PRECISE | GTL_NUMCHARS, UTF-16; no CRLF expansion.
+                let length =
+                    SendMessageW(control, WM_USER + 95, length_options.as_ptr() as usize, 0) as i32;
+                let mut range = FormatRange {
+                    dc,
+                    target: dc,
+                    area: RECT {
+                        left: 720,
+                        top: 720,
+                        right: w - 720,
+                        bottom: h - 720,
+                    },
+                    page: RECT {
+                        left: 0,
+                        top: 0,
+                        right: w,
+                        bottom: h,
+                    },
+                    start: 0,
+                    end: length,
+                };
+                loop {
+                    if StartPage(dc) <= 0 {
+                        success = false;
+                        break;
+                    }
+                    let next = SendMessageW(control, EM_FORMATRANGE, 1, &range as *const _ as isize)
+                        as i32;
+                    if EndPage(dc) <= 0 || (next <= range.start && range.start < range.end) {
+                        success = false;
+                        break;
+                    }
+                    range.start = next;
+                    if range.start >= range.end {
+                        break;
+                    }
                 }
-                range.start = next;
-                if range.start >= range.end {
+                SendMessageW(control, EM_FORMATRANGE, 0, 0);
+                if !success {
                     break;
                 }
             }
-            SendMessageW(control, EM_FORMATRANGE, 0, 0);
             if success {
                 if EndDoc(dc) <= 0 {
                     return Err("PDF printing did not finish. Check the print queue.".into());
@@ -1320,7 +1640,8 @@ unsafe fn export_pdf(parent: HWND, rtf: &str, output: &Path, font: HFONT) -> Res
                 Ok(())
             } else {
                 AbortDoc(dc);
-                Err("PDF export failed; output may be incomplete.".into())
+                Err(section_error
+                    .unwrap_or_else(|| "PDF export failed; output may be incomplete.".into()))
             }
         })();
         DeleteDC(dc);
@@ -1550,8 +1871,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             return false;
         };
         match msg {
+            crate::large::EDIT_CURRENT => {
+                if app.large.is_some() {
+                    if let Some(path) = app.large_path.clone() {
+                        app.begin_load(path, Some(lp as u64));
+                    }
+                }
+            }
             PASTE => {
-                if app.pdf_path.is_none() && app.image.is_none() && app.large.is_none() {
+                if app.loading.is_none()
+                    && app.saving.is_none()
+                    && app.pdf_path.is_none()
+                    && app.image.is_none()
+                    && app.large.is_none()
+                {
                     if app.is_markdown() && crate::assets::available() {
                         match crate::assets::clipboard(hwnd) {
                             Ok(Some(paste)) => app.insert_image(paste),
@@ -1586,13 +1919,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             WM_TIMER => {
                 KillTimer(hwnd, wp);
                 match wp {
+                    11 => app.load_tick(),
+                    12 => app.save_tick(),
                     10 => {
                         self::App::poll_external(app);
                         SetTimer(hwnd, 10, 400, None);
                     }
                     1 => app.refresh_preview(),
                     9 => {
-                        if app.pdf_path.is_none() && app.image.is_none() && app.large.is_none() {
+                        if app.loading.is_none()
+                            && app.saving.is_none()
+                            && app.pdf_path.is_none()
+                            && app.image.is_none()
+                            && app.large.is_none()
+                        {
                             app.highlighter.update(app.edit, app.path.as_deref());
                         }
                     }
@@ -1858,6 +2198,12 @@ pub fn run() {
                 (TEXT_LARGER, "Larger text", "", "font larger size"),
                 (TEXT_SMALLER, "Smaller text", "", "font smaller size"),
                 (EDITOR, "Editor", "Ctrl+E", "editor"),
+                (
+                    OVERVIEW,
+                    "Document overview",
+                    "Ctrl+Shift+E",
+                    "large file region navigate",
+                ),
                 (202, "Refresh", "Ctrl+Shift+R", "refresh"),
                 (BOLD, "Bold", "Ctrl+B", "bold"),
                 (ITALIC, "Italic", "Ctrl+I", "italic"),
@@ -1907,6 +2253,9 @@ pub fn run() {
                 buffer: theme::Buffer::default(),
                 exporting: false,
                 export_result: Arc::new(Mutex::new(None)),
+                loading: None,
+                chunk: None,
+                saving: None,
             })
         });
         APP.with(|slot| slot.borrow_mut().as_mut().unwrap().show_editor());
@@ -2065,6 +2414,50 @@ fn native_markdown_pdf_roundtrip() {
         println!("Exported and rendered {count} pages: {}", path.display());
         FreeLibrary(library);
     }
+}
+
+#[test]
+#[ignore = "Requires Windows RichEdit and Microsoft Print to PDF"]
+fn native_region_export_includes_whole_document_and_unsaved_edits() {
+    let root = std::env::temp_dir().join(format!("featherpad-region-pdf-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let input = root.join("input.md");
+    let output = root.join("output.pdf");
+    let source = format!(
+        "# HEAD_SENTINEL\n\n{}# MIDDLE_SENTINEL\n\n{}# TAIL_SENTINEL\n",
+        "\n".repeat(70000),
+        "\n".repeat(70000)
+    );
+    std::fs::write(&input, &source).unwrap();
+    let (chunk, region) = document::Chunk::read(&input, 70000).unwrap();
+    unsafe {
+        LoadLibraryW(wide("Msftedit.dll").as_ptr());
+    }
+    export_chunk_document(
+        &chunk,
+        &format!("# UNSAVED_SENTINEL\n\n{region}"),
+        &output,
+        Some(&root),
+    )
+    .unwrap();
+    let pdf = lopdf::Document::load(&output).unwrap();
+    let pages: Vec<_> = pdf.get_pages().keys().copied().collect();
+    let content = pdf.extract_text(&pages).unwrap();
+    for marker in [
+        "HEAD_SENTINEL",
+        "MIDDLE_SENTINEL",
+        "TAIL_SENTINEL",
+        "UNSAVED_SENTINEL",
+    ] {
+        assert!(
+            content.contains(marker),
+            "Missing {marker} in PDF: {content}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&input).unwrap(), source);
+    std::fs::remove_file(input).unwrap();
+    std::fs::remove_file(output).unwrap();
+    std::fs::remove_dir(root).unwrap();
 }
 
 #[test]
@@ -2435,7 +2828,8 @@ fn shortcut(key: u16, ctrl: bool, shift: bool, pdf: bool, terminal: bool) -> usi
         (true, true, 0x50) => COMMANDS,
         (true, false, 0x51) => EXIT,
         (true, false, 0x50) => EXPORT,
-        (true, _, 0x45) => EDITOR,
+        (true, true, 0x45) => OVERVIEW,
+        (true, false, 0x45) => EDITOR,
         (true, true, 0x49) => IMAGE,
         (true, _, 0x42) if !terminal => BOLD,
         (true, false, 0x49) if !terminal => ITALIC,
@@ -2471,6 +2865,10 @@ unsafe fn image_dialog(hwnd: HWND) -> Option<PathBuf> {
 #[test]
 fn shortcuts_work_with_terminal_focus() {
     for terminal in [false, true] {
+        assert_eq!(shortcut(0x45, true, false, false, terminal), EDITOR);
+        assert_eq!(shortcut(0x45, true, true, false, terminal), OVERVIEW);
+        assert_eq!(shortcut(0x53, true, true, false, terminal), SAVE_AS);
+        assert_eq!(shortcut(0x50, true, false, false, terminal), EXPORT);
         assert_eq!(shortcut(0x50, true, true, false, terminal), COMMANDS);
         assert_eq!(shortcut(0x4a, true, false, false, terminal), TERMINAL);
         assert_eq!(shortcut(0x53, true, false, false, terminal), SAVE);
@@ -2489,4 +2887,44 @@ fn shortcuts_work_with_terminal_focus() {
     assert_eq!(shortcut(0x43, true, false, false, true), 0); // Shell Ctrl+C stays native.
     assert_eq!(shortcut(0x56, true, false, false, true), 0); // Shell paste stays native.
     assert_eq!(shortcut(0x49, true, false, false, false), ITALIC);
+}
+
+#[test]
+fn native_incremental_load_preserves_unicode_and_selection() {
+    unsafe {
+        LoadLibraryW(wide("Msftedit.dll").as_ptr());
+        let edit = rich_edit(null_mut(), false, GetStockObject(DEFAULT_GUI_FONT) as HFONT);
+        assert!(!edit.is_null());
+        MoveWindow(edit, 0, 0, 1000, 700, 0);
+        SendMessageW(edit, EM_SETREADONLY, 1, 0);
+        let source = format!("{}😀\r\n{}\r\n中文", "a".repeat(8191), "b".repeat(8190));
+        let units: Vec<u16> = source.encode_utf16().collect();
+        let mut offset = 0;
+        let mut batches = 0;
+        while offset < units.len() {
+            let next = append_load_batch(edit, &units, offset, 8192).unwrap();
+            assert!(next > offset && next - offset <= 8192);
+            offset = next;
+            batches += 1;
+            let mut a = 1u32;
+            let mut b = 1u32;
+            SendMessageW(
+                edit,
+                EM_GETSEL,
+                &mut a as *mut _ as usize,
+                &mut b as *mut _ as isize,
+            );
+            assert_eq!((a, b), (0, 0));
+        }
+        assert!(batches >= 3);
+        assert_eq!(
+            document::encode(&text(edit), Encoding::Utf8, false),
+            document::encode(&source, Encoding::Utf8, false)
+        );
+        SendMessageW(edit, EM_SETREADONLY, 0, 0);
+        SendMessageW(edit, EM_SETSEL, 0, 1);
+        SendMessageW(edit, EM_REPLACESEL, 1, wide("Z").as_ptr() as isize);
+        assert!(text(edit).starts_with('Z'));
+        DestroyWindow(edit);
+    }
 }

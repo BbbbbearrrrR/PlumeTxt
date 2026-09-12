@@ -1,4 +1,4 @@
-//! Bounded, read-only text viewport. No full-file allocation or line index.
+//! Bounded text viewport with on-demand region editing. No full-file line index.
 use crate::theme::*;
 use std::{
     cell::RefCell,
@@ -20,6 +20,7 @@ use windows_sys::Win32::{
     UI::{Controls::SetScrollInfo, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 const READY: u32 = WM_APP + 130;
+pub const EDIT_CURRENT: u32 = WM_APP + 131;
 // ponytail: byte-based navigation avoids an O(file size) line index; add a background index only when exact line navigation is needed.
 const RANGE: i32 = 1_000_000;
 const BLOCK: u64 = 256 * 1024;
@@ -276,9 +277,24 @@ struct State {
     wheel: i32,
 }
 impl Large {
+    pub unsafe fn offset(&self) -> u64 {
+        let p = GetWindowLongPtrW(self.0, GWLP_USERDATA) as *mut RefCell<State>;
+        if p.is_null() {
+            0
+        } else {
+            (*p).borrow().requested
+        }
+    }
+    pub unsafe fn seek(&self, offset: u64) {
+        let p = GetWindowLongPtrW(self.0, GWLP_USERDATA) as *mut RefCell<State>;
+        if !p.is_null() {
+            (*p).borrow_mut().request(offset, 0);
+        }
+    }
     pub unsafe fn create(parent: HWND, path: PathBuf, font: HFONT) -> Self {
         let class = wide("FeatherPadLarge");
         RegisterClassW(&WNDCLASSW {
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: GetModuleHandleW(null()),
             lpszClassName: class.as_ptr(),
@@ -288,7 +304,7 @@ impl Large {
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("Large file · Read only").as_ptr(),
+            wide("Large file").as_ptr(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPCHILDREN,
             0,
             0,
@@ -447,6 +463,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         WM_LBUTTONDOWN => {
             SetFocus(hwnd);
+        }
+        WM_LBUTTONDBLCLK => {
+            let row = ((lp >> 16) as u16 as i16 as i32 - 24).max(0) / 28;
+            if let Some(offset) = s
+                .page
+                .as_ref()
+                .and_then(|p| p.rows.get(row as usize))
+                .map(|r| r.start)
+            {
+                PostMessageW(GetParent(hwnd), EDIT_CURRENT, 0, offset as isize);
+            }
         }
         WM_KEYDOWN => match wp as u16 {
             VK_DOWN => s.move_rows(1),

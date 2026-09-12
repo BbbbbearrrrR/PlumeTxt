@@ -1,0 +1,16 @@
+[
+  {
+    "file": "table-1MiB.csv",
+    "window_ms": 283.9296000020113,
+    "first_text_ms": 302.8569000016432,
+    "editable_ms": 1529.3172000019695,
+    "max_sampled_reply_ms": 32.25460000248859
+  },
+  {
+    "file": "markdown-8MiB.md",
+    "window_ms": 72.4361999964458,
+    "first_text_ms": 109.23879999609198,
+    "editable_ms": 3952.501299994765,
+    "max_sampled_reply_ms": 52.09330000070622
+  }
+]

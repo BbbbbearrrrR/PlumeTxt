@@ -1,0 +1,6 @@
+{
+  "rounds": 3,
+  "featherpad_sha256": "67d8f80d691a6288b780b6f6a43b49daf0bf9a3c01db133c7824d4305c9d56d2",
+  "sublime_sha256": "67d363dc7a54808624c1d0e4837ee5258974d338d1117738046a5a823ab4c16a",
+  "method": "Warm cache, fresh processes, isolated Sublime defaults. Responsive = filename title plus WM_NULL reply. Settled = 4 half-second samples below 25ms CPU each. Not a first-paint, full-load, edit-latency or FPS measurement. Working-set sums double-count shared pages. Peaks sampled every 0.5s."
+}

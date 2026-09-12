@@ -26,10 +26,13 @@ Windows 10 version 1809 or later / Windows 11, x64. PDF export requires Microsof
 | PDF outline | Ctrl+Shift+L |
 | PDF zoom / Fit width | Ctrl + or -, Ctrl+0 |
 | Return to editor | Ctrl+E |
+| Large-file overview | Ctrl+Shift+E |
 | Terminal | Ctrl+J, Ctrl+backtick, or the bottom-right `>_` button |
 | Insert image | Ctrl+Shift+I |
 | Paste image / text | Ctrl+V |
 | Quit | Ctrl+Q |
+
+Normal and region editing use the same Save, Save as, Preview, Refresh, Export, Terminal, Insert image and Paste shortcuts. Ctrl+E always focuses/returns to the editor; Ctrl+Shift+E is the separate large-file overview command.
 
 The command panel supports search, arrow keys, Enter, mouse selection, and Escape. Font and text-size commands are available there. Status messages disappear automatically.
 
@@ -63,15 +66,21 @@ The source editor automatically colours Markdown headings, emphasis, links, list
 
 CSV/TSV use consistent column colours, including unquoted text, escaped quotes and multiline quoted fields. Colours for code use cyan keywords, blue functions/punctuation, mint strings, muted comments and warm numbers. Highlighting changes no font sizes or file contents. Native text ranges preserve selection and undo/redo; clipboard paste stays plain text. IME composition postpones highlighting.
 
-Work is debounced and limited to 32K UTF-16 units near the viewport, with at most 4,096 colour runs per update. The >8 MiB read-only viewer colours only its bounded page on its worker thread, without a full-file scan or index. This is lexical highlighting, not semantic analysis: mixed-language components use shared basic rules, and multiline constructs starting outside the bounded context can have approximate colours. Soft wrapping preserves logical record boundaries. Dense token windows spend the bounded formatting budget on visible text first; colours beyond that budget are deferred until scrolling.
+Work is debounced and limited to 32K UTF-16 units near the viewport, with at most 4,096 colour runs per update. The >8 MiB bounded viewer colours only its bounded page on its worker thread, without a full-file scan or index. This is lexical highlighting, not semantic analysis: mixed-language components use shared basic rules, and multiline constructs starting outside the bounded context can have approximate colours. Soft wrapping preserves logical record boundaries. Dense token windows spend the bounded formatting budget on visible text first; colours beyond that budget are deferred until scrolling.
 
 ## Large files
 
-Files larger than 8 MiB automatically open in a separate **read-only** text viewport, including gigabyte Markdown. The title shows `Read only`. The first viewport is loaded on a worker thread; each request reads at most 512 KiB, and only 256 display rows are retained. No whole-file string, UTF-16 copy, Markdown parse, or line index is built.
+Files larger than 8 MiB open directly in the editor, including gigabyte Markdown. The first Unicode-aligned region (up to 64 KiB) is loaded on a worker and is immediately editable once displayed; no double-click or mode-switch command is required. The title shows `Region` to distinguish the loaded portion from the whole file. No whole-file string, UTF-16 copy, Markdown parse, or line index is built.
 
 Use the wheel, arrow keys, Page Up/Down, Home/End, or drag the right scrollbar. Position is based on byte offsets, so a jump does not require scanning preceding lines. Long lines wrap into bounded display rows. UTF-8 and BOM-marked UTF-16 are decoded locally; malformed sequences display replacement characters. Disk changes are reflected in subsequent reads, without mapping mutable file memory.
 
-This mode currently displays Markdown source only. Editing, selection/copy, search, full-document preview and PDF export are unavailable in the large viewport. Ctrl+E returns to the previous editor; Ctrl+O opens another file. The integrated terminal starts in the large file's folder when creating a new session.
+The regular editor supports typing, deletion, selection, copy/paste and undo within the loaded region. Ctrl+Shift+E optionally opens an overview for navigating elsewhere; double-click a row or press Ctrl+E again to edit there. The overview reads at most 512 KiB per request and retains at most 256 display rows. Ctrl+S streams the unchanged prefix and suffix around the replacement into a temporary file, flushes it, then replaces the destination. Save as writes the whole file too. Encoding is preserved; line endings within the edited region use its detected style. External changes detected before saving are rejected rather than overwritten. Saving runs in the background; editing and document switching wait until it finishes. A close/open request that initiates saving must be repeated after completion. Failures retain your edits.
+
+Ctrl+Shift+E opens the large viewport, with a save/discard prompt if needed; successful saving keeps the edited position in an editable view. This is region editing, not a full-file editable buffer: cross-region selection/undo, search and a full-document preview remain unavailable. The integrated terminal starts in the large file's folder when creating a new session.
+
+Ctrl+Shift+M previews the current region with synchronized scrolling and live local edits; Ctrl+Shift+R refreshes it. Ctrl+P exports the **whole document**, including the current unsaved region, from a temporary snapshot without saving changes to the original file. Export reads bounded sections and sends their rendered pages through one PDF print job on a worker. Sections prefer paragraph boundaries and start new pages. Markdown context restarts between sections: fences, tables, links or other constructs spanning a boundary can format differently from an in-memory full-document render. Temporary snapshots are removed after completion or failure; the destination is replaced only after a complete PDF is available.
+
+Files up to 8 MiB are read/decoded on a worker and inserted in adaptive batches through native text ranges, keeping the window responsive and displaying text before the entire buffer is ready. Editing is enabled after insertion completes. New/Open cancels the pending load without allowing an old result to replace the new document. Highlighting and Markdown preview run after insertion.
 
 First-display speed depends on storage latency; a cold network file cannot be promised an instant open. The benchmark creates a full-content 1 GiB file and measures **warm-cache** first viewport and random seeks:
 
@@ -113,7 +122,7 @@ Saved text documents are checked for external edits on a background thread. Afte
 
 `Keep current` retains the editor text and marks it unsaved; Ctrl+S then writes it to disk. `Use disk` adopts the latest reviewed disk version, keeping the previous text available through Undo. Both actions recheck the disk version before resolving, so a newer write requires another review. Missing, unreadable, binary or over-limit files report an error and preserve editor text. The watcher applies to saved editable text; the separate large-file viewport, PDF and image viewers do not display text diffs.
 
-UTF-8 and BOM-marked UTF-16 LE/BE are supported. Saving preserves encoding and the detected line-ending style. Invalid text encodings and NUL bytes are rejected. The full editor has a 32 MiB save limit; files above 8 MiB use the read-only large-file viewport.
+UTF-8 and BOM-marked UTF-16 LE/BE are supported. Saving preserves encoding and the detected line-ending style. Invalid text encodings and NUL bytes are rejected. The full editor has a 32 MiB save limit; files above 8 MiB use the bounded viewport with region editing and streaming save.
 
 Text saves write a same-directory temporary file, synchronize it, and replace the destination. External changes are checked before saving. PDF exports finish in a temporary file before replacing their destination.
 
