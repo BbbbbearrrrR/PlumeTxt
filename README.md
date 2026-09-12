@@ -36,13 +36,12 @@ Keep the `runtime` folder beside `PlumeTxt.exe` when moving or distributing the 
 | PDF outline | Ctrl+Shift+L |
 | PDF zoom / Fit width / Fit page | Ctrl + or -, Ctrl+0 / Ctrl+Shift+0 |
 | Markdown bold / Italic / Inline code | Ctrl+B / Ctrl+I / Ctrl+K |
-| Large-file overview | Commands → Document overview |
 | Terminal | Ctrl+Shift+J or the bottom-right `>_` button |
 | Insert image | Ctrl+Shift+I |
 | Paste image / text | Ctrl+V |
 | Quit | Ctrl+Q |
 
-Normal and region editing use the same Save, Save as, Preview, Refresh, Export, Terminal, Insert image and Paste shortcuts. Ctrl+E toggles Markdown reading/editing, edits the selected large-file region, or returns from PDF/image viewing to the retained editor. Ctrl+Shift+E exports PDF; the large-file overview is available from Commands.
+Normal and region editing use the same Save, Save as, Preview, Refresh, Export, Terminal, Insert image and Paste shortcuts. Ctrl+E toggles Markdown reading/editing, edits the selected large-file region, or returns from PDF/image viewing to the retained editor. Ctrl+Shift+E exports PDF.
 
 The command panel supports search, Up/Down to select, Enter to execute, and Escape to close. Arrow navigation keeps the search field focused. A mouse click selects; a double-click executes. The panel contains only essential actions for the current document and workspace. Formatting, zoom steps, New and Quit remain available through their shortcuts; they no longer fill the command list. The footer shows the current reading/editing state (or live PDF page number), only the most relevant shortcuts, a file-type tag (`*` means unsaved edits), and fixed Commands/Terminal controls. Narrow windows show fewer hints. Temporary status messages replace the contextual hints and then clear. Alt alone no longer opens Commands; AltGr and terminal editing combinations stay with their input control.
 
@@ -52,7 +51,7 @@ Preview headings have a clickable disclosure arrow. Collapsing a heading hides i
 
 ## Workspace
 
-Opening a file normally keeps the single-file layout. Use Ctrl+Shift+O / **Open folder**, drop a folder onto the window, or pass a folder as the command-line argument to open a workspace. Its dark left file tree shows folders first, with compact text and seven high-contrast, distinct silhouettes for folders, archives, Markdown, PDF, images, code and other files. Icons are shared across rows and regenerated only when DPI changes; they do not depend on installed file associations. Drag the right divider to widen the file tree or PDF outline for long names. A cyan guide follows the pointer; document layout changes once on release to avoid tearing and repeated PDF rendering; neither directory panel has a horizontal scrollbar. Native hover tooltips are disabled. Subdirectories are read only when expanded; selecting a file uses the normal open path, including unsaved-change prompts and all supported viewers.
+Opening a file normally keeps the single-file layout. Use Ctrl+Shift+O / **Open folder**, drop a folder onto the window, or pass a folder as the command-line argument to open a workspace. Its dark left file tree shows folders first, with compact text and seven high-contrast, distinct silhouettes for folders, archives, Markdown, PDF, images, code and other files. Icons are shared across rows and regenerated only when DPI changes; they do not depend on installed file associations. Drag the right divider to widen the file tree or PDF outline for long names. A cyan guide follows the pointer, and document layout changes once on release; neither directory panel has a horizontal scrollbar. Native hover tooltips are disabled. Subdirectories are read only when expanded; selecting a file uses the normal open path, including unsaved-change prompts and all supported viewers.
 
 Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-file-types.ps1` once to add **Open with PlumeTxt** to Explorer's folder, folder background and drive context menus for the current user. On Windows 11, this classic menu entry is under **Show more options**. It opens the chosen directory as a workspace with the feather icon in the menu.
 
@@ -74,7 +73,7 @@ The source and preview share scroll progress. Scroll either pane or drag the sin
 
 Both panes use regular-weight Segoe UI with approximately 20 px body text at 100%. Reading mode centers the content in a column up to 880 px wide. Headings retain their hierarchy. Consolas is available for source text. Text zoom changes both panes. Preview updates are debounced; large documents require Ctrl+Shift+R. Markdown parsing and image decoding run in one background task at a time. Repeated requests keep only a pending flag, not extra document snapshots; obsolete results are discarded before display. Native RichEdit installation still runs on the UI thread.
 
-Headings, emphasis, lists, tasks, quotes, code, tables, and link text are supported. Local supported raster images render in preview and PDF export; missing or unsupported images show alt text. HTML is literal text. No remote content is loaded. Export uses light paper colors and selectable text.
+Headings, emphasis, lists, tasks, quotes, code, and tables are supported. Tables honor left/center/right alignment and distinguish header rows. Fenced code reuses the source lexer with a shaded background and separate screen/paper palettes; text events over 64 KiB remain plain to bound lexer memory. Links open HTTP(S)/mailto targets in the default application, and relative files inside PlumeTxt; section anchors remain unsupported. Local supported raster images render in preview and PDF export; missing or unsupported images show alt text. HTML is literal text. No remote content is loaded. Export uses light paper colors and selectable text.
 
 ## Images and shortcuts
 
@@ -108,7 +107,7 @@ Files larger than 8 MiB open directly in the editor, including gigabyte Markdown
 
 Use the wheel, arrow keys, Page Up/Down, Home/End, or drag the right scrollbar. Position is based on byte offsets, so a jump does not require scanning preceding lines. Long lines wrap into bounded display rows. UTF-8 and BOM-marked UTF-16 are decoded locally; malformed sequences display replacement characters. Disk changes are reflected in subsequent reads, without mapping mutable file memory.
 
-The regular editor supports typing, deletion, selection, copy/paste and undo within the loaded region. **Document overview** in Commands opens an overview for navigating elsewhere; double-click a row or press Ctrl+E again to edit there. The overview reads at most 512 KiB per request and retains at most 256 display rows. Ctrl+S streams the unchanged prefix and suffix around the replacement into a temporary file, flushes it, then replaces the destination. Save as writes the whole file too. Encoding is preserved; line endings within the edited region use its detected style. External changes detected before saving are rejected rather than overwritten. Saving runs in the background; editing and document switching wait until it finishes. A close/open request that initiates saving must be repeated after completion. Failures retain your edits.
+The regular editor supports typing, deletion, selection, copy/paste and undo within the loaded region. Ctrl+S streams the unchanged prefix and suffix around the replacement into a temporary file, flushes it, then replaces the destination. Save as writes the whole file too. Encoding is preserved; line endings within the edited region use its detected style. External changes detected before saving are rejected rather than overwritten. Saving runs in the background; editing and document switching wait until it finishes. A close/open request that initiates saving must be repeated after completion. Failures retain your edits.
 
 **Document overview** opens the large viewport, with a save/discard prompt if needed; successful saving keeps the edited position in an editable view. This is region editing, not a full-file editable buffer: cross-region selection/undo, search and a full-document preview remain unavailable. The integrated terminal starts in the large file's folder when creating a new session.
 
@@ -128,15 +127,19 @@ Measured locally on 2026-09-12 (release build, one warm-cache run): 1 GiB first 
 
 PDFs render inside PlumeTxt using Windows.Data.Pdf. Pages scroll continuously. The outline reads local PDF bookmarks and falls back to page numbers. Visible pages and neighboring pages are rendered on demand.
 
-The CPU raster cache is capped at 48 MiB, with up to 16 MiB of shared page textures per GPU reader; each page is capped at about 8 million pixels. These limits exclude system decoder memory, in-flight frames, and window buffers. PDF text search and match highlighting are available with Ctrl+F. Arbitrary PDF text selection, annotations, forms, and password entry are not implemented.
+The CPU raster cache is capped at 48 MiB, with up to 16 MiB of shared page textures per GPU reader; each page is capped at about 8 million pixels. These limits exclude system decoder memory, in-flight frames, and window buffers. PDF text search and match highlighting are available with Ctrl+F. Drag to select PDF text and press Ctrl+C or Ctrl+Insert to copy; Escape clears the selection. Drag across pages (scroll while holding the mouse to reach more pages). Selection uses the text layer, supports cropped/rotated pages, and runs off the UI thread with one pending job. A selection is limited to 1 million characters and 20,000 highlight rectangles; only visible pages draw highlights. Scans without a text layer require OCR. Annotations, forms, and password entry are not implemented.
 
 ## Terminal
 
-The terminal slides in from the right, taking roughly one third of the window (320–520 px). The document area resizes alongside it; the bottom-right button and Ctrl+Shift+J toggle the panel.
+The terminal appears on the right, initially taking about 40% of the window (400–640 px). The document area resizes alongside it; the bottom-right button and Ctrl+Shift+J toggle the panel.
 
 The integrated terminal uses Windows ConPTY and a VT parser. PowerShell starts without profiles in the active document's folder; untitled documents use the application's working directory. Existing sessions keep their working directory when another document opens.
 
 - Input, arrows, Tab completion, Ctrl+C, UTF-8 output, and ANSI colors are supported.
+- The right terminal starts at about 40% of the window width. Drag its left divider to resize; the guide follows the pointer and layout changes once on release. Unchanged terminal grid sizes do not trigger another ConPTY resize. Your chosen width is retained when reopening the terminal during the current session.
+- Terminal output is coalesced into short frame intervals. Synchronized output (DEC mode 2026) defers partial redraws, with a 250 ms recovery timeout for missing end markers. Program-selected block, underline and bar cursor shapes are honored as steady cursors. Cursor position and visibility settle for 32 ms before presentation, covering ConPTY cursor restores that arrive after the synchronized-output end marker; sustained moves and hiding still take effect.
+- Modified arrow/Home/End/Delete keys, F1–F12, Shift+Tab and Ctrl+Backspace are forwarded to the shell. Alt+F4 and Alt+Space retain their Windows behavior. IME composition and candidate windows follow the terminal caret.
+- Paste normalizes line endings and uses bracketed paste when the shell enables it; control characters other than tabs/newlines are removed. Cursor queries are handled across output chunks, and output processing yields after bounded batches so typing can be dispatched.
 - Paste with Ctrl+V; drag to select and copy with Ctrl+Shift+C. Without a selection, copy captures the visible screen.
 - Use the wheel for up to 2,000 rows of scrollback.
 - Hiding the panel keeps the session alive. After `exit`, reopen the panel to start a new session.
@@ -150,7 +153,9 @@ The window uses Per-Monitor V2 DPI awareness. Fonts, main layout, command panel,
 
 No Electron, WebView, background service, or network resources. Markdown custom tracks are siblings of the RichEdit controls, so text scrolling cannot move them. The native RichEdit tracks stay enabled for correct range updates but are clipped outside the visible text region. Full line layout is measured after content or width changes, and a short pane shares the overflowing pane's range. PDF tracks keep their existing implementation. Custom dark tracks support dragging and wheel input. Command lists and PDF pages are double buffered.
 
-Wheel scrolling, command-panel opening, and terminal expansion use elapsed-time easing and respect the Windows client-area animation setting. Terminal expansion uses a clip region over a fixed-size live control; the document and terminal grid are laid out once per open/close transition rather than every animation frame. Reversing a transition continues from its current progress. Timers stop after transitions settle; they do not run continuously while idle. The main window paints its simple background directly instead of retaining another full-window bitmap; content controls retain their own double buffers. Performance still depends on file size and the Windows PDF engine.
+All application UI animations are disabled by implementation: the command palette and sidebars open or close immediately, and wheel input updates the scroll position directly without easing or animation timers. High-resolution wheel deltas retain their fractional remainder. Divider dragging moves only a lightweight guide; releasing it commits the new width and reflows the document once. No animation snapshots or interpolation state are retained.
+
+The command palette remains an independent popup so GPU content cannot paint over it. Its complete first frame is painted without holding the owner-draw state borrow. Output batching, cursor stabilization, asynchronous search/load/save, preview debouncing, and scrollbar idle hiding remain functional; these are not decorative animations.
 
 ## File safety
 
@@ -177,9 +182,38 @@ cargo test --locked -- --include-ignored --test-threads=1
 
 The executable is `target/release/plumetxt.exe`. Test output is written to `tmp/`. The root `PlumeTxt.exe` is the packaged build. Feather assets are embedded in the executable.
 
+### Windows Setup
+
+Opening a project with no document shows the same translucent blue feather used by the app icon. It is static, centered in the remaining document area, and uses no animation timer. Selecting a file or pressing Ctrl+N restores document content; opening a folder preserves existing documents and unsaved text.
+
+The ordinary unsigned Setup uses the classic Explorer menu (Windows 11 puts it under **Show more options**). A Windows 11 first-level menu requires an `IExplorerCommand` extension plus a trusted, signed identity package. The native extension supports a single file, folder, or folder background, reuses the app icon, and starts no background service. Drive entries retain the classic menu.
+
+To build and check the extension without installing it, run `./scripts/build-shell-menu.ps1`. Its unsigned output is for development checks only. To include the modern menu in Setup, use `./scripts/build-setup.ps1 -CompilerPath <ISCC.exe> -ShellCertificateThumbprint <thumbprint>` with a trusted code-signing certificate and private key in `Cert:\CurrentUser\My`. Select the folder context-menu task during installation. Setup registers the package per user and removes it on uninstall; registration failures retain the classic menu and are logged to `%LOCALAPPDATA%\PlumeTxt\shell-menu-install.log`. Neither script changes global Explorer menu settings, enables developer mode, nor installs a certificate. The signed registration/display path still requires testing on a clean Windows 11 account before publishing.
+
+Microsoft documents the [modern context-menu contract](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/integrate-packaged-app-with-file-explorer) and [identity package signing requirements](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/grant-identity-to-nonpackaged-apps).
+
+Build with PowerShell 7, Rust MSVC and [Inno Setup 6.6 or newer](https://jrsoftware.org/isdl.php):
+
+```powershell
+./scripts/build-setup.ps1
+# For an unpacked compiler, supply its path:
+./scripts/build-setup.ps1 -CompilerPath C:/tools/InnoSetup/ISCC.exe
+./scripts/test-setup.ps1 -SetupPath ./dist/PlumeTxt-0.2.0-Setup-x64.exe
+```
+
+The build reads the version from Cargo, builds Windows x64 with the static C runtime, and writes `dist/PlumeTxt-<version>-Setup-x64.exe` plus a SHA-256 file. Upload both files as GitHub Release assets. Setup is currently unsigned; release signing requires a code-signing certificate.
+
+Setup supports Windows 10 1809 or later on x64-compatible systems. It installs for the current user under `%LOCALAPPDATA%\Programs\PlumeTxt`, without elevation, and includes the PDFium runtime and redistribution notices. The wizard offers English and Simplified Chinese and follows the system light/dark setting. The vendored Chinese translation is from [Inno Setup 6.7.3](https://github.com/jrsoftware/issrc/blob/is-6_7_3/Files/Languages/Unofficial/ChineseSimplified.isl).
+
+The Start menu shortcut is automatic; desktop shortcuts, Open with/Default apps registration and folder context menus are optional. Existing Windows default choices remain unchanged. Keep the Setup AppId when releasing updates so they reuse the installation and uninstall entry. Close PlumeTxt before upgrading. Uninstall removes packaged files and selected registrations and leaves user-created documents in place.
+
+The smoke test installs twice into a temporary path containing Chinese characters and spaces, launches the installed executable, then uninstalls it and verifies that a user document survives. Run it in a Windows account without an existing PlumeTxt installation or Start menu shortcut. It leaves optional associations and folder menus disabled to preserve the account's existing portable registration.
+
 ## Rendering and materials
 
-PDF and image scaling, terminal text and the large-file overview use an on-demand Direct2D hardware target with DirectWrite text. RichEdit, input fields, trees and other native controls retain their native editing, IME, keyboard navigation and accessibility. The command panel, search fields, buttons, status bar, selection states and scrollbars share the dark surface palette, inset borders and visible focus accents. Supported Windows versions supply the dark Mica title bar and native window shadow; other versions keep the opaque caption. Page and panel shadows use static layers, not a background animation or blur texture.
+PDF and image scaling, terminal text and the large-file overview use an on-demand Direct2D hardware target with DirectWrite text. RichEdit, input fields, trees and other native controls retain their native editing, IME, keyboard navigation and accessibility. The command palette uses a separate owned popup so GPU content cannot paint through it. Wheel input goes to its list without holding the owner-draw state borrow; it follows the main window when moved or resized. Document overview is no longer listed in the palette.
+
+The command panel, search fields, buttons, status bar, selection states and scrollbars share the dark surface palette, inset borders and visible focus accents. Supported Windows versions supply the dark Mica title bar and native window shadow; other versions keep the opaque caption. Page and panel shadows use static layers, not a background animation or blur texture.
 
 Rendering starts only when a custom view paints. GPU textures are reused and capped at 16 MiB per view; PDF CPU rasters are capped at 48 MiB. Hidden custom views release their rendering buffers. A successful GPU frame releases the GDI viewport buffer. Hardware creation, resize or draw failure repaints through GDI immediately, with a five-second retry cooldown. A visible page set or image beyond the texture budget uses GDI until the source or view is reset, avoiding repeated texture eviction and upload. These limits exclude driver/device memory, window back buffers and decoder working memory. Hardware acceleration can increase process memory and is not guaranteed to outperform GDI for small static views.
 

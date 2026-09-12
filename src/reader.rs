@@ -5,6 +5,11 @@ use std::{
     mem::{size_of, zeroed},
     path::PathBuf,
     ptr::{null, null_mut},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{sync_channel, Receiver, TryRecvError},
+        Arc,
+    },
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -90,8 +95,26 @@ impl Layout {
     }
 }
 
+struct SelectionWork {
+    version: u64,
+    cancel: Arc<AtomicBool>,
+    result: Receiver<Result<crate::pdftext::Selection, String>>,
+}
+impl Drop for SelectionWork {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 struct State {
     search_match: Option<crate::pdftext::Match>,
+    selection: Option<crate::pdftext::Selection>,
+    selection_range: Option<[crate::pdftext::Point; 2]>,
+    selection_version: u64,
+    selection_ready: bool,
+    selection_drag: bool,
+    selection_work: Option<SelectionWork>,
+    copy_pending: bool,
     hwnd: HWND,
     tree: HWND,
     font: HFONT,
@@ -180,6 +203,13 @@ impl Reader {
         SetWindowTheme(tree, wide("").as_ptr(), wide("").as_ptr());
         let state = State {
             search_match: None,
+            selection: None,
+            selection_range: None,
+            selection_version: 0,
+            selection_ready: false,
+            selection_drag: false,
+            selection_work: None,
+            copy_pending: false,
             hwnd,
             tree,
             font,
@@ -220,6 +250,7 @@ impl Reader {
     pub unsafe fn open(&self, path: PathBuf) {
         with(self.0, |s| {
             s.search_match = None;
+            s.clear_selection();
             s.path = path;
             s.document_id += 1;
             s.generation += 1;
@@ -250,6 +281,7 @@ impl Reader {
     pub unsafe fn close(&self) {
         with(self.0, |s| {
             s.search_match = None;
+            s.clear_selection();
             s.document_id += 1;
             s.worker.close();
             s.cache.clear();
@@ -303,12 +335,116 @@ unsafe fn with(hwnd: HWND, f: impl FnOnce(&mut State)) {
 }
 
 impl State {
+    unsafe fn clear_selection(&mut self) {
+        self.selection_version += 1;
+        self.selection = None;
+        self.selection_range = None;
+        self.selection_ready = false;
+        self.selection_drag = false;
+        self.copy_pending = false;
+        if let Some(work) = &self.selection_work {
+            work.cancel.store(true, Ordering::Relaxed);
+        }
+        if GetCapture() == self.hwnd {
+            ReleaseCapture();
+        }
+        invalidate(self.hwnd);
+    }
+    fn selection_point(&self, x: i32, y: i32, clamp: bool) -> Option<crate::pdftext::Point> {
+        if self.layout.pages.is_empty() || (!clamp && x < self.sidebar()) {
+            return None;
+        }
+        let page = self.layout.at(self.y + y - HEADER);
+        let r = self.layout.pages.get(page)?;
+        let left = self.sidebar() + ((self.viewport_width - r.width) / 2).max(GAP) - self.x;
+        let top = HEADER + r.top - self.y;
+        if !clamp && (x < left || x > left + r.width || y < top || y > top + r.height) {
+            return None;
+        }
+        Some(crate::pdftext::Point {
+            page,
+            x: ((x - left) as f32 / r.width.max(1) as f32).clamp(0., 1.),
+            y: ((y - top) as f32 / r.height.max(1) as f32).clamp(0., 1.),
+        })
+    }
+    unsafe fn extend_selection(&mut self, point: crate::pdftext::Point) {
+        if let Some(range) = &mut self.selection_range {
+            if range[1] == point {
+                return;
+            }
+            range[1] = point;
+            self.selection_version += 1;
+            self.selection = None;
+            self.selection_ready = false;
+            if let Some(work) = &self.selection_work {
+                work.cancel.store(true, Ordering::Relaxed);
+            }
+            SetTimer(self.hwnd, 12, 40, None);
+            invalidate(self.hwnd);
+        }
+    }
+    unsafe fn selection_tick(&mut self) {
+        if let Some(work) = self.selection_work.take() {
+            match work.result.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    self.selection_work = Some(work);
+                    return;
+                }
+                result if work.version == self.selection_version => {
+                    self.selection_ready = true;
+                    match result {
+                        Ok(Ok(selection)) => {
+                            self.selection = Some(selection);
+                            self.message.clear();
+                        }
+                        Ok(Err(error)) => self.message = error,
+                        _ => self.message = "PDF text extraction stopped; select again".into(),
+                    }
+                    if self.copy_pending {
+                        self.copy_pending = false;
+                        self.copy_selection();
+                    }
+                    invalidate(self.hwnd);
+                }
+                _ => (),
+            }
+        }
+        if !self.selection_ready {
+            if let Some(range) = self.selection_range.filter(|r| r[0] != r[1]) {
+                let path = self.path.clone();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let token = cancel.clone();
+                let (sender, result) = sync_channel(1);
+                std::thread::spawn(move || {
+                    let _ = sender.send(crate::pdftext::select(&path, range, &token));
+                });
+                self.selection_work = Some(SelectionWork {
+                    version: self.selection_version,
+                    cancel,
+                    result,
+                });
+                SetTimer(self.hwnd, 12, 40, None);
+                return;
+            }
+        }
+        KillTimer(self.hwnd, 12);
+    }
+    unsafe fn copy_selection(&mut self) {
+        if let Some(selection) = &self.selection {
+            if !selection.text.is_empty() && !crate::assets::copy_text(self.hwnd, &selection.text) {
+                self.message = "Clipboard busy; press Ctrl+C again".into();
+                invalidate(self.hwnd);
+            }
+        } else if !self.selection_ready && self.selection_range.is_some_and(|r| r[0] != r[1]) {
+            self.copy_pending = true;
+            SetTimer(self.hwnd, 12, 40, None);
+        }
+    }
     fn sidebar(&self) -> i32 {
         if self.toc_visible {
-            self.toc_width.min(
-                (unsafe { client(self.hwnd).right - px(self.hwnd, 240) })
-                    .max(unsafe { px(self.hwnd, 140) }),
-            )
+            self.toc_width.min(unsafe {
+                (client(self.hwnd).right - px(self.hwnd, 240)).max(px(self.hwnd, 140))
+            })
         } else {
             0
         }
@@ -323,7 +459,14 @@ impl State {
             (side - px(self.hwnd, 24)).max(1),
             (rc.bottom - HEADER - px(self.hwnd, 104)).max(1),
         );
-        ShowWindow(self.tree, if self.toc_visible { SW_SHOW } else { SW_HIDE });
+        ShowWindow(
+            self.tree,
+            if side > px(self.hwnd, 24) {
+                SW_SHOWNA
+            } else {
+                SW_HIDE
+            },
+        );
         // MoveWindow suppresses repaint; the parent's paint excludes this child.
         // Repaint newly exposed outline space when a docked panel closes.
         InvalidateRect(self.tree, null(), 0);
@@ -657,7 +800,7 @@ impl State {
         } else {
             self.current_page() + 1
         };
-        if self.toc_visible {
+        if side > px(self.hwnd, 24) {
             canvas.label(
                 &format!(
                     "{} / {}   ·   {:.0}%",
@@ -676,7 +819,7 @@ impl State {
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
         }
-        if self.toc_visible {
+        if side > px(self.hwnd, 24) {
             canvas.label(
                 "Outline",
                 RECT {
@@ -763,8 +906,15 @@ impl State {
                 );
             }
         }
-        if let Some(hit) = &self.search_match {
+        for hit in self
+            .search_match
+            .iter()
+            .chain(self.selection.iter().flat_map(|s| s.pages.iter()))
+        {
             if let Some(page) = self.layout.pages.get(hit.page) {
+                if page.top + page.height < self.y || page.top > self.y + self.viewport_height {
+                    continue;
+                }
                 let x = side + ((self.viewport_width - page.width) / 2).max(GAP) - self.x;
                 let y = HEADER + page.top - self.y;
                 for b in &hit.boxes {
@@ -776,6 +926,26 @@ impl State {
                     };
                     if r.right > r.left && r.bottom > r.top {
                         canvas.tint(r, ACCENT, 90);
+                    }
+                }
+            }
+        }
+        if self.selection_drag && self.selection.is_none() {
+            if let Some([a, b]) = self.selection_range {
+                if a.page == b.page {
+                    if let Some(page) = self.layout.pages.get(a.page) {
+                        let x = side + ((self.viewport_width - page.width) / 2).max(GAP) - self.x;
+                        let y = HEADER + page.top - self.y;
+                        canvas.tint(
+                            RECT {
+                                left: x + (a.x.min(b.x) * page.width as f32) as i32,
+                                top: y + (a.y.min(b.y) * page.height as f32) as i32,
+                                right: x + (a.x.max(b.x) * page.width as f32) as i32,
+                                bottom: y + (a.y.max(b.y) * page.height as f32) as i32 + 1,
+                            },
+                            ACCENT,
+                            45,
+                        );
                     }
                 }
             }
@@ -799,12 +969,12 @@ impl State {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    // DefWindowProc sends WM_SIZE synchronously here; do not hold State across it.
+    if msg == WM_WINDOWPOSCHANGED {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
     if msg == WM_ERASEBKGND {
         return 1;
-    }
-    if msg == WM_SIZE {
-        PostMessageW(hwnd, RESIZE, 0, 0);
-        return 0;
     }
     if msg == WM_NCDESTROY {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<State>;
@@ -830,9 +1000,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         return 0;
     }
     let Ok(mut s) = (*ptr).try_borrow_mut() else {
+        if msg == WM_SIZE {
+            PostMessageW(hwnd, RESIZE, 0, 0);
+        }
         return DefWindowProcW(hwnd, msg, wp, lp);
     };
     match msg {
+        WM_SIZE => s.resize(),
         WM_SHOWWINDOW if wp == 0 => s.renderer.release(),
         SCROLL_TO => {
             if wp != 0 {
@@ -846,7 +1020,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         JUMP => {
             s.jump(wp);
-            // Cancel any in-flight wheel animation before applying the destination.
+            // Synchronize the scrollbar with the destination.
             PostMessageW(hwnd, crate::scroll::POSITION, 1, s.y as isize);
         }
         FONTS_CHANGED => {
@@ -929,7 +1103,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                 }
             }
         }
+        WM_COPY => s.copy_selection(),
         WM_KEYDOWN => match wp as u16 {
+            0x43 if GetKeyState(VK_CONTROL as i32) < 0 && GetKeyState(VK_MENU as i32) >= 0 => {
+                s.copy_selection()
+            }
+            VK_INSERT if GetKeyState(VK_CONTROL as i32) < 0 => s.copy_selection(),
+            VK_ESCAPE => {
+                s.clear_selection();
+                s.message.clear();
+            }
             VK_UP => s.scroll(SB_VERT, SB_LINEUP, 0),
             VK_DOWN => s.scroll(SB_VERT, SB_LINEDOWN, 0),
             VK_PRIOR => s.action(UP),
@@ -940,6 +1123,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         },
         WM_MOUSEMOVE => {
             let x = lp as u16 as i16 as i32;
+            let y = (lp >> 16) as u16 as i16 as i32;
+            if s.selection_drag {
+                if let Some(point) = s.selection_point(x, y, true) {
+                    s.extend_selection(point);
+                }
+            }
             if let Some(guide) = &mut s.toc_drag {
                 guide.move_to(
                     hwnd,
@@ -951,6 +1140,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             }
             if s.toc_visible && (s.toc_drag.is_some() || (x - s.sidebar()).abs() <= px(hwnd, 7)) {
                 SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+            } else if s.selection_drag || s.selection_point(x, y, false).is_some() {
+                SetCursor(LoadCursorW(null_mut(), IDC_IBEAM));
             }
         }
         WM_LBUTTONUP | WM_CAPTURECHANGED if s.toc_drag.is_some() => {
@@ -969,9 +1160,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             if s.toc_visible && (x - s.sidebar()).abs() <= px(hwnd, 7) {
                 s.toc_drag = Some(Divider::new(hwnd, s.sidebar()));
                 SetCapture(hwnd);
+            } else {
+                s.clear_selection();
+                s.message.clear();
+                if let Some(point) = s.selection_point(x, (lp >> 16) as u16 as i16 as i32, false) {
+                    s.selection_range = Some([point, point]);
+                    s.selection_drag = true;
+                    SetCapture(hwnd);
+                }
             }
             SetFocus(hwnd);
         }
+        WM_LBUTTONUP | WM_CAPTURECHANGED if s.selection_drag => {
+            if msg == WM_LBUTTONUP {
+                if let Some(point) = s.selection_point(
+                    lp as u16 as i16 as i32,
+                    (lp >> 16) as u16 as i16 as i32,
+                    true,
+                ) {
+                    s.extend_selection(point);
+                }
+            }
+            s.selection_drag = false;
+            if msg == WM_LBUTTONUP {
+                ReleaseCapture();
+            }
+            s.selection_tick();
+            invalidate(hwnd);
+        }
+        WM_TIMER if wp == 12 => s.selection_tick(),
         WM_TIMER => {
             KillTimer(hwnd, wp);
             invalidate(hwnd);
@@ -1051,7 +1268,7 @@ fn native_continuous_reader_settles_after_scrolling() {
         let fonts = Fonts::new();
         let reader = Reader::create(parent, fonts.ui, fonts.small);
         MoveWindow(reader.0, 0, 0, 1050, 700, 0);
-        reader.open(path);
+        reader.open(path.clone());
         let pump = |duration: Duration| {
             let start = Instant::now();
             while start.elapsed() < duration {
@@ -1169,10 +1386,18 @@ fn native_continuous_reader_settles_after_scrolling() {
         ShowWindow(parent, SW_SHOWNOACTIVATE);
         // Terminal close expands the outline after its old bounds were painted.
         MoveWindow(reader.0, 0, 0, 1050, 450, 0);
+        with(reader.0, |s| {
+            assert_eq!(
+                s.viewport_height,
+                client(reader.0).bottom - HEADER,
+                "Resize must publish final geometry before a queued paint"
+            );
+            assert_eq!(s.viewport_width, client(reader.0).right - s.sidebar());
+        });
         SendMessageW(reader.0, RESIZE, 0, 0);
         MoveWindow(reader.0, 0, 0, 1050, 700, 0);
         SendMessageW(reader.0, RESIZE, 0, 0);
-        // A final layout must also repaint after intermediate animation paints.
+        // A final layout must repaint after intermediate resize paints.
         with(reader.0, |s| {
             ValidateRect(s.tree, null());
         });
@@ -1197,6 +1422,64 @@ fn native_continuous_reader_settles_after_scrolling() {
                 "Outline repaint must erase stale terminal pixels in empty space"
             );
             ReleaseDC(s.tree, dc);
+        });
+        let mut bounds = None;
+        crate::pdftext::search(
+            &path,
+            "Chapter",
+            &AtomicBool::new(false),
+            &mut |hit, _, _| {
+                bounds = Some(hit.boxes[0]);
+                false
+            },
+        )
+        .unwrap();
+        let b = bounds.unwrap();
+        let mut points = [0isize; 2];
+        with(reader.0, |s| {
+            s.y = 0;
+            s.x = 0;
+            s.scrollbars();
+            let page = s.layout.pages[0];
+            let left = s.sidebar() + ((s.viewport_width - page.width) / 2).max(GAP);
+            let y = HEADER + page.top + ((b[1] + b[3]) / 2. * page.height as f32) as i32;
+            for (point, x) in points.iter_mut().zip([b[0] + 0.002, b[2] - 0.002]) {
+                *point = ((y as isize) << 16) | (left + (x * page.width as f32) as i32) as isize;
+            }
+        });
+        SendMessageW(reader.0, WM_LBUTTONDOWN, 1, points[0]);
+        SendMessageW(reader.0, WM_MOUSEMOVE, 1, points[1]);
+        SendMessageW(reader.0, WM_LBUTTONUP, 0, points[1]);
+        let start = Instant::now();
+        loop {
+            pump(Duration::from_millis(30));
+            let mut ready = false;
+            with(reader.0, |s| ready = s.selection_ready);
+            if ready {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "Selection did not finish"
+            );
+        }
+        with(reader.0, |s| {
+            assert_eq!(s.selection.as_ref().unwrap().text, "Chapter");
+            assert!(!s.selection.as_ref().unwrap().pages[0].boxes.is_empty());
+            s.zoom(1.1, 100);
+            assert_eq!(s.selection.as_ref().unwrap().text, "Chapter");
+        });
+        SendMessageW(reader.0, WM_KEYDOWN, VK_ESCAPE as usize, 0);
+        with(reader.0, |s| assert!(s.selection.is_none()));
+        SendMessageW(reader.0, WM_LBUTTONDOWN, 1, points[0]);
+        SendMessageW(reader.0, WM_MOUSEMOVE, 1, points[1]);
+        SendMessageW(reader.0, WM_LBUTTONUP, 0, points[1]);
+        reader.close();
+        pump(Duration::from_millis(200));
+        with(reader.0, |s| {
+            assert!(s.selection.is_none());
+            assert!(s.selection_range.is_none());
+            assert!(!s.copy_pending);
         });
         assert_eq!(SendMessageW(reader.0, WM_ERASEBKGND, 0, 0), 1);
         drop(reader);

@@ -231,7 +231,7 @@ pub unsafe fn dark_scrollbars(hwnd: HWND, background: u32) {
     crate::scroll::attach(hwnd, background);
 }
 
-// A compositor-backed divider guide keeps expensive document reflow out of mouse motion.
+// A lightweight drag guide avoids document reflow until mouse release.
 pub struct Divider {
     hwnd: HWND,
     pub x: i32,
@@ -400,40 +400,6 @@ fn changing_font_preserves_readable_color_and_clean_state() {
         }
         DestroyWindow(hwnd);
         windows_sys::Win32::Foundation::FreeLibrary(library);
-    }
-}
-
-// Time-based easing keeps duration independent of delayed UI timer messages.
-pub fn ease_out(progress: f64) -> f64 {
-    1. - (1. - progress.clamp(0., 1.)).powi(3)
-}
-
-#[test]
-fn animation_progress_is_bounded_and_monotonic() {
-    assert_eq!(ease_out(-1.), 0.);
-    assert_eq!(ease_out(1.), 1.);
-    assert_eq!(ease_out(2.), 1.);
-    assert!((ease_out(0.5) - 0.875).abs() < 1e-10);
-    for i in 0..100 {
-        assert!(ease_out(i as f64 / 100.) <= ease_out((i + 1) as f64 / 100.));
-    }
-}
-
-pub unsafe fn animations_enabled() -> bool {
-    let mut enabled: i32 = 1;
-    SystemParametersInfoW(
-        SPI_GETCLIENTAREAANIMATION,
-        0,
-        &mut enabled as *mut _ as _,
-        0,
-    );
-    enabled != 0
-}
-pub unsafe fn animation_progress(start: std::time::Instant, duration: f64) -> f64 {
-    if animations_enabled() {
-        ease_out(start.elapsed().as_secs_f64() / duration)
-    } else {
-        1.
     }
 }
 

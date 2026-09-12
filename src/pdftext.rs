@@ -1,4 +1,4 @@
-//! PDFium is loaded only while searching. Rendering remains in the existing Windows worker.
+//! PDFium is loaded on demand for search and selection. Rendering remains in the existing Windows worker.
 use std::{
     ffi::c_void,
     fs::File,
@@ -32,7 +32,7 @@ unsafe extern "C" fn read(file: Handle, offset: u32, buffer: *mut u8, size: u32)
             .is_ok(),
     )
 }
-// ponytail: PDFium's global state is not thread-safe; serialize searches, never the UI.
+// ponytail: PDFium's global state is not thread-safe; serialize text extraction, never the UI.
 static LOCK: Mutex<()> = Mutex::new(());
 macro_rules! api {
     ($($name:ident($($arg:ty),*) -> $ret:ty;)*) => {
@@ -65,6 +65,8 @@ api! {
     FPDFText_ClosePage(Handle) -> ();
     FPDFText_CountChars(Handle) -> i32;
     FPDFText_GetText(Handle, i32, i32, *mut u16) -> i32;
+    FPDFText_GetCharIndexAtPos(Handle, f64, f64, f64, f64) -> i32;
+    FPDF_DeviceToPage(Handle, i32, i32, i32, i32, i32, i32, i32, *mut f64, *mut f64) -> i32;
     FPDFText_FindStart(Handle, *const u16, u32, i32) -> Handle;
     FPDFText_FindNext(Handle) -> i32;
     FPDFText_GetSchResultIndex(Handle) -> i32;
@@ -146,38 +148,15 @@ pub fn search(
                 if start < 0 || start >= count || len <= 0 || len > count - start {
                     break;
                 }
-                let extract = |start: i32, count: i32| {
-                    let mut units = vec![0u16; count as usize * 2 + 1];
-                    let n = (api.FPDFText_GetText)(text.0, start, count, units.as_mut_ptr()).max(1)
-                        as usize;
-                    String::from_utf16_lossy(&units[..n.saturating_sub(1).min(units.len())])
-                };
-                let matched = extract(start, len.min(2048));
-                let snippet = extract((start - 24).max(0), (count - (start - 24).max(0)).min(180))
+                let matched = api.extract(text.0, start, len.min(2048));
+                let snippet = api
+                    .extract(
+                        text.0,
+                        (start - 24).max(0),
+                        (count - (start - 24).max(0)).min(180),
+                    )
                     .replace(['\r', '\n', '\t'], " ");
-                let mut boxes = Vec::new();
-                for i in 0..(api.FPDFText_CountRects)(text.0, start, len).clamp(0, 2048) {
-                    let (mut l, mut t, mut r, mut b) = (0., 0., 0., 0.);
-                    if (api.FPDFText_GetRect)(text.0, i, &mut l, &mut t, &mut r, &mut b) == 0 {
-                        continue;
-                    }
-                    let (mut x1, mut y1, mut x2, mut y2) = (0, 0, 0, 0);
-                    if (api.FPDF_PageToDevice)(
-                        page.0, 0, 0, 1_000_000, 1_000_000, 0, l, t, &mut x1, &mut y1,
-                    ) == 0
-                        || (api.FPDF_PageToDevice)(
-                            page.0, 0, 0, 1_000_000, 1_000_000, 0, r, b, &mut x2, &mut y2,
-                        ) == 0
-                    {
-                        continue;
-                    }
-                    boxes.push([
-                        x1.min(x2) as f32 / 1e6,
-                        y1.min(y2) as f32 / 1e6,
-                        x1.max(x2) as f32 / 1e6,
-                        y1.max(y2) as f32 / 1e6,
-                    ]);
-                }
+                let boxes = api.boxes(page.0, text.0, start, len);
                 if !emit(
                     Match {
                         page: index as usize,
@@ -192,6 +171,172 @@ pub fn search(
         }
         Ok(has_text)
     }
+}
+
+impl Api {
+    unsafe fn extract(&self, text: Handle, start: i32, count: i32) -> String {
+        let mut units = vec![0u16; count as usize * 2 + 1];
+        let n = (self.FPDFText_GetText)(text, start, count, units.as_mut_ptr()).max(1) as usize;
+        String::from_utf16_lossy(&units[..n.saturating_sub(1).min(units.len())])
+    }
+    unsafe fn boxes(&self, page: Handle, text: Handle, start: i32, len: i32) -> Vec<[f32; 4]> {
+        let mut boxes = Vec::new();
+        for i in 0..(self.FPDFText_CountRects)(text, start, len).clamp(0, 20000) {
+            let (mut l, mut t, mut r, mut b) = (0., 0., 0., 0.);
+            if (self.FPDFText_GetRect)(text, i, &mut l, &mut t, &mut r, &mut b) == 0 {
+                continue;
+            }
+            let (mut x1, mut y1, mut x2, mut y2) = (0, 0, 0, 0);
+            if (self.FPDF_PageToDevice)(page, 0, 0, 1_000_000, 1_000_000, 0, l, t, &mut x1, &mut y1)
+                == 0
+                || (self.FPDF_PageToDevice)(
+                    page, 0, 0, 1_000_000, 1_000_000, 0, r, b, &mut x2, &mut y2,
+                ) == 0
+            {
+                continue;
+            }
+            boxes.push([
+                x1.min(x2) as f32 / 1e6,
+                y1.min(y2) as f32 / 1e6,
+                x1.max(x2) as f32 / 1e6,
+                y1.max(y2) as f32 / 1e6,
+            ]);
+        }
+
+        boxes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Point {
+    pub page: usize,
+    pub x: f32,
+    pub y: f32,
+}
+pub struct Selection {
+    pub text: String,
+    pub pages: Vec<Match>,
+}
+
+pub fn select(
+    path: &Path,
+    mut range: [Point; 2],
+    cancel: &AtomicBool,
+) -> Result<Selection, String> {
+    let _lock = LOCK.lock().map_err(|_| "PDF text extraction stopped")?;
+    let mut out = Selection {
+        text: String::new(),
+        pages: Vec::new(),
+    };
+    if cancel.load(Ordering::Relaxed) || range[0] == range[1] {
+        return Ok(out);
+    }
+    if range.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return Err("Invalid PDF selection".into());
+    }
+    if range[0].page > range[1].page {
+        range.swap(0, 1);
+    }
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let length = u32::try_from(file.metadata().map_err(|e| e.to_string())?.len())
+        .map_err(|_| "PDF text extraction supports files smaller than 4 GiB")?;
+    unsafe {
+        let api = Api::load()?;
+        (api.FPDF_InitLibrary)();
+        let mut access = Access {
+            length,
+            read,
+            file: (&mut file as *mut File).cast(),
+        };
+        let doc = (api.FPDF_LoadCustomDocument)(&mut access, null());
+        if doc.is_null() {
+            return Err("Cannot read text in this PDF".into());
+        }
+        let doc = Owned(doc, api.FPDF_CloseDocument);
+        if range[1].page >= (api.FPDF_GetPageCount)(doc.0).max(0) as usize {
+            return Err("PDF page changed; select again".into());
+        }
+        let mut chars = 0i64;
+        let mut rectangles = 0i64;
+        for index in range[0].page..=range[1].page {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(out);
+            }
+            let page = (api.FPDF_LoadPage)(doc.0, index as i32);
+            if page.is_null() {
+                return Err("Cannot read PDF page".into());
+            }
+            let page = Owned(page, api.FPDF_ClosePage);
+            let text = (api.FPDFText_LoadPage)(page.0);
+            if text.is_null() {
+                return Err("Cannot read PDF text".into());
+            }
+            let text = Owned(text, api.FPDFText_ClosePage);
+            let count = (api.FPDFText_CountChars)(text.0);
+            if count < 0 {
+                return Err("Cannot read PDF characters".into());
+            }
+            if count == 0 {
+                continue;
+            }
+            let hit = |point: Point| -> Result<i32, String> {
+                let (mut x, mut y) = (0., 0.);
+                if (api.FPDF_DeviceToPage)(
+                    page.0,
+                    0,
+                    0,
+                    1_000_000,
+                    1_000_000,
+                    0,
+                    (point.x.clamp(0., 1.) * 1e6) as i32,
+                    (point.y.clamp(0., 1.) * 1e6) as i32,
+                    &mut x,
+                    &mut y,
+                ) == 0
+                {
+                    return Err("Cannot map PDF selection".into());
+                }
+                let i = (api.FPDFText_GetCharIndexAtPos)(text.0, x, y, 1e9, 1e9);
+                if i < 0 || i >= count {
+                    Err("No selectable text here".into())
+                } else {
+                    Ok(i)
+                }
+            };
+            let mut start = if index == range[0].page {
+                hit(range[0])?
+            } else {
+                0
+            };
+            let mut end = if index == range[1].page {
+                hit(range[1])?
+            } else {
+                count - 1
+            };
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            chars += i64::from(end - start + 1);
+            rectangles +=
+                i64::from((api.FPDFText_CountRects)(text.0, start, end - start + 1).max(0));
+            if chars > 1_000_000 || rectangles > 20000 {
+                return Err("Selection too large; copy a smaller range".into());
+            }
+            if !out.text.is_empty() && !out.text.ends_with('\n') {
+                out.text.push_str("\r\n");
+            }
+            out.text
+                .push_str(&api.extract(text.0, start, end - start + 1));
+            out.pages.push(Match {
+                page: index,
+                boxes: api.boxes(page.0, text.0, start, end - start + 1),
+            });
+        }
+    }
+    if out.text.is_empty() {
+        return Err("No text layer in this selection · Scanned pages need OCR".into());
+    }
+    Ok(out)
 }
 
 #[test]
@@ -217,9 +362,13 @@ fn pdf_search_finds_compressed_text_and_rotated_cropped_boxes() {
             "Resources" => resources, "Contents" => content,
         })));
     }
+    kids.push(Object::Reference(doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages,
+        "MediaBox" => vec![0.into(),0.into(),600.into(),800.into()],
+    })));
     doc.set_object(
         pages,
-        dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 2 },
+        dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 3 },
     );
     let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
     doc.trailer.set("Root", catalog);
@@ -253,6 +402,80 @@ fn pdf_search_finds_compressed_text_and_rotated_cropped_boxes() {
         (b[0] - (1. - a[3])).abs() < 0.002 && (b[1] - a[0]).abs() < 0.002,
         "{a:?} {b:?}"
     );
+    let range = [
+        Point {
+            page: 0,
+            x: a[0] + 0.001,
+            y: (a[1] + a[3]) / 2.,
+        },
+        Point {
+            page: 0,
+            x: a[2] - 0.001,
+            y: (a[1] + a[3]) / 2.,
+        },
+    ];
+    assert!(select(
+        &path,
+        [
+            Point {
+                page: 2,
+                ..range[0]
+            },
+            Point {
+                page: 2,
+                ..range[1]
+            }
+        ],
+        &AtomicBool::new(false)
+    )
+    .err()
+    .unwrap()
+    .contains("No text layer"));
+    let selected = select(&path, range, &AtomicBool::new(false)).unwrap();
+    assert_eq!(selected.text, "Needle");
+    assert_eq!(
+        select(&path, [range[1], range[0]], &AtomicBool::new(false))
+            .unwrap()
+            .text,
+        "Needle"
+    );
+    let rotated = [
+        Point {
+            page: 1,
+            x: (b[0] + b[2]) / 2.,
+            y: b[1] + 0.001,
+        },
+        Point {
+            page: 1,
+            x: (b[0] + b[2]) / 2.,
+            y: b[3] - 0.001,
+        },
+    ];
+    assert_eq!(
+        select(&path, rotated, &AtomicBool::new(false))
+            .unwrap()
+            .text,
+        "Needle"
+    );
+    let across = select(&path, [range[0], rotated[1]], &AtomicBool::new(false)).unwrap();
+    assert_eq!(across.text, "Needle text\r\nNeedle");
+    assert_eq!(across.pages.len(), 2);
+    assert!(select(&path, range, &AtomicBool::new(true))
+        .unwrap()
+        .text
+        .is_empty());
+    assert!(select(
+        &path,
+        [
+            range[0],
+            Point {
+                page: 100,
+                ..range[1]
+            }
+        ],
+        &AtomicBool::new(false)
+    )
+    .is_err());
     assert!(search(
         &path,
         "absent",

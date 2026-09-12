@@ -43,7 +43,7 @@ pub(crate) enum Language {
     Ignore,
 }
 impl Language {
-    fn name(name: &str) -> Self {
+    pub(crate) fn name(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
             "md" | "markdown" | "mdown" => Self::Markdown,
             "rs" | "rust" => Self::Rust,

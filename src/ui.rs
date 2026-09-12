@@ -39,6 +39,7 @@ const NEXT: usize = 108;
 const ZOOM_IN: usize = 109;
 const ZOOM_OUT: usize = 110;
 const FIT: usize = 111;
+const OVERVIEW: usize = 126;
 const EDITOR: usize = 112;
 const BOLD: usize = 113;
 const ITALIC: usize = 114;
@@ -53,7 +54,6 @@ const TERMINAL: usize = 122;
 const IMAGE: usize = 123;
 const KEEP_CURRENT: usize = 124;
 const USE_DISK: usize = 125;
-const OVERVIEW: usize = 126;
 const OPEN_FOLDER: usize = 127;
 const CLOSE_FOLDER: usize = 128;
 const TOGGLE_FILES: usize = 130;
@@ -159,7 +159,10 @@ struct App {
     search_hit: Option<crate::search::Hit>,
     workspace: Option<crate::workspace::Workspace>,
     workspace_width: i32,
+    sidebar_width: i32,
     workspace_visible: bool,
+    workspace_idle: bool,
+    feather: (i32, theme::Buffer),
     workspace_drag: Option<theme::Divider>,
     folded: RefCell<BTreeSet<usize>>,
     fold_revision: Cell<u64>,
@@ -180,8 +183,8 @@ struct App {
     terminal: Option<terminal::Terminal>,
     terminal_open: bool,
     terminal_width: i32,
-    terminal_started: std::time::Instant,
-    terminal_from: f64,
+    terminal_preferred_width: i32,
+    terminal_drag: Option<theme::Divider>,
     font: HFONT,
     path: Option<PathBuf>,
     encoding: Encoding,
@@ -210,8 +213,22 @@ struct App {
 }
 
 impl App {
+    fn empty_workspace(&self) -> bool {
+        self.workspace_idle
+            && self.workspace.is_some()
+            && self.path.is_none()
+            && self.pdf_path.is_none()
+            && self.image.is_none()
+            && self.large.is_none()
+    }
     unsafe fn focus_content(&self) {
-        let target = if self.pdf_path.is_some() {
+        let target = if self.empty_workspace() {
+            if self.sidebar_visible() && !self.search_visible {
+                self.workspace.as_ref().unwrap().hwnd
+            } else {
+                self.hwnd
+            }
+        } else if self.pdf_path.is_some() {
             self.viewer.as_ref().map_or(self.hwnd, |v| v.0)
         } else if let Some(image) = &self.image {
             image.0
@@ -242,10 +259,13 @@ impl App {
                 self.fonts.small,
             ));
         }
-        self.search_visible = true;
-        self.workspace_visible = true;
-        self.layout();
-        self.search.as_ref().unwrap().focus();
+        {
+            self.search_visible = true;
+            self.workspace_visible = true;
+            self.layout();
+            self.search.as_ref().unwrap().focus();
+            self.refresh_preview();
+        };
     }
     unsafe fn select_search_result(&mut self, selection: Option<(i32, i32)>) {
         self.preview_only = false;
@@ -294,28 +314,85 @@ impl App {
     unsafe fn open_folder(&mut self, path: PathBuf) {
         match crate::workspace::Workspace::create(self.hwnd, path, self.fonts.small) {
             Ok(workspace) => {
+                self.workspace_idle = self.path.is_none()
+                    && self.pdf_path.is_none()
+                    && self.image.is_none()
+                    && self.large.is_none()
+                    && GetWindowTextLengthW(self.edit) == 0
+                    && SendMessageW(self.edit, EM_GETMODIFY, 0, 0) == 0;
                 self.search.take();
                 self.search_visible = false;
                 self.workspace = Some(workspace);
                 self.workspace_visible = true;
                 self.layout();
+                self.focus_content();
                 self.status("");
+                self.refresh_preview();
             }
             Err(e) => error(self.hwnd, &e),
         }
     }
-    unsafe fn toggle_heading(&self, start: i32, end: i32) -> bool {
+    unsafe fn preview_url(&self, start: i32, end: i32) -> Option<String> {
         use windows::Win32::UI::Controls::RichEdit::ITextRange2;
         use windows_core::Interface;
-        let key = (|| {
-            let doc = crate::syntax::document(self.preview)?;
-            let range: ITextRange2 = doc.Range(start, end).ok()?.cast().ok()?;
-            let url = range.GetURL().ok()?.to_string();
-            url.trim_matches('"')
-                .strip_prefix("plumetxt-fold:")?
-                .parse::<usize>()
-                .ok()
-        })();
+        let doc = crate::syntax::document(self.preview)?;
+        let range: ITextRange2 = doc.Range(start, end).ok()?.cast().ok()?;
+        Some(
+            range
+                .GetURL()
+                .ok()?
+                .to_string()
+                .trim_matches('"')
+                .to_owned(),
+        )
+    }
+    unsafe fn activate_preview_link(&mut self, start: i32, end: i32) {
+        if self.toggle_heading(start, end) {
+            return;
+        }
+        let Some(url) = self.preview_url(start, end) else {
+            return;
+        };
+        if url.chars().any(char::is_control) {
+            return;
+        }
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("https://")
+            || lower.starts_with("http://")
+            || lower.starts_with("mailto:")
+        {
+            if ShellExecuteW(
+                self.hwnd,
+                wide("open").as_ptr(),
+                wide(&url).as_ptr(),
+                null(),
+                null(),
+                SW_SHOWNORMAL,
+            ) as isize
+                <= 32
+            {
+                self.status("Could not open link");
+            }
+        } else if url.starts_with('#') {
+            self.status("Section anchors are not supported yet");
+        } else if let Some(base) = self.path.as_ref().and_then(|p| p.parent()) {
+            if let Some(path) = crate::assets::relative_path(base, &url) {
+                if path.is_file() {
+                    self.open(path);
+                } else {
+                    self.status("Linked file was not found");
+                }
+            } else {
+                self.status("Unsupported link target");
+            }
+        } else {
+            self.status("Save the document before opening relative links");
+        }
+    }
+    unsafe fn toggle_heading(&self, start: i32, end: i32) -> bool {
+        let key = self
+            .preview_url(start, end)
+            .and_then(|url| url.strip_prefix("plumetxt-fold:")?.parse::<usize>().ok());
         let Some(key) = key else {
             return false;
         };
@@ -755,6 +832,17 @@ impl App {
             "Editing  ·  Save Ctrl+S".into()
         }
     }
+    unsafe fn terminal_width_bounds(&self) -> (i32, i32) {
+        let total = theme::client(self.hwnd).right;
+        let left = if self.sidebar_visible() {
+            self.workspace_width
+                .min((total - theme::px(self.hwnd, 360)).max(theme::px(self.hwnd, 160)))
+        } else {
+            0
+        };
+        let max = (total - left - theme::px(self.hwnd, 240)).max(1);
+        (theme::px(self.hwnd, 240).min(max), max)
+    }
     unsafe fn refresh_status(&self) {
         let message = self.status_message.borrow();
         let value = if message.is_empty() {
@@ -774,6 +862,18 @@ impl App {
         }
     }
     unsafe fn layout(&mut self) {
+        if !self.empty_workspace() {
+            self.feather = (0, theme::Buffer::default());
+        }
+        self.palette.reposition();
+        if !self.preview.is_null()
+            && self.pdf_path.is_none()
+            && self.image.is_none()
+            && self.large.is_none()
+        {
+            scroll::hold_range(self.preview, true);
+            SetTimer(self.hwnd, 1, 100, None);
+        }
         let rc = theme::client(self.hwnd);
         let d = |v| theme::px(self.hwnd, v);
         theme::move_window(
@@ -810,22 +910,29 @@ impl App {
             0,
         );
         let bottom = rc.bottom;
-        let left = if self.sidebar_visible() {
+        let target_left = if self.sidebar_visible() {
             self.workspace_width.min((rc.right - d(360)).max(d(160)))
         } else {
             0
         };
+        let left = target_left;
+        self.sidebar_width = left;
+        let target_terminal = if self.terminal_open {
+            let (min, max) = self.terminal_width_bounds();
+            let desired = if self.terminal_preferred_width == 0 {
+                (rc.right * 2 / 5).clamp(d(400), d(640))
+            } else {
+                self.terminal_preferred_width
+            };
+            desired.clamp(min, max)
+        } else {
+            0
+        };
+        self.terminal_width = target_terminal;
         let right = (rc.right - self.terminal_width).max(left + 1);
         if let Some(workspace) = &self.workspace {
-            ShowWindow(
-                workspace.hwnd,
-                if self.workspace_visible && !self.search_visible {
-                    SW_SHOWNA
-                } else {
-                    SW_HIDE
-                },
-            );
-            if self.workspace_visible && !self.search_visible {
+            let visible = left > d(16) && !self.search_visible;
+            if visible {
                 scroll::resize(
                     workspace.hwnd,
                     d(8),
@@ -834,19 +941,14 @@ impl App {
                     (bottom - d(54)).max(1),
                 );
             }
+            ShowWindow(workspace.hwnd, if visible { SW_SHOWNA } else { SW_HIDE });
         }
         if let Some(search) = &self.search {
-            ShowWindow(
-                search.0,
-                if self.workspace_visible && self.search_visible {
-                    SW_SHOWNA
-                } else {
-                    SW_HIDE
-                },
-            );
-            if self.workspace_visible && self.search_visible {
+            let visible = left > d(16) && self.search_visible;
+            if visible {
                 theme::move_window(search.0, 0, 0, left - d(4), (bottom - d(34)).max(1), 0);
             }
+            ShowWindow(search.0, if visible { SW_SHOWNA } else { SW_HIDE });
         }
         if let Some(view) = &self.image {
             theme::move_window(view.0, left, 0, right - left, (bottom - d(34)).max(1), 0);
@@ -863,6 +965,14 @@ impl App {
                 (self.terminal_width - d(20)).max(1),
                 (bottom - d(58)).max(1),
                 0,
+            );
+            ShowWindow(
+                terminal.0,
+                if self.terminal_width > d(20) {
+                    SW_SHOWNA
+                } else {
+                    SW_HIDE
+                },
             );
         }
         if let Some(viewer) = &self.viewer {
@@ -887,7 +997,14 @@ impl App {
         );
         let reading = self.preview_only && self.comparison.is_none();
         if self.image.is_none() && self.pdf_path.is_none() && self.large.is_none() {
-            ShowWindow(self.edit, if reading { SW_HIDE } else { SW_SHOWNA });
+            ShowWindow(
+                self.edit,
+                if reading || self.empty_workspace() {
+                    SW_HIDE
+                } else {
+                    SW_SHOWNA
+                },
+            );
         }
         if !self.preview.is_null() {
             let reading_inset = ((right - left - d(880)) / 2).max(d(24));
@@ -934,7 +1051,18 @@ impl App {
             );
             ShowWindow(*action, if comparing { SW_SHOWNA } else { SW_HIDE });
         }
-        scroll::show(self.edit, !reading && (self.preview.is_null() || comparing));
+        scroll::measure(self.edit);
+        if !self.preview.is_null() {
+            scroll::measure(self.preview);
+        }
+        scroll::show(
+            self.edit,
+            !self.empty_workspace() && !reading && (self.preview.is_null() || comparing),
+        );
+        if self.empty_workspace() && !self.preview.is_null() {
+            ShowWindow(self.preview, SW_HIDE);
+            scroll::show(self.preview, false);
+        }
         theme::invalidate(self.hwnd);
         SetTimer(self.hwnd, 9, 80, None);
     }
@@ -945,6 +1073,8 @@ impl App {
         }
         self.workspace_width = (self.workspace_width as i64 * dpi as i64 / self.dpi as i64) as i32;
         self.terminal_width = (self.terminal_width as i64 * dpi as i64 / self.dpi as i64) as i32;
+        self.terminal_preferred_width =
+            (self.terminal_preferred_width as i64 * dpi as i64 / self.dpi as i64) as i32;
         self.dpi = dpi;
         SetPropW(self.hwnd, wide("PlumeTxtDpi").as_ptr(), dpi as usize as _);
         let fonts = theme::Fonts::at_dpi(dpi);
@@ -1019,6 +1149,7 @@ impl App {
         }
     }
     unsafe fn show_editor(&mut self) {
+        self.workspace_idle = false;
         self.image.take();
         self.image_path = None;
         self.large.take();
@@ -1276,9 +1407,10 @@ impl App {
         }
     }
     unsafe fn refresh_preview(&self) {
+        KillTimer(self.hwnd, 1);
         self.preview_version
             .set(self.preview_version.get().wrapping_add(1));
-        if self.loading.is_some() {
+        if self.loading.is_some() || self.empty_workspace() {
             return;
         }
         if let Some(snapshot) = &self.comparison {
@@ -1306,6 +1438,7 @@ impl App {
                 if let Err(e) = result {
                     self.status(&e);
                 }
+                scroll::hold_range(self.preview, false);
             }
             return;
         }
@@ -1356,7 +1489,10 @@ impl App {
                     *self.preview_job.borrow_mut() = Some((version, receiver));
                     SetTimer(self.hwnd, 14, 30, None);
                 }
-                Err(e) => self.status(&format!("Preview worker: {e}")),
+                Err(e) => {
+                    scroll::hold_range(self.preview, false);
+                    self.status(&format!("Preview worker: {e}"));
+                }
             }
         }
     }
@@ -1412,6 +1548,7 @@ impl App {
                 Ok(Err(e)) => self.status(&e),
                 Err(_) => self.status("Preview worker stopped"),
             }
+            scroll::hold_range(self.preview, false);
         } else {
             drop(result);
         }
@@ -1553,9 +1690,6 @@ impl App {
                         (IMAGE, "Insert image", "Ctrl+Shift+I", "picture"),
                     ]);
                 }
-                if self.chunk.is_some() {
-                    items.push((OVERVIEW, "Document overview", "", "large file navigate"));
-                }
             }
         }
         items.push((TERMINAL, "Toggle terminal", "Ctrl+Shift+J", "shell"));
@@ -1565,6 +1699,15 @@ impl App {
         items
     }
     unsafe fn command(&mut self, id: usize) {
+        if self.empty_workspace()
+            && matches!(
+                id,
+                SAVE | SAVE_AS | PREVIEW | EXPORT | BOLD | ITALIC | CODE | IMAGE
+            )
+        {
+            self.status("Select a file or press Ctrl+N to create a document");
+            return;
+        }
         if id == PRINT {
             if self.printing.is_some() {
                 self.status("Printing…");
@@ -1680,13 +1823,20 @@ impl App {
                     }
                     self.layout();
                 }
+                self.refresh_preview();
             }
             CLOSE_FOLDER => {
+                let idle = self.empty_workspace();
                 self.search.take();
-                self.search_visible = false;
                 self.workspace.take();
+                self.search_visible = false;
+                self.workspace_visible = false;
+                if idle {
+                    self.show_editor();
+                }
                 self.layout();
                 self.focus_content();
+                self.refresh_preview();
             }
             REFRESH_FILES => {
                 if let Some(workspace) = &mut self.workspace {
@@ -1740,8 +1890,6 @@ impl App {
                         self.cancel_loading();
                         self.browse_large(chunk.path, chunk.start);
                     }
-                } else if self.large.is_none() {
-                    self.status("Overview is available for large files");
                 }
             }
             PREVIEW
@@ -1847,11 +1995,6 @@ impl App {
                 }
             }
             LAYOUT => {
-                if self.terminal_open {
-                    self.terminal_width = (theme::client(self.hwnd).right / 3)
-                        .clamp(theme::px(self.hwnd, 320), theme::px(self.hwnd, 520));
-                    SetTimer(self.hwnd, 7, 15, None);
-                }
                 self.layout();
                 if !self.preview.is_null() && self.pdf_path.is_none() && self.image.is_none() {
                     SetTimer(self.hwnd, 1, 350, None);
@@ -1872,11 +2015,7 @@ impl App {
                 }
             }
             TERMINAL => {
-                let previous_target = if self.terminal_open { 1. } else { 0. };
-                self.terminal_from += (previous_target - self.terminal_from)
-                    * theme::animation_progress(self.terminal_started, 0.18);
                 self.terminal_open = !self.terminal_open;
-                self.terminal_started = std::time::Instant::now();
                 if self.terminal_open
                     && (self.terminal.is_none()
                         || self.terminal.as_ref().is_some_and(|t| t.exited()))
@@ -1897,23 +2036,16 @@ impl App {
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     self.terminal = Some(terminal::Terminal::create(self.hwnd, &cwd));
                 }
-                if self.terminal_open {
-                    self.terminal_width = (theme::client(self.hwnd).right / 3)
-                        .clamp(theme::px(self.hwnd, 320), theme::px(self.hwnd, 520));
-                    self.layout();
-                    if let Some(t) = &self.terminal {
-                        let rc = theme::client(t.0);
-                        let visible = (rc.right as f64 * self.terminal_from).round() as i32;
-                        SetWindowRgn(
-                            t.0,
-                            CreateRectRgn(rc.right - visible, 0, rc.right, rc.bottom),
-                            0,
-                        );
-                        ShowWindow(t.0, SW_SHOW);
+                self.layout();
+                if let Some(t) = &self.terminal {
+                    if self.terminal_open {
                         SetFocus(t.0);
                     }
                 }
-                SetTimer(self.hwnd, 7, 15, None);
+                if !self.terminal_open {
+                    self.focus_content();
+                }
+                self.refresh_preview();
             }
             IMAGE => {
                 if self.image.is_some() || self.pdf_path.is_some() || self.large.is_some() {
@@ -1993,8 +2125,8 @@ impl App {
             },
             SURFACE,
         );
-        if self.sidebar_visible() {
-            let width = self.workspace_width.min((rc.right - d(360)).max(d(160)));
+        if self.sidebar_width > 0 {
+            let width = self.sidebar_width;
             fill(
                 dc,
                 RECT {
@@ -2016,17 +2148,27 @@ impl App {
                 LINE,
             );
         }
-        if self.large.is_none()
+        if self.terminal_width > 0 {
+            let x = rc.right - self.terminal_width + d(4);
+            fill(
+                dc,
+                RECT {
+                    left: x,
+                    top: d(12),
+                    right: x + 1,
+                    bottom: rc.bottom - d(46),
+                },
+                LINE,
+            );
+        }
+        if !self.empty_workspace()
+            && self.large.is_none()
             && self.pdf_path.is_none()
             && self.image.is_none()
             && !self.preview.is_null()
             && (!self.preview_only || self.comparison.is_some())
         {
-            let left = if self.sidebar_visible() {
-                self.workspace_width.min((rc.right - d(360)).max(d(160)))
-            } else {
-                0
-            };
+            let left = self.sidebar_width;
             let middle = left + (rc.right - self.terminal_width - left).max(1) / 2;
             fill(
                 dc,
@@ -2049,6 +2191,65 @@ impl App {
             },
             LINE,
         );
+        if self.empty_workspace() {
+            let width = (rc.right - self.terminal_width - self.sidebar_width).max(0);
+            let height = (rc.bottom - d(34)).max(0);
+            let size = d(192).min(width).min(height);
+            if size > 0 && self.feather.0 != size {
+                let icon = &mut self.feather.1;
+                if icon.ensure(dc, size, size) {
+                    fill(
+                        icon.dc,
+                        RECT {
+                            left: 0,
+                            top: 0,
+                            right: size,
+                            bottom: size,
+                        },
+                        CANVAS,
+                    );
+                    // Scale the original artwork at physical pixel size once per size/DPI change.
+                    if let Ok((dib, w, h)) = crate::assets::load_feather(size as u32) {
+                        StretchDIBits(
+                            icon.dc,
+                            0,
+                            0,
+                            size,
+                            size,
+                            0,
+                            0,
+                            w as i32,
+                            h as i32,
+                            dib[40..].as_ptr().cast(),
+                            dib.as_ptr().cast(),
+                            DIB_RGB_COLORS,
+                            SRCCOPY,
+                        );
+                        self.feather.0 = size;
+                    }
+                }
+            }
+            if self.feather.0 == size && size > 0 {
+                GdiAlphaBlend(
+                    dc,
+                    self.sidebar_width + (width - size) / 2,
+                    (height - size) / 2,
+                    size,
+                    size,
+                    self.feather.1.dc,
+                    0,
+                    0,
+                    size,
+                    size,
+                    BLENDFUNCTION {
+                        BlendOp: AC_SRC_OVER as u8,
+                        BlendFlags: 0,
+                        SourceConstantAlpha: 88,
+                        AlphaFormat: 0,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -2440,6 +2641,7 @@ unsafe fn draw_terminal_button(draw: &DRAWITEMSTRUCT) {
     // Keep this path independent of App so every paint supplies the dark background.
     theme::fill(draw.hDC, draw.rcItem, theme::SURFACE);
     let d = |v| theme::px(draw.hwndItem, v);
+    let terminal = draw.CtlID == TERMINAL as u32;
     let hovered = !GetPropW(draw.hwndItem, wide("PlumeTxtHover").as_ptr()).is_null();
     let pressed = draw.itemState & ODS_SELECTED != 0;
     let focused = draw.itemState & ODS_FOCUS != 0;
@@ -2459,26 +2661,55 @@ unsafe fn draw_terminal_button(draw: &DRAWITEMSTRUCT) {
         } else {
             theme::SURFACE
         },
-        if focused { theme::ACCENT } else { theme::LINE },
-        d(10),
+        if focused || (terminal && hovered) {
+            theme::ACCENT
+        } else if terminal {
+            theme::rgb(82, 108, 124)
+        } else {
+            theme::LINE
+        },
+        d(if terminal { 6 } else { 10 }),
         d(1),
     );
-    theme::label(
-        draw.hDC,
-        &if draw.CtlID == TERMINAL as u32 {
-            ">_".into()
-        } else {
-            text(draw.hwndItem)
-        },
-        draw.rcItem,
-        SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0) as HFONT,
-        if draw.itemState & ODS_DISABLED != 0 {
-            theme::MUTED
-        } else {
-            theme::INK
-        },
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-    );
+    let color = if draw.itemState & ODS_DISABLED != 0 {
+        theme::MUTED
+    } else if terminal {
+        theme::ACCENT
+    } else {
+        theme::INK
+    };
+    if terminal {
+        // Geometric prompt avoids font-dependent baseline and glyph spacing.
+        let x = (draw.rcItem.left + draw.rcItem.right) / 2;
+        let y = (draw.rcItem.top + draw.rcItem.bottom) / 2;
+        let pen = CreatePen(PS_SOLID, d(2).max(1), color);
+        let old = SelectObject(draw.hDC, pen);
+        let prompt = [
+            POINT {
+                x: x - d(7),
+                y: y - d(4),
+            },
+            POINT { x: x - d(3), y },
+            POINT {
+                x: x - d(7),
+                y: y + d(4),
+            },
+        ];
+        Polyline(draw.hDC, prompt.as_ptr(), prompt.len() as i32);
+        MoveToEx(draw.hDC, x + d(1), y + d(4), null_mut());
+        LineTo(draw.hDC, x + d(7), y + d(4));
+        SelectObject(draw.hDC, old);
+        DeleteObject(pen);
+    } else {
+        theme::label(
+            draw.hDC,
+            &text(draw.hwndItem),
+            draw.rcItem,
+            SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0) as HFONT,
+            color,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
     if draw.itemState & (ODS_FOCUS | ODS_SELECTED) != 0 {
         let middle = (draw.rcItem.left + draw.rcItem.right) / 2;
         theme::fill(
@@ -2560,7 +2791,10 @@ fn native_terminal_button_paints_during_reentrant_layout() {
                     theme::SURFACE
                 }
             );
-            assert!((8..28).any(|x| (4..20).any(|y| GetPixel(dc, x, y) != theme::CANVAS)));
+            if state == 0 {
+                assert_eq!(GetPixel(dc, 18, 2), theme::rgb(82, 108, 124));
+            }
+            assert!((8..28).any(|x| (4..20).any(|y| GetPixel(dc, x, y) == theme::ACCENT)));
         }
         SelectObject(dc, old);
         DeleteObject(bitmap);
@@ -2740,6 +2974,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             return false;
         };
         match msg {
+            WM_MOVE => app.palette.reposition(),
             WM_DPICHANGED => {
                 let rect = *(lp as *const RECT);
                 app.change_dpi((wp & 0xffff) as u32);
@@ -2773,6 +3008,50 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     .and_then(|search| search.take_hit())
                 {
                     app.open_search_result(hit);
+                }
+            }
+            WM_LBUTTONDOWN
+                if app.terminal_open
+                    && ((lp as u16 as i16 as i32)
+                        - (theme::client(hwnd).right - app.terminal_width
+                            + theme::px(hwnd, 4)))
+                    .abs()
+                        <= theme::px(hwnd, 4) =>
+            {
+                app.terminal_drag = Some(theme::Divider::new(
+                    hwnd,
+                    theme::client(hwnd).right - app.terminal_width,
+                ));
+                SetCapture(hwnd);
+            }
+            WM_MOUSEMOVE
+                if app.terminal_drag.is_some()
+                    || (app.terminal_open
+                        && ((lp as u16 as i16 as i32)
+                            - (theme::client(hwnd).right - app.terminal_width
+                                + theme::px(hwnd, 4)))
+                        .abs()
+                            <= theme::px(hwnd, 4)) =>
+            {
+                let total = theme::client(hwnd).right;
+                let (min, max) = app.terminal_width_bounds();
+                if let Some(guide) = &mut app.terminal_drag {
+                    guide.move_to(
+                        hwnd,
+                        (lp as u16 as i16 as i32).clamp(total - max, total - min),
+                    );
+                }
+                SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+            }
+            WM_LBUTTONUP | WM_CAPTURECHANGED if app.terminal_drag.is_some() => {
+                let guide = app.terminal_drag.take().unwrap();
+                let width = theme::client(hwnd).right - guide.x;
+                drop(guide);
+                if msg == WM_LBUTTONUP {
+                    app.terminal_preferred_width = width;
+                    ReleaseCapture();
+                    app.layout();
+                    SetTimer(hwnd, 1, 100, None);
                 }
             }
             WM_LBUTTONDOWN if app.sidebar_visible() => {
@@ -2820,7 +3099,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             }
             FOLD_HEADING => {
                 if !app.preview.is_null() && app.comparison.is_none() {
-                    app.toggle_heading(wp as i32, lp as i32);
+                    app.activate_preview_link(wp as i32, lp as i32);
                 }
             }
             crate::large::EDIT_CURRENT => {
@@ -2920,37 +3199,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     6 => theme::invalidate(hwnd),
                     8 => {
                         app.status("");
-                    }
-                    7 => {
-                        let progress = theme::animation_progress(app.terminal_started, 0.18);
-                        if let Some(t) = &app.terminal {
-                            let rc = theme::client(t.0);
-                            let target = if app.terminal_open { 1. } else { 0. };
-                            let fraction =
-                                app.terminal_from + (target - app.terminal_from) * progress;
-                            let visible = (rc.right as f64 * fraction).round() as i32;
-                            SetWindowRgn(
-                                t.0,
-                                CreateRectRgn(rc.right - visible, 0, rc.right, rc.bottom),
-                                1,
-                            );
-                            if progress >= 1. {
-                                if !app.terminal_open {
-                                    ShowWindow(t.0, SW_HIDE);
-                                }
-                                SetWindowRgn(t.0, null_mut(), 0);
-                            }
-                        }
-                        if progress >= 1. {
-                            if !app.terminal_open {
-                                app.terminal_width = 0;
-                                app.layout();
-                                app.focus_content();
-                            }
-                            SetTimer(hwnd, 1, 100, None);
-                        } else {
-                            SetTimer(hwnd, 7, 15, None);
-                        }
                     }
                     _ => (),
                 }
@@ -3163,7 +3411,10 @@ pub fn run() {
                 search_hit: None,
                 workspace: None,
                 workspace_width: theme::px(hwnd, 240),
+                sidebar_width: 0,
                 workspace_visible: true,
+                workspace_idle: false,
+                feather: (0, theme::Buffer::default()),
                 workspace_drag: None,
                 folded: RefCell::new(BTreeSet::new()),
                 fold_revision: Cell::new(0),
@@ -3184,8 +3435,8 @@ pub fn run() {
                 terminal: None,
                 terminal_open: false,
                 terminal_width: 0,
-                terminal_started: std::time::Instant::now(),
-                terminal_from: 0.,
+                terminal_preferred_width: 0,
+                terminal_drag: None,
                 font,
                 path: None,
                 encoding: Encoding::Utf8,
@@ -3495,6 +3746,50 @@ fn native_preview_heading_arrow_has_actionable_link() {
         .unwrap();
         assert!(!text(control).contains("BODY_MARKER"));
         assert!(text(control).contains("NEXT_MARKER"));
+        for dark in [true, false] {
+            let source = "[Docs](https://example.com/read?q=1&x=2)\n\n|Left|Center|Right|\n|:---|:---:|---:|\n|LeftCell|CenterCell|RightCell|\n\n```rust\nlet count = 42; // 中文\n```";
+            set_rtf(control, &markdown::with_images(source, 9000, dark, None)).unwrap();
+            let plain = text(control);
+            assert!(plain.contains("let count = 42; // 中文"), "{plain}");
+            assert!(plain.contains("RightCell"), "{plain}");
+            let find = |needle: &str| {
+                let range = doc.Range(0, 0).unwrap();
+                assert!(
+                    range
+                        .FindText(
+                            &windows_core::BSTR::from(needle),
+                            10000,
+                            windows::Win32::UI::Controls::RichEdit::tomConstants(0)
+                        )
+                        .unwrap()
+                        > 0
+                );
+                range
+            };
+            let link: ITextRange2 = find("Docs").cast().unwrap();
+            assert_eq!(
+                link.GetURL().unwrap().to_string().trim_matches('"'),
+                "https://example.com/read?q=1&x=2"
+            );
+            assert_eq!(
+                find("CenterCell")
+                    .GetPara()
+                    .unwrap()
+                    .GetAlignment()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                find("RightCell").GetPara().unwrap().GetAlignment().unwrap(),
+                2
+            );
+            if dark {
+                assert_eq!(
+                    find("let").GetFont().unwrap().GetForeColor().unwrap() as u32,
+                    theme::ACCENT
+                );
+            }
+        }
         DestroyWindow(control);
     }
 }
@@ -4128,7 +4423,10 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
             search_hit: None,
             workspace: None,
             workspace_width: theme::px(hwnd, 240),
+            sidebar_width: 0,
             workspace_visible: true,
+            workspace_idle: false,
+            feather: (0, theme::Buffer::default()),
             workspace_drag: None,
             folded: RefCell::new(BTreeSet::new()),
             fold_revision: Cell::new(0),
@@ -4149,8 +4447,8 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
             terminal: None,
             terminal_open: false,
             terminal_width: 0,
-            terminal_started: std::time::Instant::now(),
-            terminal_from: 0.,
+            terminal_preferred_width: 0,
+            terminal_drag: None,
             font,
             path: None,
             encoding: Encoding::Utf8,
@@ -4177,6 +4475,64 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
             chunk: None,
             saving: None,
         };
+        // Exercise the real divider messages and retain the chosen width across layouts.
+        app.terminal_open = true;
+        app.layout();
+        let total = theme::client(hwnd).right;
+        let initial = app.terminal_width;
+        assert!(initial > total / 3);
+        APP.with(|slot| *slot.borrow_mut() = Some(app));
+        let down = total - initial + theme::px(hwnd, 4);
+        let desired = initial + theme::px(hwnd, 60);
+        wndproc(hwnd, WM_LBUTTONDOWN, 1, (100 << 16) | down as isize);
+        wndproc(
+            hwnd,
+            WM_MOUSEMOVE,
+            1,
+            (100 << 16) | (total - desired) as isize,
+        );
+        APP.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().terminal_width, initial));
+        wndproc(
+            hwnd,
+            WM_LBUTTONUP,
+            0,
+            (100 << 16) | (total - desired) as isize,
+        );
+        let mut app = APP.with(|slot| slot.borrow_mut().take().unwrap());
+        assert_eq!(app.terminal_width, desired);
+        app.command(LAYOUT);
+        assert_eq!(app.terminal_width, desired);
+        MoveWindow(hwnd, 0, 0, 650, 700, 0);
+        app.layout();
+        assert!(app.terminal_width <= app.terminal_width_bounds().1);
+        assert_eq!(app.terminal_preferred_width, desired);
+        MoveWindow(hwnd, 0, 0, 1000, 700, 0);
+        app.layout();
+        assert_eq!(app.terminal_width, desired);
+        app.terminal_open = false;
+        app.terminal_width = 0;
+        app.layout();
+        app.terminal_open = true;
+        app.layout();
+        assert_eq!(app.terminal_width, desired);
+        app.terminal_open = false;
+        app.layout();
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        app.terminal_open = true;
+        app.layout();
+        assert_eq!(
+            app.terminal_width, desired,
+            "Panel opens at full width in the same layout"
+        );
+        app.terminal_open = false;
+        app.layout();
+        assert_eq!(
+            app.terminal_width, 0,
+            "Panel closes without animation ticks"
+        );
+        ShowWindow(hwnd, SW_HIDE);
+        app.terminal_open = false;
+        app.layout();
         app.preview = rich_edit(hwnd, true, font);
         MoveWindow(app.preview, 0, 0, 800, 600, 0);
         let drain = |app: &App| {
@@ -4277,6 +4633,70 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
         app.command(PREVIEW);
         assert!(app.pdf_path.is_none());
         assert_eq!(text(edit), source);
+        // Opening a project preserves a document, but a pristine empty editor becomes idle.
+        let root = std::env::current_dir().unwrap().join("tmp/workspace-idle");
+        std::fs::create_dir_all(&root).unwrap();
+        app.open_folder(root.clone());
+        assert!(!app.empty_workspace());
+        assert_eq!(text(edit), source);
+        app.command(NEW);
+        app.open_folder(root.clone());
+        assert!(app.empty_workspace());
+        assert_eq!(GetWindowLongW(edit, GWL_STYLE) as u32 & WS_VISIBLE, 0);
+        assert_eq!(GetFocus(), app.workspace.as_ref().unwrap().hwnd);
+        let dc = GetDC(hwnd);
+        let mut frame = theme::Buffer::default();
+        let rc = theme::client(hwnd);
+        assert!(frame.ensure(dc, rc.right, rc.bottom));
+        app.paint(frame.dc, &rc);
+        let mut blue = 0;
+        for y in 0..rc.bottom - theme::px(hwnd, 34) {
+            for x in app.sidebar_width..rc.right {
+                let pixel = GetPixel(frame.dc, x, y);
+                if (pixel >> 16) & 255 > (pixel & 255) + 16 {
+                    blue += 1;
+                }
+            }
+        }
+        assert!(blue > 100, "The idle workspace must paint its blue feather");
+        let cached = app.feather.1.dc;
+        app.paint(frame.dc, &rc);
+        assert_eq!(
+            app.feather.1.dc, cached,
+            "Reuse the decoded feather on repaint"
+        );
+        for edge in [192, 384, 576] {
+            let (dib, width, height) = crate::assets::load_feather(edge).unwrap();
+            assert_eq!(
+                (width, height),
+                (edge, edge),
+                "Use native pixels beyond the ICO's 256px limit"
+            );
+            assert_eq!(
+                dib.len(),
+                40 + ((edge as usize * 3 + 3) & !3) * edge as usize
+            );
+        }
+
+        ReleaseDC(hwnd, dc);
+        app.command(NEW);
+        assert!(!app.empty_workspace());
+        assert!(
+            app.feather.1.dc.is_null(),
+            "Release the logo cache when opening the editor"
+        );
+        assert_ne!(GetWindowLongW(edit, GWL_STYLE) as u32 & WS_VISIBLE, 0);
+        SetWindowTextW(edit, wide("unsaved").as_ptr());
+        app.open_folder(root.clone());
+        assert!(!app.empty_workspace());
+        assert_eq!(text(edit), "unsaved");
+        SetWindowTextW(edit, wide("").as_ptr());
+        SendMessageW(edit, EM_SETMODIFY, 0, 0);
+        app.open_folder(root);
+        assert!(app.empty_workspace());
+        app.command(CLOSE_FOLDER);
+        assert!(!app.empty_workspace());
+        assert_ne!(GetWindowLongW(edit, GWL_STYLE) as u32 & WS_VISIBLE, 0);
         drop(app);
         DestroyWindow(hwnd);
     }

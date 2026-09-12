@@ -86,6 +86,31 @@ pub unsafe fn available() -> bool {
         || IsClipboardFormatAvailable(15) != 0
         || IsClipboardFormatAvailable(RegisterClipboardFormatW(wide("PNG").as_ptr())) != 0
 }
+pub unsafe fn copy_text(hwnd: HWND, text: &str) -> bool {
+    let data = wide(text);
+    let memory = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2);
+    if memory.is_null() {
+        return false;
+    }
+    let buffer = GlobalLock(memory);
+    if buffer.is_null() {
+        GlobalFree(memory);
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.cast::<u16>(), data.len());
+    GlobalUnlock(memory);
+    if OpenClipboard(hwnd) == 0 {
+        GlobalFree(memory);
+        return false;
+    }
+    let ok = EmptyClipboard() != 0 && !SetClipboardData(13, memory).is_null();
+    if !ok {
+        GlobalFree(memory);
+    }
+    CloseClipboard();
+    ok
+}
+
 pub unsafe fn clipboard(hwnd: HWND) -> Result<Option<Paste>, String> {
     if OpenClipboard(hwnd) == 0 {
         return Err("Clipboard is busy. Try pasting again.".into());
@@ -253,13 +278,7 @@ pub fn insert(document: &Path, paste: Paste) -> Result<String, String> {
 }
 
 // Only local relative links are read; no URL or network share is fetched.
-pub fn picture(
-    base: &Path,
-    link: &str,
-    width: usize,
-    budget: &mut (usize, u64),
-    dark: bool,
-) -> Option<String> {
+pub(crate) fn relative_path(base: &Path, link: &str) -> Option<PathBuf> {
     let mut decoded = Vec::new();
     let b = link.as_bytes();
     let mut i = 0;
@@ -276,7 +295,16 @@ pub fn picture(
     if decoded.contains([':', '\\', '\0']) || decoded.starts_with('/') {
         return None;
     }
-    let path = base.join(&decoded);
+    Some(base.join(&decoded))
+}
+pub fn picture(
+    base: &Path,
+    link: &str,
+    width: usize,
+    budget: &mut (usize, u64),
+    dark: bool,
+) -> Option<String> {
+    let path = relative_path(base, link)?;
     if !supported(&path) {
         return None;
     }
@@ -561,6 +589,10 @@ pub fn print_picture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
 }
 pub fn load_picture(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     let image = decode_scaled(&read(path)?, MAX_PIXELS, u32::MAX)?;
+    Ok((image.dib(true), image.width, image.height))
+}
+pub fn load_feather(edge: u32) -> Result<(Vec<u8>, u32, u32), String> {
+    let image = decode_scaled(include_bytes!("../assets/feather.png"), MAX_PIXELS, edge)?;
     Ok((image.dib(true), image.width, image.height))
 }
 fn decode_scaled(bytes: &[u8], pixel_budget: u64, edge: u32) -> Result<Decoded, String> {

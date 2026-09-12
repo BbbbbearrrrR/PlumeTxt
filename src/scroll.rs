@@ -18,7 +18,6 @@ use windows_sys::Win32::{
 pub const SYNC: u32 = WM_APP + 91;
 pub const POSITION: u32 = WM_APP + 92;
 const UPDATE: u32 = WM_APP + 93;
-const TIMER: usize = 904;
 const TREE_IDLE: usize = 905;
 pub const ES_DISABLENOSCROLL: u32 = 0x2000;
 const MEASURE: u32 = WM_APP + 95;
@@ -27,10 +26,7 @@ struct Host {
     h: HWND,
     kind: u8,
     visible: bool,
-    target: f64,
     wheel: i32,
-    animating: bool,
-    last_frame: std::time::Instant,
     layout_dirty: bool,
     saved_position: POINT,
     background: u32,
@@ -43,13 +39,17 @@ struct Bar {
     bg: u32,
     drag: bool,
     offset: i32,
+    settled: Option<SCROLLINFO>,
     buffer: Buffer,
 }
 pub unsafe fn info(hwnd: HWND, vertical: bool) -> SCROLLINFO {
+    // RichEdit exposes a provisional range until wrapping has been measured.
+    measure(hwnd);
     let value = native_info(hwnd, vertical);
     if vertical && limit(&value) == 0 {
         let peer = GetPropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr());
         if !peer.is_null() {
+            measure(peer);
             return native_info(peer, true);
         }
     }
@@ -69,6 +69,16 @@ pub unsafe fn pair(hwnd: HWND, peer: HWND) {
         RemovePropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr());
     } else {
         SetPropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr(), peer);
+    }
+}
+pub unsafe fn hold_range(hwnd: HWND, hold: bool) {
+    let key = wide("PlumeTxtHoldRange");
+    if hold {
+        SetPropW(hwnd, key.as_ptr(), 1usize as _);
+    } else {
+        RemovePropW(hwnd, key.as_ptr());
+        measure(hwnd);
+        PostMessageW(hwnd, UPDATE, 0, 0);
     }
 }
 pub unsafe fn measure(hwnd: HWND) {
@@ -192,6 +202,7 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
                 bg,
                 drag: false,
                 offset: 0,
+                settled: None,
                 buffer: Buffer::default(),
             }))) as isize,
         );
@@ -202,10 +213,7 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
         h: make(false),
         kind,
         visible: kind != 3 && kind != 1,
-        target: 0.,
         wheel: 0,
-        animating: false,
-        last_frame: std::time::Instant::now(),
         layout_dirty: true,
         saved_position: POINT { x: 0, y: 0 },
         background: bg,
@@ -424,6 +432,10 @@ unsafe extern "system" fn host_proc(
     _id: usize,
     data: usize,
 ) -> isize {
+    // This default handler sends WM_SIZE recursively; Host must remain borrowable.
+    if msg == WM_WINDOWPOSCHANGED {
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    }
     let ptr = data as *mut RefCell<Host>;
     // Native scroll painting can reenter while Host is borrowed. Its geometry stays
     // enabled for RichEdit; only our dark sibling controls should ever draw the tracks.
@@ -534,8 +546,6 @@ unsafe extern "system" fn host_proc(
         if s.kind == 0 && s.layout_dirty {
             refresh(hwnd, &mut s);
         }
-        s.animating = false;
-        KillTimer(hwnd, TIMER);
         position(hwnd, s.kind, wp != 0, lp as i32);
         if s.kind == 0 {
             s.saved_position = POINT {
@@ -564,32 +574,11 @@ unsafe extern "system" fn host_proc(
                 return 0;
             }
         }
-        let delta = (wp >> 16) as u16 as i16 as f64;
+        let delta = (wp >> 16) as u16 as i16 as i32;
         let i = info(hwnd, true);
-        if !s.animating {
-            s.last_frame = std::time::Instant::now();
-            s.target = i.nPos as f64;
-        }
-        s.target = (s.target - delta * 0.8).clamp(0., limit(&i) as f64);
-        s.animating = true;
-        SetTimer(hwnd, TIMER, 15, None);
-        return 0;
-    }
-    if msg == WM_TIMER && wp == TIMER {
-        if s.kind == 0 {
-            s.target = s.target.clamp(0., limit(&info(hwnd, true)) as f64);
-        }
-        let current = info(hwnd, true).nPos;
-        let remaining = s.target - current as f64;
-        let elapsed = s.last_frame.elapsed().as_secs_f64();
-        s.last_frame = std::time::Instant::now();
-        let next = if remaining.abs() < 2. || !animations_enabled() {
-            s.animating = false;
-            KillTimer(hwnd, TIMER);
-            s.target as i32
-        } else {
-            current + (remaining * (1. - (-elapsed / 0.035).exp())).round() as i32
-        };
+        s.wheel += delta * 4;
+        let next = (i.nPos - s.wheel / 5).clamp(0, limit(&i));
+        s.wheel %= 5;
         position(hwnd, s.kind, true, next);
         if s.kind == 0 {
             s.saved_position = POINT {
@@ -607,9 +596,7 @@ unsafe extern "system" fn host_proc(
         if s.layout_dirty {
             refresh(hwnd, &mut s);
         }
-        s.animating = false;
         s.wheel = 0;
-        KillTimer(hwnd, TIMER);
     }
     let focus_position =
         if s.kind == 0 && (msg == WM_SETFOCUS || (msg == WM_IME_REQUEST && wp == 6)) {
@@ -741,7 +728,17 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
     }
     let rc = client(hwnd);
     let length = if s.vertical { rc.bottom } else { rc.right };
-    let i = info(s.owner, s.vertical);
+    let mut i = info(s.owner, s.vertical);
+    let held = !GetPropW(s.owner, wide("PlumeTxtHoldRange").as_ptr()).is_null();
+    if held {
+        if let Some(settled) = s.settled {
+            i.nMax = settled.nMax;
+            i.nPage = settled.nPage;
+        }
+    } else {
+        s.settled = Some(i);
+    }
+    let draw_thumb = !held || s.settled.is_some();
     let (start, size) = thumb(length, &i, dpi(hwnd));
     match msg {
         WM_ERASEBKGND => return 1,
@@ -765,18 +762,20 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
                         bottom: px(hwnd, 8),
                     }
                 };
-                rounded(
-                    s.buffer.dc,
-                    r,
-                    if s.drag {
-                        ACCENT
-                    } else if tree {
-                        rgb(105, 130, 146)
-                    } else {
-                        MUTED
-                    },
-                    px(hwnd, 4),
-                );
+                if draw_thumb {
+                    rounded(
+                        s.buffer.dc,
+                        r,
+                        if s.drag {
+                            ACCENT
+                        } else if tree {
+                            rgb(105, 130, 146)
+                        } else {
+                            MUTED
+                        },
+                        px(hwnd, 4),
+                    );
+                }
                 s.buffer.blit(dc, &ps.rcPaint);
             }
             EndPaint(hwnd, &ps);
@@ -1047,6 +1046,22 @@ fn native_markdown_long_scroll_settles() {
             max > 100000,
             "The full document must be measured before drawing its thumb"
         );
+        for width in [180, 700, 240, 500] {
+            resize(hwnd, 0, 0, width, 400);
+            assert!(
+                (*(host_data as *const RefCell<Host>)).borrow().layout_dirty,
+                "Nested WM_SIZE must invalidate the measured range"
+            );
+            let first = info(hwnd, true);
+            measure(hwnd);
+            let settled = info(hwnd, true);
+            assert_eq!(
+                (first.nMax, first.nPage),
+                (settled.nMax, settled.nPage),
+                "The first thumb must use the final wrapped range"
+            );
+        }
+        let max = limit(&info(hwnd, true));
         for wanted in [100, 1000, max / 2, max - 100, max] {
             set_position(hwnd, true, wanted);
             assert!((info(hwnd, true).nPos - wanted).abs() <= 2);
@@ -1080,13 +1095,9 @@ fn native_markdown_long_scroll_settles() {
         assert!((info(hwnd, true).nPos - max / 3).abs() <= 2);
         set_position(hwnd, true, 0);
         SendMessageW(short, WM_MOUSEWHEEL, ((-120i16) as u16 as usize) << 16, 0);
-        for _ in 0..80 {
-            SendMessageW(hwnd, WM_TIMER, TIMER, 0);
-        }
         let mut data = 0;
         GetWindowSubclass(hwnd, Some(host_proc), 902, &mut data);
         let state = &*(data as *const RefCell<Host>);
-        assert!(!state.borrow().animating, "Wheel easing must settle");
         assert!(
             info(hwnd, true).nPos > 0,
             "Wheel over a short preview must scroll the source"
@@ -1094,15 +1105,28 @@ fn native_markdown_long_scroll_settles() {
         SendMessageW(hwnd, WM_MOUSEWHEEL, ((-120i16) as u16 as usize) << 16, 0);
         SetWindowTextW(hwnd, wide("Short source").as_ptr());
         measure(hwnd);
-        for _ in 0..80 {
-            SendMessageW(hwnd, WM_TIMER, TIMER, 0);
-        }
-        assert!(
-            !state.borrow().animating,
-            "Shrinking text must not leave the timer running"
+        assert_eq!(
+            info(hwnd, true).nPos,
+            0,
+            "Shrinking text clamps immediately"
         );
         pair(hwnd, null_mut());
         DestroyWindow(short);
+        let bar = state.borrow().v;
+        SetWindowTextW(hwnd, wide(&"Stable range\r\n".repeat(3000)).as_ptr());
+        SendMessageW(bar, WM_MOUSEMOVE, 0, 0);
+        let bar_state = GetWindowLongPtrW(bar, GWLP_USERDATA) as *const RefCell<Bar>;
+        let original_range = (*bar_state).borrow().settled.unwrap().nMax;
+        hold_range(hwnd, true);
+        SetWindowTextW(hwnd, wide(&"Replacement\r\n".repeat(100)).as_ptr());
+        SendMessageW(bar, WM_MOUSEMOVE, 0, 0);
+        assert_eq!((*bar_state).borrow().settled.unwrap().nMax, original_range);
+        hold_range(hwnd, false);
+        SendMessageW(bar, WM_MOUSEMOVE, 0, 0);
+        assert_eq!(
+            (*bar_state).borrow().settled.unwrap().nMax,
+            info(hwnd, true).nMax
+        );
         DestroyWindow(hwnd);
         FreeLibrary(library);
     }
@@ -1168,7 +1192,7 @@ fn native_tree_tracks_are_clipped_and_hide_when_idle() {
         assert_eq!(
             GetUpdateRect(tree, null_mut(), 0),
             0,
-            "Unchanged tree geometry must not repaint during panel animation"
+            "Unchanged tree geometry must not repaint during layout"
         );
         let region = CreateRectRgn(0, 0, 0, 0);
         assert_ne!(GetWindowRgn(tree, region), 0);

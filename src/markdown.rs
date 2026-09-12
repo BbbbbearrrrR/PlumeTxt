@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use std::fmt::Write;
 use std::{borrow::Cow, collections::BTreeSet};
 
@@ -95,8 +95,41 @@ fn formatted(
             r"\red222\green232\blue233;\red63\green221\blue207;",
         );
     }
+    // Shared lexer colors, with a paper palette for PDF export.
+    let palette = [
+        crate::theme::INK,
+        crate::theme::ACCENT,
+        crate::theme::rgb(111, 185, 246),
+        crate::theme::rgb(145, 206, 180),
+        crate::theme::rgb(218, 185, 130),
+        crate::theme::rgb(178, 165, 223),
+        crate::theme::MUTED,
+    ];
+    let paper = [
+        0x403022, 0x9a6023, 0x9a6023, 0x466b20, 0x235d94, 0x884d79, 0x72685d,
+    ];
+    let mut extra = String::new();
+    for color in if dark { palette } else { paper } {
+        let _ = write!(
+            extra,
+            "\\red{}\\green{}\\blue{};",
+            color & 255,
+            color >> 8 & 255,
+            color >> 16 & 255
+        );
+    }
+    extra.push_str(if dark {
+        "\\red16\\green23\\blue31;"
+    } else {
+        "\\red242\\green245\\blue248;"
+    });
+    let end = out.find("}\\f0").unwrap();
+    out.insert_str(end, &extra);
+    let mut code_language = None;
     let mut lists: Vec<Option<u64>> = Vec::new();
-    let mut columns = 0;
+    let mut alignments = Vec::new();
+    let mut column = 0;
+    let mut table_head = false;
     let mut image_budget = (16 * 1024 * 1024, 16 * 1024 * 1024);
     let mut image_rendered = false;
     for (event, range) in Parser::new_ext(
@@ -132,11 +165,19 @@ fn formatted(
                 Tag::Strong => out.push_str("{\\b "),
                 Tag::Emphasis => out.push_str("{\\i "),
                 Tag::Strikethrough => out.push_str("{\\strike "),
-                Tag::CodeBlock(_) => out.push_str(if dark {
-                    "{\\pard\\li280\\sa160\\f1\\fs28 "
-                } else {
-                    "{\\pard\\li280\\sa160\\f1\\fs20 "
-                }),
+                Tag::CodeBlock(kind) => {
+                    code_language = Some(match kind {
+                        CodeBlockKind::Fenced(name) => crate::syntax::Language::name(
+                            name.split_whitespace().next().unwrap_or(""),
+                        ),
+                        _ => crate::syntax::Language::Plain,
+                    });
+                    out.push_str(if dark {
+                        "{\\pard\\li200\\ri200\\sb120\\sa160\\cbpat10\\f1\\fs28 "
+                    } else {
+                        "{\\pard\\li200\\ri200\\sb120\\sa160\\cbpat10\\f1\\fs20 "
+                    });
+                }
                 Tag::BlockQuote(_) => out.push_str("{\\li360\\i "),
                 Tag::List(start) => lists.push(start),
                 Tag::Item => {
@@ -149,7 +190,14 @@ fn formatted(
                         _ => out.push_str("\\u8226? "),
                     }
                 }
-                Tag::Link { .. } => out.push_str("{\\ul\\cf2 "),
+                Tag::Link { dest_url, .. } => {
+                    out.push_str("{\\field{\\*\\fldinst HYPERLINK \"");
+                    escape(
+                        &mut out,
+                        &dest_url.replace('"', "%22").replace(['\r', '\n', '\0'], ""),
+                    );
+                    out.push_str("\"}{\\fldrslt\\ul\\cf2 ");
+                }
                 Tag::Image { dest_url, .. } => {
                     if let Some(picture) = base.and_then(|base| {
                         crate::assets::picture(
@@ -167,28 +215,49 @@ fn formatted(
                     out.push('{');
                     escape(&mut out, "[Image: ");
                 }
-                Tag::Table(align) => {
-                    columns = align.len();
-                }
+                Tag::Table(align) => alignments = align,
                 Tag::TableHead | Tag::TableRow => {
-                    out.push_str("{\\trowd\\trgaph80");
-                    for c in 1..=columns {
-                        let _ = write!(out, "\\cellx{}", c * table_width.max(240) / columns.max(1));
+                    table_head = matches!(tag, Tag::TableHead);
+                    column = 0;
+                    out.push_str("{\\trowd\\trgaph100");
+                    for c in 1..=alignments.len() {
+                        out.push_str("\\clbrdrb\\brdrs\\brdrw10\\brdrcf9");
+                        if table_head {
+                            out.push_str("\\clcbpat10");
+                        }
+                        let _ = write!(
+                            out,
+                            "\\cellx{}",
+                            c * table_width.max(240) / alignments.len().max(1)
+                        );
                     }
                     out.push(' ');
                 }
-                Tag::TableCell => out.push_str("\\intbl "),
+                Tag::TableCell => {
+                    out.push_str("{\\pard\\intbl ");
+                    out.push_str(match alignments.get(column) {
+                        Some(Alignment::Center) => "\\qc ",
+                        Some(Alignment::Right) => "\\qr ",
+                        _ => "\\ql ",
+                    });
+                    if table_head {
+                        out.push_str("\\b ");
+                    }
+                    column += 1;
+                }
                 _ => (),
             },
             Event::End(tag) => match tag {
-                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock | TagEnd::Item => {
-                    out.push_str("\\par}")
-                }
+                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => out.push_str("\\par}"),
                 TagEnd::Strong
                 | TagEnd::Emphasis
                 | TagEnd::Strikethrough
-                | TagEnd::BlockQuote(_)
-                | TagEnd::Link => out.push('}'),
+                | TagEnd::BlockQuote(_) => out.push('}'),
+                TagEnd::Link => out.push_str("}}"),
+                TagEnd::CodeBlock => {
+                    code_language = None;
+                    out.push_str("\\par}");
+                }
                 TagEnd::Image => {
                     escape(&mut out, "]");
                     out.push('}');
@@ -196,11 +265,34 @@ fn formatted(
                 TagEnd::List(_) => {
                     lists.pop();
                 }
-                TagEnd::TableCell => out.push_str("\\cell "),
+                TagEnd::TableCell => out.push_str("\\cell} "),
                 TagEnd::TableHead | TagEnd::TableRow => out.push_str("\\row}"),
                 TagEnd::Table => out.push_str("\\pard\\par "),
                 _ => (),
             },
+            Event::Text(text) if code_language.is_some() && text.len() <= 64 * 1024 => {
+                // ponytail: cap lexer allocation per text event; larger blocks remain plain.
+                let colors = crate::syntax::colors(&text, code_language.unwrap());
+                let mut start = 0;
+                for end in text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .skip(1)
+                    .chain(std::iter::once(text.len()))
+                {
+                    if end == text.len() || colors[end] != colors[start] {
+                        let color = palette
+                            .iter()
+                            .position(|c| *c == colors[start])
+                            .unwrap_or(0)
+                            + 3;
+                        let _ = write!(out, "{{\\cf{color} ");
+                        escape(&mut out, &text[start..end]);
+                        out.push('}');
+                        start = end;
+                    }
+                }
+            }
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 escape(&mut out, &text)
             }
@@ -249,6 +341,12 @@ fn heading_folds_respect_hierarchy_and_leave_export_complete() {
 
 #[test]
 fn markdown_unicode_and_rtf_injection() {
+    let rich = preview("[Docs](https://example.com)\n\n|Left|Center|Right|\n|:---|:---:|---:|\n|a|b|c|\n\n```rust\nlet n = 42; // 中文\n```", 9000);
+    assert!(rich.contains("HYPERLINK \"https://example.com\""));
+    assert!(rich.contains("\\qc ") && rich.contains("\\qr "));
+    assert!(rich.contains("\\clcbpat10") && rich.contains("\\cbpat10"));
+    assert!(rich.contains("{\\cf4 let}"));
+
     let screen = preview("Body\n\n```\ncode\n```", 9000);
     assert!(screen.contains(r"\fs30"));
     assert!(screen.contains(r"\fs28"));

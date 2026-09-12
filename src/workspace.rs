@@ -37,7 +37,6 @@ impl Workspace {
             wide("SysTreeView32").as_ptr(),
             wide("Files").as_ptr(),
             WS_CHILD
-                | WS_VISIBLE
                 | WS_TABSTOP
                 | TVS_HASBUTTONS
                 | TVS_LINESATROOT

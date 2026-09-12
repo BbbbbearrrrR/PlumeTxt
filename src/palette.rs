@@ -28,8 +28,6 @@ struct State {
     query: String,
     dispatch: u32,
     buffer: Buffer,
-    reveal: i32,
-    started: std::time::Instant,
 }
 pub struct Palette(pub HWND);
 impl Palette {
@@ -53,7 +51,7 @@ impl Palette {
             WS_EX_TOOLWINDOW,
             name.as_ptr(),
             wide("Commands").as_ptr(),
-            WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            WS_POPUP | WS_CLIPCHILDREN,
             0,
             0,
             600,
@@ -125,8 +123,6 @@ impl Palette {
             query: String::new(),
             dispatch,
             buffer: Buffer::default(),
-            reveal: 388,
-            started: std::time::Instant::now(),
         };
         SetWindowLongPtrW(
             hwnd,
@@ -141,6 +137,7 @@ impl Palette {
         with(self.0, |s| s.items = items);
     }
     pub unsafe fn show(&self) {
+        let mut opening = None;
         with(self.0, |s| {
             let window = s.hwnd;
             let d = |v| px(window, v);
@@ -152,37 +149,69 @@ impl Palette {
             s.previous_scroll = crate::scroll::saved_position(s.previous);
             let mut rc = zeroed();
             GetClientRect(s.parent, &mut rc);
+            let mut origin = POINT {
+                x: (rc.right - d(600)) / 2,
+                y: d(48),
+            };
+            ClientToScreen(s.parent, &mut origin);
             SetWindowPos(
                 s.hwnd,
                 HWND_TOP,
-                (rc.right - d(600)) / 2,
-                d(48),
+                origin.x,
+                origin.y,
                 d(600),
                 d(388),
                 SWP_NOACTIVATE,
             );
             SetWindowTextW(s.edit, wide("").as_ptr());
             s.refresh();
-            s.reveal = d(60);
-            s.started = std::time::Instant::now();
             SetWindowRgn(
                 s.hwnd,
-                CreateRoundRectRgn(0, 0, d(600), s.reveal, d(24), d(24)),
+                CreateRoundRectRgn(0, 0, d(600), d(388), d(24), d(24)),
                 0,
             );
-            ShowWindow(s.hwnd, SW_SHOW);
-            SetTimer(s.hwnd, 903, 15, None);
-            SetFocus(s.edit);
+            opening = Some(s.edit);
         });
+        // Showing/focusing a popup synchronously paints its native children.
+        // Release State before Windows calls back into our owner-draw handler.
+        if let Some(edit) = opening {
+            ShowWindow(self.0, SW_SHOW);
+            RedrawWindow(
+                self.0,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+            SetFocus(edit);
+        }
+    }
+    pub unsafe fn reposition(&self) {
+        if IsWindowVisible(self.0) == 0 {
+            return;
+        }
+        let parent = GetWindow(self.0, GW_OWNER);
+        let rc = client(parent);
+        let mut origin = POINT {
+            x: (rc.right - px(self.0, 600)) / 2,
+            y: px(self.0, 48),
+        };
+        ClientToScreen(parent, &mut origin);
+        SetWindowPos(
+            self.0,
+            HWND_TOP,
+            origin.x,
+            origin.y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
     pub unsafe fn key(&self, msg: &MSG) -> bool {
         if IsWindowVisible(self.0) == 0 {
             return false;
         }
         if msg.message == WM_MOUSEWHEEL {
-            with(self.0, |s| {
-                SendMessageW(s.list, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
-            });
+            SendMessageW(self.0, WM_MOUSEWHEEL, msg.wParam, msg.lParam);
             return true;
         }
         if msg.message == WM_KEYDOWN
@@ -256,7 +285,6 @@ impl State {
         invalidate(self.hwnd);
     }
     unsafe fn hide(&self) {
-        KillTimer(self.hwnd, 903);
         ShowWindow(self.hwnd, SW_HIDE);
         if IsWindow(self.previous) != 0 {
             SetFocus(self.previous);
@@ -312,6 +340,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
     if p.is_null() {
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+    if msg == WM_MOUSEWHEEL {
+        // LISTBOX scrolling can synchronously send WM_DRAWITEM back here.
+        let list = (*p).borrow().list;
+        SendMessageW(list, msg, wp, lp);
+        return 0;
+    }
     let Ok(mut s) = (*p).try_borrow_mut() else {
         return DefWindowProcW(hwnd, msg, wp, lp);
     };
@@ -324,11 +358,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             SendMessageW(s.list, WM_SETFONT, wp, 0);
             SendMessageW(s.list, LB_SETITEMHEIGHT, 0, d(48) as isize);
             let parent = client(s.parent);
-            move_window(hwnd, (parent.right - d(600)) / 2, d(48), d(600), d(388), 0);
+            let mut origin = POINT {
+                x: (parent.right - d(600)) / 2,
+                y: d(48),
+            };
+            ClientToScreen(s.parent, &mut origin);
+            move_window(hwnd, origin.x, origin.y, d(600), d(388), 0);
             move_window(s.edit, d(24), d(20), d(490), d(32), 0);
             crate::scroll::resize(s.list, d(12), d(76), d(574), d(288));
-            s.reveal = d(388);
-            KillTimer(hwnd, 903);
             SetWindowRgn(
                 hwnd,
                 CreateRoundRectRgn(0, 0, d(600), d(388), d(24), d(24)),
@@ -337,22 +374,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             invalidate(hwnd);
         }
 
-        WM_TIMER if wp == 903 => {
-            s.reveal = px(hwnd, 60)
-                + (px(hwnd, 328) as f64 * animation_progress(s.started, 0.16)).round() as i32;
-            if s.reveal >= px(hwnd, 388) {
-                s.reveal = px(hwnd, 388);
-                KillTimer(hwnd, 903);
-            }
-            SetWindowRgn(
-                hwnd,
-                CreateRoundRectRgn(0, 0, px(hwnd, 600), s.reveal, px(hwnd, 24), px(hwnd, 24)),
-                1,
-            );
-        }
-        WM_MOUSEWHEEL => {
-            SendMessageW(s.list, WM_MOUSEWHEEL, wp, lp);
-        }
         REFRESH => {
             if s.current_query() != s.query {
                 s.refresh();
@@ -360,7 +381,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         }
         WM_CLOSE => s.hide(),
         WM_ACTIVATE if wp & 0xffff == WA_INACTIVE as usize => {
-            ShowWindow(hwnd, SW_HIDE);
+            if GetAncestor(lp as HWND, GA_ROOTOWNER) != s.parent {
+                ShowWindow(hwnd, SW_HIDE);
+            }
         }
         WM_COMMAND if (wp >> 16) as u32 == LBN_DBLCLK => s.execute(),
         KEY => {
@@ -680,6 +703,118 @@ fn native_search_executes_without_editing_document() {
         );
         DestroyWindow(editor);
         FreeLibrary(library);
+        drop(palette);
+        DestroyWindow(parent);
+    }
+}
+
+#[test]
+#[ignore = "Requires Windows native controls"]
+fn native_palette_wheel_stays_above_gpu_content() {
+    unsafe {
+        let parent = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            wide("Overlay test").as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            1000,
+            700,
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        let content = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            wide("").as_ptr(),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            1000,
+            700,
+            parent,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        let fonts = Fonts::new();
+        let palette = Palette::create(
+            parent,
+            fonts.ui,
+            fonts.small,
+            vec![(1, "Command", "", ""); 30],
+            WM_APP + 100,
+        );
+        palette.show();
+        with(palette.0, |s| {
+            assert_eq!(
+                GetPixel(s.buffer.dc, px(s.hwnd, 10), px(s.hwnd, 40)),
+                SURFACE,
+                "The complete popup must paint on opening"
+            );
+        });
+        let region = CreateRectRgn(0, 0, 0, 0);
+        GetWindowRgn(palette.0, region);
+        let mut bounds = zeroed();
+        GetRgnBox(region, &mut bounds);
+        DeleteObject(region);
+        assert!(
+            bounds.bottom >= px(palette.0, 388) - 1,
+            "Palette must open at full size without timer ticks"
+        );
+        assert_eq!(
+            IsChild(parent, palette.0),
+            0,
+            "GPU content must not share the palette's window surface"
+        );
+        assert_eq!(GetWindow(palette.0, GW_OWNER), parent);
+        let list = (*(GetWindowLongPtrW(palette.0, GWLP_USERDATA) as *const RefCell<State>))
+            .borrow()
+            .list;
+        let wheel = MSG {
+            hwnd: content,
+            message: WM_MOUSEWHEEL,
+            wParam: ((-120i16) as u16 as usize) << 16,
+            ..zeroed()
+        };
+        assert!(palette.key(&wheel));
+        assert_eq!(SendMessageW(list, LB_GETTOPINDEX, 0, 0), 3);
+        let dc = GetDC(content);
+        let mut renderer = crate::render::Renderer::default();
+        renderer.paint(content, dc, &client(content), |canvas| {
+            canvas.fill(client(content), ACCENT)
+        });
+        ReleaseDC(content, dc);
+        RedrawWindow(
+            palette.0,
+            null(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+        let mut point = POINT {
+            x: px(palette.0, 30),
+            y: px(palette.0, 90),
+        };
+        ClientToScreen(palette.0, &mut point);
+        let hit = WindowFromPoint(point);
+        assert!(
+            hit == palette.0 || IsChild(palette.0, hit) != 0,
+            "Redrawing terminal/document must not cut through the palette"
+        );
+        MoveWindow(parent, 60, 40, 900, 650, 0);
+        palette.reposition();
+        let mut rect = zeroed();
+        GetWindowRect(palette.0, &mut rect);
+        let mut origin = POINT {
+            x: (client(parent).right - px(palette.0, 600)) / 2,
+            y: px(palette.0, 48),
+        };
+        ClientToScreen(parent, &mut origin);
+        assert_eq!((rect.left, rect.top), (origin.x, origin.y));
+        drop(renderer);
         drop(palette);
         DestroyWindow(parent);
     }
