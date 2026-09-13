@@ -346,6 +346,12 @@ unsafe fn position(hwnd: HWND, kind: u8, vertical: bool, pos: i32) {
     }
     match kind {
         0 => {
+            // RichEdit's scrollbar endpoint is not an EM_SETSCROLLPOS pixel
+            // offset after reflow. Let it align its own final visible line.
+            if vertical && pos > 0 && pos >= limit(&native_info(hwnd, true)) {
+                SendMessageW(hwnd, WM_VSCROLL, SB_BOTTOM as usize, 0);
+                return;
+            }
             let mut p = POINT {
                 x: native_info(hwnd, false).nPos,
                 y: native_info(hwnd, true).nPos,
@@ -418,9 +424,11 @@ unsafe fn refresh(hwnd: HWND, s: &mut Host) {
         MapWindowPoints(hwnd, GetParent(s.v), &mut origin, 1);
     }
     for (bar, vertical) in [(s.v, true), (s.h, false)] {
+        let range = if vertical { crate::paged::scroll_info(hwnd) } else { None }
+            .unwrap_or_else(|| info(hwnd, vertical));
         let visible = s.visible
             && (s.kind != 0 || IsWindowVisible(hwnd) != 0)
-            && limit(&info(hwnd, vertical)) > 0
+            && limit(&range) > 0
             && (vertical || s.kind == 2);
         crate::theme::move_window(
             bar,
@@ -613,6 +621,15 @@ unsafe extern "system" fn host_proc(
             let peer = GetPropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr());
             if !peer.is_null() && limit(&native_info(peer, true)) > 0 {
                 SendMessageW(peer, msg, wp, lp);
+                return 0;
+            }
+            // A short final page still has earlier content in the disk document.
+            if let Some(i) = crate::paged::scroll_info(hwnd) {
+                s.wheel += (wp >> 16) as u16 as i16 as i32 * 4;
+                let next = (i.nPos - s.wheel / 5).clamp(0, limit(&i));
+                s.wheel %= 5;
+                drop(s);
+                crate::paged::scroll_to(hwnd, next);
                 return 0;
             }
         }
@@ -1254,6 +1271,12 @@ fn native_markdown_long_scroll_settles() {
                 "Dragging must not grow the scroll range"
             );
         }
+        for _ in 0..20 {
+            SendMessageW(hwnd, WM_MOUSEWHEEL, ((-120i16) as u16 as usize) << 16, 0);
+        }
+        let bottom = info(hwnd, true).nPos;
+        SendMessageW(hwnd, WM_MOUSEWHEEL, (120usize) << 16, 0);
+        assert!(info(hwnd, true).nPos < bottom, "Wheel must reverse immediately at EOF");
         set_position(hwnd, true, max / 2);
         let reset = POINT { x: 0, y: 0 };
         SendMessageW(hwnd, WM_USER + 222, 0, &reset as *const _ as isize);

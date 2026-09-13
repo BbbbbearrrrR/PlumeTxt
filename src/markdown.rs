@@ -226,6 +226,7 @@ fn formatted(
     let mut table_head = false;
     let mut image_budget = (16 * 1024 * 1024, 16 * 1024 * 1024);
     let mut image_rendered = false;
+    let mut in_comment = false;
     for (event, range) in Parser::new_ext(
         source,
         Options::ENABLE_TABLES
@@ -415,21 +416,38 @@ fn formatted(
                 }
             }
             Event::Html(html) | Event::InlineHtml(html) => {
-                let picture = html_image(&html).and_then(|(src, width)| {
-                    base.and_then(|base| {
-                        crate::assets::picture(
-                            base,
-                            &src,
-                            width.map_or(table_width, |w| w.saturating_mul(15).min(table_width)),
-                            &mut image_budget,
-                            dark,
-                        )
-                    })
-                });
-                if let Some(picture) = picture {
-                    out.push_str(&picture);
-                } else {
-                    escape(&mut out, &html);
+                let mut html = html.as_ref();
+                while !html.is_empty() {
+                    if in_comment {
+                        let Some(end) = html.find("-->") else {
+                            break;
+                        };
+                        html = &html[end + 3..];
+                        in_comment = false;
+                        continue;
+                    }
+                    let (visible, rest) = html.split_once("<!--").unwrap_or((html, ""));
+                    in_comment = visible.len() != html.len();
+                    html = rest;
+                    if visible.trim().is_empty() {
+                        continue;
+                    }
+                    let picture = html_image(visible).and_then(|(src, width)| {
+                        base.and_then(|base| {
+                            crate::assets::picture(
+                                base,
+                                &src,
+                                width.map_or(table_width, |w| w.saturating_mul(15).min(table_width)),
+                                &mut image_budget,
+                                dark,
+                            )
+                        })
+                    });
+                    if let Some(picture) = picture {
+                        out.push_str(&picture);
+                    } else {
+                        escape(&mut out, visible);
+                    }
                 }
             }
             Event::Text(text) => escape(&mut out, &text),
@@ -527,4 +545,16 @@ fn markdown_unicode_and_rtf_injection() {
     assert!(doc.contains("{\\b bold}"));
     assert!(doc.contains("\\cellx4500"));
     assert!(doc.contains("\\{\\\\rtf1 evil\\}"));
+}
+
+#[test]
+fn html_comments_do_not_create_preview_gaps() {
+    let source = format!("Before\n\n<!-- Exact-size padding: {} -->\n\n<!-- SIZE_PADDING_END -->\n\n# File end\n\nAfter", " ".repeat(7726));
+    let expected = "Before\n\n# File end\n\nAfter";
+    assert_eq!(preview(&source, 9000), preview(expected, 9000));
+    assert_eq!(rtf(&source, 9000), rtf(expected, 9000));
+    assert_eq!(preview("Before<!-- hidden\ncomment -->After", 9000), preview("BeforeAfter", 9000));
+    assert_eq!(preview("Before\n\n<!-- hidden\ncomment\nstill hidden -->\n\nAfter", 9000), preview("Before\n\nAfter", 9000));
+    assert!(preview("`<!-- literal -->`", 9000).contains("<!-- literal -->"));
+    assert!(preview("```html\n<!-- literal -->\n```", 9000).contains("literal"));
 }

@@ -1353,20 +1353,27 @@ impl App {
         };
         scroll::measure(source);
         scroll::measure(target);
-        if let Some(anchor) = self.scroll_anchor(source) {
-            if self.restore_anchor(target, anchor) {
-                if !dragging.is_null() {
-                    UpdateWindow(target);
-                }
-                return;
-            }
-        }
         let from = scroll::info(source, true);
         let to = scroll::info(target, true);
-        let pos = (from.nPos as f64 / scroll::limit(&from).max(1) as f64
-            * scroll::limit(&to) as f64)
-            .round() as i32;
-        if (to.nPos - pos).abs() > 1 {
+        // Different wrapping changes each view's final screen. Preserve endpoints
+        // exactly; use paragraph anchors only between the top and bottom.
+        if from.nPos > 0 && from.nPos < scroll::limit(&from).saturating_sub(1) {
+            if let Some(anchor) = self.scroll_anchor(source) {
+                if self.restore_anchor(target, anchor) {
+                    if !dragging.is_null() {
+                        UpdateWindow(target);
+                    }
+                    return;
+                }
+            }
+        }
+        let pos = if from.nPos > 0 && from.nPos >= scroll::limit(&from).saturating_sub(1) {
+            scroll::limit(&to)
+        } else {
+            (from.nPos as f64 / scroll::limit(&from).max(1) as f64
+                * scroll::limit(&to) as f64).round() as i32
+        };
+        if (to.nPos - pos).abs() > 1 || pos == scroll::limit(&to) {
             scroll::set_position(target, true, pos);
         }
         if !dragging.is_null() {
@@ -1868,9 +1875,7 @@ impl App {
                     if crate::paged::active(self.edit) {
                         self.preview_scroll.set(None);
                         self.preview_anchor.set(None);
-                        if let Some(anchor) = self.scroll_anchor(self.edit) {
-                            self.restore_anchor(self.preview, anchor);
-                        }
+                        self.sync_scroll(self.edit);
                     } else if let Some(anchor) = self.preview_anchor.take() {
                         self.preview_scroll.set(None);
                         self.restore_anchor(self.edit, anchor);
@@ -4466,10 +4471,7 @@ fn native_selection_overlay_preserves_document() {
                     selected.push(GetPixel(image.dc, x, y));
                 }
             }
-            assert_eq!(
-                selected, plain,
-                "Native selection must not show beneath the custom overlay, readonly={readonly}"
-            );
+            assert_eq!(selected, plain, "Native selection must stay beneath the overlay");
             crate::selection::paint(edit, image.dc, &mut tint);
             let mut pos: POINT = zeroed();
             SendMessageW(edit, EM_POSFROMCHAR, &mut pos as *mut _ as usize, 1);
@@ -5183,17 +5185,32 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
                 "Opening must include the real file end"
             );
             if !reopening {
-                SendMessageW(edit, EM_SETSEL, usize::MAX, -1);
+                let doc = crate::syntax::document(edit).unwrap();
+                let end = doc.Range(0, 0).unwrap().GetStoryLength().unwrap() - 1;
+                let range = windows::Win32::UI::Controls::RichEdit::CHARRANGE {
+                    cpMin: end,
+                    cpMax: end,
+                };
+                SendMessageW(edit, WM_USER + 55, 0, &range as *const _ as isize); // EM_EXSETSEL
                 SendMessageW(
                     edit,
                     EM_REPLACESEL,
                     1,
                     wide(" SAVED_AT_END").as_ptr() as isize,
                 );
+                assert!(
+                    text(edit).ends_with("TRUE_FILE_END SAVED_AT_END"),
+                    "Test insertion must be at EOF before saving"
+                );
                 assert!(app.save(false));
-                assert_eq!(
-                    std::fs::read(&end_path).unwrap(),
-                    format!("{full_text} SAVED_AT_END").as_bytes()
+                let saved = std::fs::read(&end_path).unwrap();
+                let expected = format!("{full_text} SAVED_AT_END");
+                assert!(
+                    saved == expected.as_bytes(),
+                    "Saved text differs: actual {} bytes, expected {}, first mismatch {:?}",
+                    saved.len(),
+                    expected.len(),
+                    saved.iter().zip(expected.bytes()).position(|(a, b)| *a != b)
                 );
                 app.watch = None;
                 app.path = None;
@@ -5233,7 +5250,13 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
                 "TRUE_LARGE_END"
             }));
             if !reopening {
-                SendMessageW(edit, EM_SETSEL, usize::MAX, -1);
+                let doc = crate::syntax::document(edit).unwrap();
+                let end = doc.Range(0, 0).unwrap().GetStoryLength().unwrap() - 1;
+                let range = windows::Win32::UI::Controls::RichEdit::CHARRANGE {
+                    cpMin: end,
+                    cpMax: end,
+                };
+                SendMessageW(edit, WM_USER + 55, 0, &range as *const _ as isize); // EM_EXSETSEL
                 SendMessageW(
                     edit,
                     EM_REPLACESEL,
@@ -5565,7 +5588,13 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
             SetWindowTextW(edit, wide(value).as_ptr());
             SendMessageW(edit, EM_SETSEL, 0, 0);
             assert_eq!(logical_lines(edit), Some((1, total)));
-            SendMessageW(edit, EM_SETSEL, usize::MAX, -1);
+            let doc = crate::syntax::document(edit).unwrap();
+            let end = doc.Range(0, 0).unwrap().GetStoryLength().unwrap() - 1;
+            let range = windows::Win32::UI::Controls::RichEdit::CHARRANGE {
+                cpMin: end,
+                cpMax: end,
+            };
+            SendMessageW(edit, WM_USER + 55, 0, &range as *const _ as isize); // EM_EXSETSEL
             assert_eq!(logical_lines(edit), Some((total, total)));
         }
         SetWindowTextW(

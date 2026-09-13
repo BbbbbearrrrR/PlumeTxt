@@ -43,7 +43,7 @@ $uninstaller = Join-Path $destination 'unins000.exe'
 try {
     foreach ($pass in 1..2) {
         Run-Installer $SetupPath @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=""', '/LANG=chinesesimplified', ('/DIR="' + $destination + '"'), ('/LOG="' + $scratch + "/install-$pass.log" + '"'))
-        foreach ($file in @('PlumeTxt.exe', 'runtime/pdfium/pdfium.dll', 'runtime/pdfium/LICENSE', 'runtime/pdfium/licenses/pdfium.txt', 'unins000.exe')) {
+        foreach ($file in @('PlumeTxt.exe', 'LICENSE', 'runtime/pdfium/pdfium.dll', 'runtime/pdfium/LICENSE', 'runtime/pdfium/licenses/pdfium.txt', 'unins000.exe')) {
             if (-not (Test-Path -LiteralPath (Join-Path $destination $file))) { throw "Missing installed file: $file" }
         }
         if (-not (Test-Path -LiteralPath $uninstallKey)) { throw 'Missing Windows uninstall entry.' }

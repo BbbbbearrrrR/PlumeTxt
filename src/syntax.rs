@@ -807,7 +807,8 @@ unsafe extern "system" fn editor_proc(
     data: usize,
 ) -> isize {
     use windows::Win32::UI::Controls::RichEdit::{
-        EM_EXSETSEL, EM_REDO, EM_SETCHARFORMAT, EM_SETSCROLLPOS, EM_SETZOOM, EM_STREAMIN,
+        EM_EXSETSEL, EM_GETEVENTMASK, EM_GETSCROLLPOS, EM_HIDESELECTION, EM_REDO,
+        EM_SETCHARFORMAT, EM_SETEVENTMASK, EM_SETSCROLLPOS, EM_SETZOOM, EM_STREAMIN,
     };
     use windows_sys::Win32::System::SystemServices::MK_LBUTTON;
     use windows_sys::Win32::UI::Controls::{EM_REPLACESEL, EM_SETRECT, EM_SETRECTNP, EM_SETSEL};
@@ -841,7 +842,34 @@ unsafe extern "system" fn editor_proc(
         let mut before: GUITHREADINFO = std::mem::zeroed();
         before.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
         GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, null_mut()), &mut before);
-        if paint_text(data, wp).is_some() {
+        // RichEdit ignores EM_HIDESELECTION for selected table cells. Suppress
+        // that paint only; restore the native range and active end before returning.
+        let selection = (GetWindowLongW(hwnd, GWL_STYLE) as u32 & ES_READONLY as u32 != 0)
+            .then(|| document(hwnd)?.GetSelection().ok())
+            .flatten();
+        let saved = selection.as_ref()
+            .and_then(|sel| Some((sel.GetStart().ok()?, sel.GetEnd().ok()?, sel.GetFlags().ok()?)))
+            .filter(|(a, b, _)| a != b);
+        let mut scroll: windows_sys::Win32::Foundation::POINT = std::mem::zeroed();
+        let mask = if let Some((_, b, _)) = saved {
+            DefSubclassProc(hwnd, EM_GETSCROLLPOS, 0, &mut scroll as *mut _ as isize);
+            let mask = DefSubclassProc(hwnd, EM_GETEVENTMASK, 0, 0);
+            DefSubclassProc(hwnd, EM_SETEVENTMASK, 0, 0);
+            let _ = selection.as_ref().unwrap().SetRange(b, b);
+            DefSubclassProc(hwnd, EM_SETSCROLLPOS, 0, &scroll as *const _ as isize);
+            mask
+        } else { 0 };
+        let painted = paint_text(data, wp);
+        if let Some((a, b, flags)) = saved {
+            let sel = selection.as_ref().unwrap();
+            let _ = sel.SetRange(a, b);
+            let _ = sel.SetFlags(flags);
+            DefSubclassProc(hwnd, EM_SETSCROLLPOS, 0, &scroll as *const _ as isize);
+            DefSubclassProc(hwnd, EM_HIDESELECTION, 1, 0);
+            DefSubclassProc(hwnd, EM_SETEVENTMASK, 0, mask);
+            windows_sys::Win32::Graphics::Gdi::ValidateRect(hwnd, std::ptr::null());
+        }
+        if painted.is_some() {
             let mut after = before;
             GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, null_mut()), &mut after);
             // A pending layout may replace the caret once; idle draws must keep it.
@@ -857,8 +885,7 @@ unsafe extern "system" fn editor_proc(
         }
     }
     let result = DefSubclassProc(hwnd, msg, wp, lp);
-    // RichEdit can reveal its rectangular selection again after native input,
-    // especially in read-only rich text. Our shared overlay owns the highlight.
+    // Both editing and preview use the same selection overlay.
     if matches!(
         msg,
         WM_LBUTTONDOWN

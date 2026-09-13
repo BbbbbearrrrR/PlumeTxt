@@ -49,6 +49,7 @@ Name: "foldermenu"; Description: "{cm:FolderMenu}"; Flags: unchecked
 Source: "{#PayloadDir}\plumetxt.exe"; DestDir: "{app}"; DestName: "PlumeTxt.exe"; Flags: ignoreversion
 Source: "..\runtime\pdfium\*"; DestDir: "{app}\runtime\pdfium"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 #ifdef ShellMenuDir
 Source: "{#ShellMenuDir}\PlumeTxt.ShellMenu.dll"; DestDir: "{app}"; Flags: ignoreversion; Tasks: foldermenu; MinVersion: 10.0.22000
 Source: "{#ShellMenuDir}\PlumeTxt.ShellMenu.msix"; DestDir: "{app}"; Flags: ignoreversion; Tasks: foldermenu; MinVersion: 10.0.22000

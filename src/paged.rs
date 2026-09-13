@@ -1244,7 +1244,13 @@ fn native_dynamic_edit_scroll_undo_and_save() {
             assert!(s.buffer.encode_utf16().count() as u64 <= WINDOW * 2);
         }
         assert!(scroll_to(edit, 1_000_000));
-        SendMessageW(edit, EM_SETSEL, usize::MAX, -1);
+        let doc = crate::syntax::document(edit).unwrap();
+        let end = doc.Range(0, 0).unwrap().GetStoryLength().unwrap() - 1;
+        let range = windows::Win32::UI::Controls::RichEdit::CHARRANGE {
+            cpMin: end,
+            cpMax: end,
+        };
+        SendMessageW(edit, WM_USER + 55, 0, &range as *const _ as isize); // EM_EXSETSEL
         SendMessageW(
             edit,
             EM_REPLACESEL,
@@ -1404,6 +1410,48 @@ fn native_dynamic_edit_scroll_undo_and_save() {
             dragged.1 - dragged.0 > WINDOW,
             "Mouse selection must cross windows: {dragged:?}"
         );
+        // A final line after a long line can leave both local scroll ranges empty.
+        let edit = crate::ui::rich_edit(parent, false, fonts.body);
+        crate::scroll::resize(edit, 0, 0, 900, 600);
+        std::fs::write(&path, format!("{}\nEND", "x".repeat(WINDOW as usize * 4))).unwrap();
+        attach(edit, Document::open(&path, || true).unwrap()).unwrap();
+        let preview_control = crate::ui::rich_edit(parent, true, fonts.body);
+        crate::scroll::resize(preview_control, 0, 0, 900, 600);
+        SetWindowTextW(preview_control, crate::ui::wide("END").as_ptr());
+        ShowWindow(edit, SW_SHOWNOACTIVATE);
+        ShowWindow(preview_control, SW_SHOWNOACTIVATE);
+        preview(preview_control, edit);
+        crate::scroll::pair(edit, preview_control);
+        crate::scroll::pair(preview_control, edit);
+        for control in [edit, preview_control] {
+            assert!(scroll_to(edit, 1_000_000));
+            // Match the zero native range reported by the short final preview.
+            for local in [edit, preview_control] {
+                crate::scroll::measure(local);
+                let empty = SCROLLINFO {
+                    cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                    nPage: 1,
+                    ..std::mem::zeroed()
+                };
+                SetScrollInfo(local, SB_VERT, &empty, 0);
+            }
+            assert_eq!(crate::scroll::limit(&crate::scroll::info(edit, true)), 0);
+            crate::scroll::set_position(preview_control, true, 0);
+            let bar = FindWindowExW(
+                parent,
+                std::ptr::null_mut(),
+                crate::ui::wide("PlumeTxtScroll").as_ptr(),
+                crate::ui::wide("Vertical scroll").as_ptr(),
+            );
+            assert!(IsWindowVisible(bar) != 0, "Global scrollbar must stay visible at EOF");
+            let end_start = state(edit).unwrap().borrow().start;
+            SendMessageW(control, WM_MOUSEWHEEL, 120usize << 16, 0);
+            assert!(
+                state(edit).unwrap().borrow().start < end_start,
+                "Wheel must leave a short final page in both editing and preview"
+            );
+        }
         DestroyWindow(parent);
         std::fs::remove_file(path).unwrap();
     }
