@@ -180,7 +180,7 @@ impl Chunk {
         run().map_err(|e| e.to_string())
     }
 
-    pub fn save(&self, destination: &Path, text: &str) -> Result<(), String> {
+    pub fn save(&self, destination: &Path, text: &str) -> Result<Self, String> {
         use std::io::{Seek, SeekFrom};
         use std::os::windows::fs::OpenOptionsExt;
         let temp = destination.with_file_name(format!(
@@ -191,7 +191,7 @@ impl Chunk {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        let run = || -> io::Result<()> {
+        let run = || -> io::Result<Self> {
             // Deny writes/replacement while streaming, so the copied source is consistent.
             let mut source = OpenOptions::new()
                 .read(true)
@@ -224,7 +224,17 @@ impl Chunk {
             output.sync_all()?;
             drop(output);
             drop(source);
-            replace_file(&temp, destination)
+            replace_file(&temp, destination)?;
+            let meta = fs::metadata(destination)?;
+            Ok(Self {
+                path: destination.into(),
+                start: self.start,
+                end: self.start + (bytes.len() - bom) as u64,
+                len: meta.len(),
+                modified: meta.modified()?,
+                encoding: self.encoding,
+                crlf: self.crlf,
+            })
         };
         let result = run().map_err(|e| e.to_string());
         if result.is_err() {
@@ -288,7 +298,12 @@ fn region_edits_preserve_surrounding_bytes_and_reject_external_changes() {
             assert_eq!(fs::read(&copy).unwrap(), expected);
             assert_eq!(fs::read(&path).unwrap(), original);
             decode(&expected).unwrap();
-            chunk.save(&path, &replacement).unwrap();
+            let saved = chunk.save(&path, &replacement).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            let expanded = format!("{}{}", replacement, "more text\n".repeat(9000));
+            let saved = saved.save(&path, &expanded).unwrap();
+            // Repeated saves must replace the entire edited region, even after it grows past 64 KiB.
+            saved.save(&path, &replacement).unwrap();
             assert_eq!(fs::read(&path).unwrap(), expected);
             let (stale, _) = Chunk::read(&path, 0).unwrap();
             fs::write(&path, b"external update").unwrap();

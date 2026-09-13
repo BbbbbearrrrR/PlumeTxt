@@ -24,7 +24,7 @@ pub const EDIT_CURRENT: u32 = WM_APP + 131;
 // ponytail: byte-based navigation avoids an O(file size) line index; add a background index only when exact line navigation is needed.
 const RANGE: i32 = 1_000_000;
 const BLOCK: u64 = 256 * 1024;
-pub const THRESHOLD: u64 = 8 * 1024 * 1024;
+pub const THRESHOLD: u64 = crate::document::MAX_TEXT_BYTES;
 #[derive(Clone, Copy)]
 struct Request {
     id: u64,
@@ -282,7 +282,12 @@ impl Large {
         if p.is_null() {
             0
         } else {
-            (*p).borrow().requested
+            let state = (*p).borrow();
+            state
+                .page
+                .as_ref()
+                .and_then(|page| page.rows.first())
+                .map_or(state.requested, |row| row.start)
         }
     }
     pub unsafe fn seek(&self, offset: u64) {

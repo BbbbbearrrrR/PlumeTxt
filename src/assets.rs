@@ -277,8 +277,8 @@ pub fn insert(document: &Path, paste: Paste) -> Result<String, String> {
     result
 }
 
-// Only local relative links are read; no URL or network share is fetched.
-pub(crate) fn relative_path(base: &Path, link: &str) -> Option<PathBuf> {
+// Resolve local files only; do not fetch URLs or network shares.
+pub(crate) fn local_path(base: &Path, link: &str) -> Option<PathBuf> {
     let mut decoded = Vec::new();
     let b = link.as_bytes();
     let mut i = 0;
@@ -291,11 +291,21 @@ pub(crate) fn relative_path(base: &Path, link: &str) -> Option<PathBuf> {
             i += 1;
         }
     }
-    let decoded = String::from_utf8(decoded).ok()?;
-    if decoded.contains([':', '\\', '\0']) || decoded.starts_with('/') {
+    let decoded = String::from_utf8(decoded).ok()?.replace('\\', "/");
+    let decoded = decoded.strip_prefix("file:///").unwrap_or(&decoded);
+    let absolute = decoded.as_bytes().get(1) == Some(&b':')
+        && decoded
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+        && decoded.as_bytes().get(2) == Some(&b'/');
+    if decoded.contains('\0')
+        || decoded.starts_with('/')
+        || (if absolute { &decoded[2..] } else { decoded }).contains(':')
+    {
         return None;
     }
-    Some(base.join(&decoded))
+    Some(base.join(decoded))
 }
 pub fn picture(
     base: &Path,
@@ -304,7 +314,7 @@ pub fn picture(
     budget: &mut (usize, u64),
     dark: bool,
 ) -> Option<String> {
-    let path = relative_path(base, link)?;
+    let path = local_path(base, link)?;
     if !supported(&path) {
         return None;
     }
@@ -312,7 +322,16 @@ pub fn picture(
     if bytes.len() > budget.0 {
         return None;
     }
-    let image = decode(&bytes, budget.1).ok()?;
+    // RichEdit's bitmap shrinker introduces aliasing on transparent artwork.
+    // Filter to the logical display size before embedding instead of relying on
+    // the native OLE downsampler. Keep export resolution independent of preview.
+    let edge = (width / 15).max(1).min(u32::MAX as usize) as u32;
+    let image = if dark {
+        decode_sized(&bytes, budget.1, edge, u32::MAX)
+    } else {
+        decode(&bytes, budget.1)
+    }
+    .ok()?;
     let (w, h) = (image.original_width, image.original_height);
     let pixels = w as u64 * h as u64;
     let goal = (w as usize * 15).min(width.max(1));
@@ -340,6 +359,24 @@ fn image_paths_and_bounds() {
         url("中文 notes.assets/a (1).png"),
         "%E4%B8%AD%E6%96%87%20notes.assets/a%20%281%29.png"
     );
+    let base = Path::new("C:/notes");
+    for (link, expected) in [
+        ("images/a%20b.png", "C:/notes/images/a b.png"),
+        (r"images\a.png", "C:/notes/images/a.png"),
+        ("D:/images/a.png", "D:/images/a.png"),
+        ("file:///D:/images/a.png", "D:/images/a.png"),
+    ] {
+        assert_eq!(local_path(base, link).unwrap(), PathBuf::from(expected));
+    }
+    for link in [
+        "https://example.com/a.png",
+        "//server/a.png",
+        r"\server\a.png",
+        "C:relative.png",
+        "file://server/a.png",
+    ] {
+        assert!(local_path(base, link).is_none());
+    }
     assert!(dimensions(1920, 1080));
     assert!(!dimensions(u32::MAX, 100));
     assert!(png_size(b"not an image").is_none());
@@ -409,6 +446,29 @@ fn native_image_paste_and_render() {
             1,
             "Preview must contain a real image object"
         );
+        let relative = link
+            .strip_prefix("![Image](")
+            .unwrap()
+            .strip_suffix(')')
+            .unwrap();
+        let absolute = local_path(&dir, relative)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        for source in [
+            format!(r#"<img src="{relative}" width="128" alt="logo">"#),
+            format!("![absolute](<{absolute}>)"),
+            format!("![file](<file:///{absolute}>)"),
+        ] {
+            let rtf = crate::markdown::with_images(&source, 9000, true, Some(&dir));
+            assert!(rtf.contains("\\dibitmap0"), "Image must render: {source}");
+            crate::ui::set_rtf(edit, &rtf).unwrap();
+            assert_eq!(
+                ole.GetObjectCount(),
+                1,
+                "RichEdit must contain the image: {source}"
+            );
+        }
         drop(ole);
         DestroyWindow(edit);
         let pdf = dir.join("image-export.pdf");
@@ -563,7 +623,12 @@ impl Decoded {
         out[8..12].copy_from_slice(&self.height.to_le_bytes());
         out[12..14].copy_from_slice(&1u16.to_le_bytes());
         out[14..16].copy_from_slice(&24u16.to_le_bytes());
-        let background = if dark { [15u32, 13, 9] } else { [255; 3] };
+        let canvas = crate::theme::CANVAS;
+        let background = if dark {
+            [(canvas >> 16) & 255, (canvas >> 8) & 255, canvas & 255]
+        } else {
+            [255; 3]
+        };
         for y in 0..self.height as usize {
             for x in 0..self.width as usize {
                 let source = (y * self.width as usize + x) * 4;
@@ -596,6 +661,14 @@ pub fn load_feather(edge: u32) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((image.dib(true), image.width, image.height))
 }
 fn decode_scaled(bytes: &[u8], pixel_budget: u64, edge: u32) -> Result<Decoded, String> {
+    decode_sized(bytes, pixel_budget, edge, edge)
+}
+fn decode_sized(
+    bytes: &[u8],
+    pixel_budget: u64,
+    max_width: u32,
+    max_height: u32,
+) -> Result<Decoded, String> {
     use windows::Win32::{
         Graphics::Imaging::*,
         System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
@@ -660,7 +733,9 @@ fn decode_scaled(bytes: &[u8], pixel_budget: u64, edge: u32) -> Result<Decoded, 
                     "Image exceeds the 16 megapixel or document image limit",
                 ));
             }
-            let scale = (edge as f64 / w.max(h) as f64).min(1.0);
+            let scale = (max_width as f64 / w as f64)
+                .min(max_height as f64 / h as f64)
+                .min(1.0);
             let dw = (w as f64 * scale).round().max(1.0) as u32;
             let dh = (h as f64 * scale).round().max(1.0) as u32;
             let scaler = factory.CreateBitmapScaler()?;
@@ -731,4 +806,84 @@ fn native_image_formats_and_validation() {
     let mut budget = (1, 1);
     assert!(picture(dir, "sample.png", 9000, &mut budget, false).is_none());
     assert_eq!(budget, (1, 1));
+}
+
+#[test]
+#[ignore = "Requires Windows RichEdit and image codecs"]
+fn native_readme_logo_render() {
+    let _ole = Ole::new().unwrap();
+    unsafe {
+        use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+        LoadLibraryW(wide("Msftedit.dll").as_ptr());
+        let fonts = crate::theme::Fonts::new();
+        let edit = crate::ui::rich_edit(null_mut(), true, fonts.body);
+        MoveWindow(edit, 0, 0, 600, 300, 0);
+        crate::theme::editor_colors(edit);
+        let base = std::env::current_dir().unwrap();
+        let source = fs::read_to_string(base.join("README.md")).unwrap();
+        let rtf = crate::markdown::with_images(&source, 9000, true, Some(&base));
+        crate::ui::set_rtf(edit, &rtf).unwrap();
+        let screen = GetDC(edit);
+        let mut buffer = crate::theme::Buffer::default();
+        assert!(buffer.ensure(screen, 600, 300));
+        crate::theme::fill(
+            buffer.dc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 600,
+                bottom: 300,
+            },
+            crate::theme::CANVAS,
+        );
+        SetStretchBltMode(buffer.dc, HALFTONE);
+        SendMessageW(
+            edit,
+            WM_PRINTCLIENT,
+            buffer.dc as usize,
+            PRF_CLIENT as isize,
+        );
+        let thumbnail = decode_sized(
+            &read(&base.join("assets/feather.png")).unwrap(),
+            MAX_PIXELS,
+            128,
+            u32::MAX,
+        )
+        .unwrap();
+        let expected = thumbnail.dib(true);
+        let mut origin: POINT = zeroed();
+        SendMessageW(
+            edit,
+            windows_sys::Win32::UI::Controls::EM_POSFROMCHAR,
+            &mut origin as *mut _ as usize,
+            0,
+        );
+        // OLE pictures can sit below the paragraph top; locate that inset while
+        // comparing pixels, rather than baking a font-specific baseline into QA.
+        let difference = (0..32)
+            .map(|inset| {
+                let mut difference = 0u64;
+                for y in (0..128).step_by(2) {
+                    for x in (0..128).step_by(2) {
+                        let actual = GetPixel(buffer.dc, origin.x + x, origin.y + inset + y);
+                        let index = 40 + ((127 - y) * 128 + x) as usize * 3;
+                        for (channel, shift) in [(0, 16), (1, 8), (2, 0)] {
+                            difference += ((actual >> shift & 255) as i32
+                                - expected[index + channel] as i32)
+                                .unsigned_abs() as u64;
+                        }
+                    }
+                }
+                difference
+            })
+            .min()
+            .unwrap();
+        assert!(
+            difference < 64 * 64 * 3 * 2,
+            "Native logo must match its filtered pixels: mean difference {}",
+            difference as f64 / (64. * 64. * 3.)
+        );
+        ReleaseDC(edit, screen);
+        DestroyWindow(edit);
+    }
 }

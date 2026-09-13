@@ -50,6 +50,54 @@ pub fn folding_preview(
         Some(folded),
     )
 }
+pub fn scroll_anchors(source: &str, folded: &BTreeSet<usize>) -> Vec<(i32, String)> {
+    let view = fold_source(source, folded);
+    let mut anchors = Vec::new();
+    let (mut block, mut image, mut byte, mut cp, mut last) = (false, false, 0, 0, 0);
+    // Keep anchors distributed through the document with bounded extra memory.
+    let spacing = (source.len() / 8192).max(1);
+    for (event, range) in Parser::new_ext(
+        &view,
+        Options::ENABLE_TABLES
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_MATH,
+    )
+    .into_offset_iter()
+    {
+        match event {
+            Event::Start(
+                Tag::Paragraph
+                | Tag::Heading { .. }
+                | Tag::Item
+                | Tag::CodeBlock(_)
+                | Tag::TableCell,
+            ) => block = true,
+            Event::Start(Tag::Image { .. }) => image = true,
+            Event::End(TagEnd::Image) => image = false,
+            Event::Text(text) | Event::Code(text) if block && !image => {
+                block = false;
+                if !anchors.is_empty() && range.start < last + spacing {
+                    continue;
+                }
+                cp += source[byte..range.start].encode_utf16().count() as i32
+                    - source[byte..range.start].matches("\r\n").count() as i32;
+                byte = range.start;
+                let snippet: String = text
+                    .chars()
+                    .take_while(|c| *c != '\r' && *c != '\n')
+                    .take(48)
+                    .collect();
+                if !snippet.trim().is_empty() {
+                    anchors.push((cp, snippet));
+                    last = range.start;
+                }
+            }
+            _ => (),
+        }
+    }
+    anchors
+}
 fn fold_source<'a>(source: &'a str, folded: &BTreeSet<usize>) -> Cow<'a, str> {
     if folded.is_empty() {
         return Cow::Borrowed(source);
@@ -81,6 +129,51 @@ fn fold_source<'a>(source: &'a str, folded: &BTreeSet<usize>) -> Cow<'a, str> {
     // Spaces preserve original byte offsets and remove hidden Markdown from the preview parser.
     Cow::Owned(String::from_utf8(bytes).expect("masked UTF-8"))
 }
+// ponytail: support image tags, not a general HTML layout engine.
+fn html_image(html: &str) -> Option<(String, Option<usize>)> {
+    let mut rest = html.trim().strip_prefix('<')?;
+    if !rest.get(..3)?.eq_ignore_ascii_case("img") || !rest.as_bytes().get(3)?.is_ascii_whitespace()
+    {
+        return None;
+    }
+    rest = &rest[3..];
+    let (mut src, mut width) = (None, None);
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with('>') || rest.starts_with("/>") {
+            break;
+        }
+        let end = rest.find(|c: char| c.is_ascii_whitespace() || matches!(c, '=' | '>' | '/'))?;
+        if end == 0 {
+            return None;
+        }
+        let key = &rest[..end];
+        rest = rest[end..].trim_start();
+        if !rest.starts_with('=') {
+            continue;
+        }
+        rest = rest[1..].trim_start();
+        let first = *rest.as_bytes().first()?;
+        let value;
+        if first == b'\'' || first == b'"' {
+            rest = &rest[1..];
+            let end = rest.find(first as char)?;
+            value = &rest[..end];
+            rest = &rest[end + 1..];
+        } else {
+            let end = rest.find(|c: char| c.is_ascii_whitespace() || c == '>')?;
+            value = &rest[..end];
+            rest = &rest[end..];
+        }
+        if key.eq_ignore_ascii_case("src") {
+            src = Some(value.replace("&amp;", "&"));
+        }
+        if key.eq_ignore_ascii_case("width") {
+            width = value.parse::<usize>().ok().filter(|n| *n > 0);
+        }
+    }
+    Some((src?, width))
+}
 fn formatted(
     source: &str,
     table_width: usize,
@@ -88,7 +181,7 @@ fn formatted(
     base: Option<&std::path::Path>,
     folded: Option<&BTreeSet<usize>>,
 ) -> String {
-    let mut out = String::from("{\\rtf1\\ansi\\deff0\\uc1{\\fonttbl{\\f0 Segoe UI;}{\\f1 Consolas;}}{\\colortbl;\\red34\\green48\\blue64;\\red35\\green96\\blue154;}\\f0\\fs22\\cf1 ");
+    let mut out = String::from("{\\rtf1\\ansi\\deff0\\uc1{\\fonttbl{\\f0 Segoe UI;}{\\f1 Consolas;}{\\f2 Segoe UI Symbol;}{\\f3 Cambria Math;}}{\\colortbl;\\red34\\green48\\blue64;\\red35\\green96\\blue154;}\\f0\\fs22\\cf1 ");
     if dark {
         out = out.replace(r"\fs22", r"\fs30").replace(
             r"\red34\green48\blue64;\red35\green96\blue154;",
@@ -119,22 +212,26 @@ fn formatted(
         );
     }
     extra.push_str(if dark {
-        "\\red16\\green23\\blue31;"
+        "\\red24\\green33\\blue44;\\red59\\green75\\blue92;"
     } else {
-        "\\red242\\green245\\blue248;"
+        "\\red242\\green245\\blue248;\\red180\\green190\\blue200;"
     });
     let end = out.find("}\\f0").unwrap();
     out.insert_str(end, &extra);
     let mut code_language = None;
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut alignments = Vec::new();
+    let mut quote_depth = 0;
     let mut column = 0;
     let mut table_head = false;
     let mut image_budget = (16 * 1024 * 1024, 16 * 1024 * 1024);
     let mut image_rendered = false;
     for (event, range) in Parser::new_ext(
         source,
-        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+        Options::ENABLE_TABLES
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_MATH,
     )
     .into_offset_iter()
     {
@@ -146,11 +243,17 @@ fn formatted(
         }
         match event {
             Event::Start(tag) => match tag {
-                Tag::Paragraph => out.push_str("{\\pard\\sa140 "),
+                Tag::Paragraph => {
+                    if lists.is_empty() {
+                        let _ = write!(out, "{{\\pard\\li{}\\sa140 ", quote_depth * 360);
+                    } else {
+                        out.push_str("{\\sa100 ");
+                    }
+                }
                 Tag::Heading { level, .. } => {
                     let _ = write!(
                         out,
-                        "{{\\pard\\sb200\\sa120\\b\\cf2\\fs{} ",
+                        "{{\\pard\\sb200\\sa120\\b\\cf1\\fs{} ",
                         (40 - (level as u8 - 1) * 4).max(if dark { 30 } else { 20 })
                     );
                     if let Some(folded) = folded {
@@ -172,22 +275,37 @@ fn formatted(
                         ),
                         _ => crate::syntax::Language::Plain,
                     });
-                    out.push_str(if dark {
-                        "{\\pard\\li200\\ri200\\sb120\\sa160\\cbpat10\\f1\\fs28 "
-                    } else {
-                        "{\\pard\\li200\\ri200\\sb120\\sa160\\cbpat10\\f1\\fs20 "
-                    });
+                    // RichEdit cell shading suppresses token colours; borders distinguish code without that override.
+                    let _ = write!(out, "{{\\trowd\\trgaph160\\trpaddt120\\trpaddb120\\trpaddft3\\trpaddfb3\\clbrdrt\\brdrs\\brdrw10\\brdrcf11\\clbrdrl\\brdrs\\brdrw10\\brdrcf11\\clbrdrb\\brdrs\\brdrw10\\brdrcf11\\clbrdrr\\brdrs\\brdrw10\\brdrcf11\\cellx{}\\pard\\intbl\\sb100\\sa100\\f1\\cf3\\fs{} ", table_width.max(240), if dark { 26 } else { 20 });
                 }
-                Tag::BlockQuote(_) => out.push_str("{\\li360\\i "),
-                Tag::List(start) => lists.push(start),
+                Tag::BlockQuote(_) => {
+                    quote_depth += 1;
+                    let _ = write!(out, "{{\\pard\\li{}\\cf9 ", quote_depth * 360);
+                }
+                Tag::List(start) => {
+                    if !lists.is_empty() {
+                        out.push_str("\\par ");
+                    }
+                    lists.push(start);
+                }
                 Tag::Item => {
-                    let _ = write!(out, "{{\\pard\\li{}\\sa60 ", lists.len() * 240);
-                    match lists.last_mut() {
-                        Some(Some(n)) => {
-                            let _ = write!(out, "{}. ", n);
-                            *n += 1;
+                    let indent = lists.len() * 360 + quote_depth * 360;
+                    let _ = write!(out, "{{\\pard\\li{indent}\\fi-240\\tx{indent}\\sa80 ");
+                    let task = source[range.clone()]
+                        .split_once(char::is_whitespace)
+                        .is_some_and(|(_, body)| {
+                            ["[ ] ", "[x] ", "[X] "]
+                                .iter()
+                                .any(|m| body.trim_start().starts_with(m))
+                        });
+                    if !task {
+                        match lists.last_mut() {
+                            Some(Some(n)) => {
+                                let _ = write!(out, "{}.\\~", n);
+                                *n += 1;
+                            }
+                            _ => out.push_str("\\u8226?\\tab "),
                         }
-                        _ => out.push_str("\\u8226? "),
                     }
                 }
                 Tag::Link { dest_url, .. } => {
@@ -219,9 +337,11 @@ fn formatted(
                 Tag::TableHead | Tag::TableRow => {
                     table_head = matches!(tag, Tag::TableHead);
                     column = 0;
-                    out.push_str("{\\trowd\\trgaph100");
+                    out.push_str("{\\trowd\\trgaph140\\trpaddt80\\trpaddb80\\trpaddft3\\trpaddfb3");
                     for c in 1..=alignments.len() {
-                        out.push_str("\\clbrdrb\\brdrs\\brdrw10\\brdrcf9");
+                        for side in ["t", "l", "b", "r"] {
+                            let _ = write!(out, "\\clbrdr{side}\\brdrs\\brdrw10\\brdrcf11");
+                        }
                         if table_head {
                             out.push_str("\\clcbpat10");
                         }
@@ -234,7 +354,7 @@ fn formatted(
                     out.push(' ');
                 }
                 Tag::TableCell => {
-                    out.push_str("{\\pard\\intbl ");
+                    out.push_str("{\\pard\\intbl\\cf1\\sb80\\sa80 ");
                     out.push_str(match alignments.get(column) {
                         Some(Alignment::Center) => "\\qc ",
                         Some(Alignment::Right) => "\\qr ",
@@ -249,14 +369,15 @@ fn formatted(
             },
             Event::End(tag) => match tag {
                 TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => out.push_str("\\par}"),
-                TagEnd::Strong
-                | TagEnd::Emphasis
-                | TagEnd::Strikethrough
-                | TagEnd::BlockQuote(_) => out.push('}'),
+                TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough => out.push('}'),
+                TagEnd::BlockQuote(_) => {
+                    quote_depth -= 1;
+                    out.push('}');
+                }
                 TagEnd::Link => out.push_str("}}"),
                 TagEnd::CodeBlock => {
                     code_language = None;
-                    out.push_str("\\par}");
+                    out.push_str("\\cell\\row}\\pard\\sa120\\par ");
                 }
                 TagEnd::Image => {
                     escape(&mut out, "]");
@@ -293,18 +414,56 @@ fn formatted(
                     }
                 }
             }
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                escape(&mut out, &text)
+            Event::Html(html) | Event::InlineHtml(html) => {
+                let picture = html_image(&html).and_then(|(src, width)| {
+                    base.and_then(|base| {
+                        crate::assets::picture(
+                            base,
+                            &src,
+                            width.map_or(table_width, |w| w.saturating_mul(15).min(table_width)),
+                            &mut image_budget,
+                            dark,
+                        )
+                    })
+                });
+                if let Some(picture) = picture {
+                    out.push_str(&picture);
+                } else {
+                    escape(&mut out, &html);
+                }
+            }
+            Event::Text(text) => escape(&mut out, &text),
+            ref math_event @ (Event::InlineMath(_) | Event::DisplayMath(_)) => {
+                let (math, display) = match math_event {
+                    Event::InlineMath(m) => (m, false),
+                    Event::DisplayMath(m) => (m, true),
+                    _ => unreachable!(),
+                };
+                out.push_str(if display {
+                    "{\\pard\\qc\\sb160\\sa160\\f3\\cf1 "
+                } else {
+                    "{\\f3\\cf1 "
+                });
+                out.push_str("\\u-8192?");
+                escape(&mut out, math);
+                out.push_str("\\u-8191?");
+                out.push_str(if display { "\\par}" } else { "}" });
             }
             Event::Code(text) => {
-                out.push_str("{\\f1 ");
+                out.push_str("{\\f1\\highlight10\\cf3 ");
                 escape(&mut out, &text);
                 out.push('}');
             }
             Event::SoftBreak => out.push(' '),
             Event::HardBreak => out.push_str("\\line "),
-            Event::Rule => out.push_str("\\par ________________________________\\par "),
-            Event::TaskListMarker(done) => out.push_str(if done { "[x] " } else { "[ ] " }),
+            Event::Rule => {
+                let _ = write!(out, "{{\\pard\\sa100\\par}}{{\\trowd\\trrh-20\\trgaph0\\clbrdrt\\brdrnone\\clbrdrb\\brdrnone\\clbrdrl\\brdrnone\\clbrdrr\\brdrnone\\clcbpat11\\cellx{}\\pard\\intbl\\fs1\\cell\\row}}{{\\pard\\sa100\\par}}", table_width.max(240));
+            }
+            Event::TaskListMarker(done) => out.push_str(if done {
+                "{\\f2\\cf2\\u9745?}\\tab "
+            } else {
+                "{\\f2\\cf9\\u9744?}\\tab "
+            }),
             _ => (),
         }
     }
@@ -341,15 +500,26 @@ fn heading_folds_respect_hierarchy_and_leave_export_complete() {
 
 #[test]
 fn markdown_unicode_and_rtf_injection() {
+    assert_eq!(
+        html_image(r#"<img alt="logo > here" width='128' src="assets/a&amp;b.png">"#),
+        Some(("assets/a&b.png".into(), Some(128)))
+    );
+    assert_eq!(
+        html_image("<IMG SRC=logo.png />"),
+        Some(("logo.png".into(), None))
+    );
+    assert!(html_image("<img src='broken>").is_none());
+    assert!(html_image("<script src='a.png'>").is_none());
+
     let rich = preview("[Docs](https://example.com)\n\n|Left|Center|Right|\n|:---|:---:|---:|\n|a|b|c|\n\n```rust\nlet n = 42; // 中文\n```", 9000);
     assert!(rich.contains("HYPERLINK \"https://example.com\""));
     assert!(rich.contains("\\qc ") && rich.contains("\\qr "));
-    assert!(rich.contains("\\clcbpat10") && rich.contains("\\cbpat10"));
+    assert!(rich.contains("\\clcbpat10") && rich.contains("\\trgaph160"));
     assert!(rich.contains("{\\cf4 let}"));
 
     let screen = preview("Body\n\n```\ncode\n```", 9000);
     assert!(screen.contains(r"\fs30"));
-    assert!(screen.contains(r"\fs28"));
+    assert!(screen.contains(r"\fs26"));
     assert!(!screen.contains('\u{c}'));
     let doc = rtf("# 中文 😀\n\n**bold** `code`\n\n1. item\n\n| A | B |\n|---|---|\n| one | two |\n\n{\\rtf1 evil}", 9000);
     assert!(doc.contains("\\u20013?"));

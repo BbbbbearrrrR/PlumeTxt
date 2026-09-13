@@ -500,9 +500,21 @@ pub unsafe fn document(hwnd: HWND) -> Option<ITextDocument> {
     }
     IUnknown::from_raw(raw).cast().ok()
 }
+// Keep the first deadline: wheel/input messages must not postpone highlighting.
+pub unsafe fn schedule(hwnd: HWND) {
+    let key = wide("PlumeTxtHighlightPending");
+    if GetPropW(hwnd, key.as_ptr()).is_null() && SetTimer(hwnd, 9, 16, None) != 0 {
+        SetPropW(hwnd, key.as_ptr(), 1usize as _);
+    }
+}
+
+pub unsafe fn scheduled(hwnd: HWND) {
+    RemovePropW(hwnd, wide("PlumeTxtHighlightPending").as_ptr());
+}
+
 #[derive(Default)]
 pub struct Highlighter {
-    last: Option<(i32, Language, String)>,
+    last: Option<(i32, Language, String, i32, i32)>,
 }
 impl Highlighter {
     pub fn clear(&mut self) {
@@ -527,6 +539,19 @@ impl Highlighter {
         });
         let line = SendMessageW(hwnd, EM_GETFIRSTVISIBLELINE, 0, 0);
         let first = SendMessageW(hwnd, EM_LINEINDEX, line as usize, 0).max(0) as i32;
+        let rect = crate::theme::client(hwnd);
+        let bottom = POINT {
+            x: rect.right - 1,
+            y: rect.bottom - 1,
+        };
+        let visible_end = (SendMessageW(hwnd, WM_USER + 39, 0, &bottom as *const _ as isize)
+            as i32)
+            .max(first)
+            .saturating_add(1); // EM_CHARFROMPOS (RichEdit)
+        let paint_start = (first - 512).max(0);
+        let paint_end = visible_end
+            .saturating_add(512)
+            .min(first.saturating_add(WINDOW / 2));
         let start = (first - WINDOW / 2).max(0);
         let Ok(range) = doc.Range(start, start + WINDOW) else {
             return;
@@ -544,11 +569,9 @@ impl Highlighter {
                 source.drain(..=n);
             }
         }
-        if self
-            .last
-            .as_ref()
-            .is_some_and(|v| v.0 == start && v.1 == language && v.2 == source)
-        {
+        if self.last.as_ref().is_some_and(|v| {
+            v.0 == start && v.1 == language && v.2 == source && v.3 <= first && v.4 >= visible_end
+        }) {
             return;
         }
         let colors = colors(&source, language);
@@ -576,19 +599,20 @@ impl Highlighter {
         }
         let _ = doc.Freeze();
         let result = (|| -> windows::core::Result<()> {
-            doc.Range(start, offset)?
+            doc.Range(paint_start, paint_end.min(offset))?
                 .GetFont()?
                 .SetForeColor(INK as i32)?;
-            // Spend the bounded format budget on visible text first instead of
-            // turning an entire dense CSV window back into plain text.
+            // Lex the look-behind for context, but format only the viewport and a
+            // small margin. TOM formatting, not tokenization, dominates the cost.
             for &(a, b, color) in runs
                 .iter()
-                .filter(|r| r.1 > first)
-                .chain(runs.iter().filter(|r| r.1 <= first))
+                .filter(|r| r.1 > paint_start && r.0 < paint_end)
                 .filter(|r| r.2 != INK)
                 .take(4096)
             {
-                doc.Range(a, b)?.GetFont()?.SetForeColor(color as i32)?;
+                doc.Range(a.max(paint_start), b.min(paint_end))?
+                    .GetFont()?
+                    .SetForeColor(color as i32)?;
             }
             Ok(())
         })();
@@ -598,7 +622,7 @@ impl Highlighter {
         SendMessageW(hwnd, EM_SETMODIFY, modified as usize, 0);
         SendMessageW(hwnd, WM_USER + 69, 0, mask);
         if result.is_ok() {
-            self.last = Some((start, language, source));
+            self.last = Some((start, language, source, paint_start, paint_end));
         }
     }
 }
@@ -803,9 +827,12 @@ unsafe extern "system" fn editor_proc(
     }
     if msg == WM_IME_ENDCOMPOSITION {
         RemovePropW(hwnd, wide("PlumeTxtComposing").as_ptr());
-        SetTimer(GetAncestor(hwnd, GA_ROOT), 9, 80, None);
+        schedule(GetAncestor(hwnd, GA_ROOT));
     }
     if msg == WM_PASTE {
+        if GetWindowLongW(hwnd, GWL_STYLE) as u32 & ES_READONLY as u32 != 0 {
+            return 0;
+        }
         PostMessageW(GetAncestor(hwnd, GA_ROOT), crate::ui::PASTE, 0, 0);
         return 0;
     }
@@ -830,8 +857,32 @@ unsafe extern "system" fn editor_proc(
         }
     }
     let result = DefSubclassProc(hwnd, msg, wp, lp);
+    // RichEdit can reveal its rectangular selection again after native input,
+    // especially in read-only rich text. Our shared overlay owns the highlight.
+    if matches!(
+        msg,
+        WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_KEYDOWN
+            | EM_SETSEL
+            | EM_EXSETSEL
+            | EM_STREAMIN
+    ) || msg == WM_MOUSEMOVE && wp & MK_LBUTTON as usize != 0
+    {
+        let (mut a, mut b) = (0u32, 0u32);
+        SendMessageW(
+            hwnd,
+            windows_sys::Win32::UI::Controls::EM_GETSEL,
+            &mut a as *mut _ as usize,
+            &mut b as *mut _ as isize,
+        );
+        if a != b {
+            SendMessageW(hwnd, WM_USER + 63, 1, 0);
+        }
+    }
     if matches!(msg, WM_LBUTTONUP | WM_CAPTURECHANGED) {
-        SetTimer(GetAncestor(hwnd, GA_ROOT), 9, 80, None);
+        schedule(GetAncestor(hwnd, GA_ROOT));
     }
     // Passive queries, paints and timers must not recreate the caret or restart
     // its native blink cycle. Only input/layout changes need new cell geometry.

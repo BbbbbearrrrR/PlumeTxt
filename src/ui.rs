@@ -70,6 +70,7 @@ const DISPATCH: u32 = WM_APP + 2;
 const LAYOUT: usize = 200;
 const CHANGE: usize = 201;
 const EXPORTED: u32 = WM_APP + 3;
+const PREVIEW_READY: u32 = WM_APP + 183;
 const EM_STREAMIN: u32 = WM_USER + 73;
 const EM_FORMATRANGE: u32 = WM_USER + 57;
 const EM_EXLIMITTEXT: u32 = WM_USER + 53;
@@ -93,6 +94,57 @@ unsafe fn error(hwnd: HWND, text: &str) {
         MB_OK | MB_ICONERROR,
     );
 }
+unsafe fn character_y(edit: HWND, cp: i32) -> Option<i32> {
+    use windows::Win32::UI::Controls::RichEdit::{
+        tomAllowOffClient, tomClientCoord, tomConstants, tomStart,
+    };
+    let doc = crate::syntax::document(edit)?;
+    let range = doc.Range(cp, cp).ok()?;
+    let (mut x, mut y) = (0, 0);
+    range
+        .GetPoint(
+            tomConstants(tomStart.0 | tomClientCoord.0 | tomAllowOffClient.0),
+            &mut x,
+            &mut y,
+        )
+        .ok()?;
+    Some(y)
+}
+unsafe fn logical_lines(edit: HWND) -> Option<(i32, i32)> {
+    use windows::Win32::UI::Controls::RichEdit::tomParagraph;
+    let doc = crate::syntax::document(edit)?;
+    let end = doc
+        .Range(0, 0)
+        .ok()?
+        .GetStoryLength()
+        .ok()?
+        .saturating_sub(1);
+    let current = doc.GetSelection().ok()?.GetStart().ok()?;
+    Some((
+        doc.Range(current, current)
+            .ok()?
+            .GetIndex(tomParagraph.0)
+            .ok()?,
+        doc.Range(end, end).ok()?.GetIndex(tomParagraph.0).ok()?,
+    ))
+}
+unsafe fn number_gutter(hwnd: HWND, font: HFONT, total: u64) -> i32 {
+    let digits = total.max(1).ilog10() as usize + 1;
+    let dc = GetDC(hwnd);
+    if dc.is_null() {
+        return theme::px(hwnd, (digits as i32 * 16 + 16).max(56));
+    }
+    let old = SelectObject(dc, font);
+    let mut widest = 0;
+    for digit in b'0'..=b'9' {
+        let mut size = SIZE { cx: 0, cy: 0 };
+        GetTextExtentPoint32W(dc, &(digit as u16), 1, &mut size);
+        widest = widest.max(size.cx);
+    }
+    SelectObject(dc, old);
+    ReleaseDC(hwnd, dc);
+    (widest * digits as i32 + theme::px(hwnd, 16)).max(theme::px(hwnd, 56))
+}
 unsafe fn text(hwnd: HWND) -> String {
     let len = GetWindowTextLengthW(hwnd).max(0) as usize;
     let mut buf = vec![0u16; len + 1];
@@ -100,7 +152,13 @@ unsafe fn text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..read])
 }
 
+enum SavedText {
+    Region(document::Chunk),
+    Full(PathBuf),
+}
+
 struct LoadedText {
+    paged: Option<crate::paged::Document>,
     units: Vec<u16>,
     encoding: Encoding,
     crlf: bool,
@@ -108,10 +166,19 @@ struct LoadedText {
     chunk: Option<document::Chunk>,
 }
 struct Loading {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    editing_region: bool,
     receiver: Receiver<Result<LoadedText, String>>,
     data: Option<LoadedText>,
     inserted: usize,
     batch: usize,
+}
+
+impl Drop for Loading {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 unsafe fn append_load_batch(
@@ -151,7 +218,8 @@ unsafe fn append_load_batch(
     result.map(|()| end).map_err(|e| e.to_string())
 }
 
-type PreviewResult = (u64, Receiver<Result<String, String>>);
+type PreviewData = (String, Vec<(i32, String)>);
+type PreviewResult = (u64, Receiver<Result<PreviewData, String>>);
 
 struct App {
     search: Option<crate::search::Search>,
@@ -175,6 +243,9 @@ struct App {
     preview_job: RefCell<Option<PreviewResult>>,
     preview_version: Cell<u64>,
     preview_pending: Cell<bool>,
+    preview_scroll: Cell<Option<f64>>,
+    preview_anchors: RefCell<Vec<(i32, i32)>>,
+    preview_anchor: Cell<Option<(i32, f64)>>,
     status: HWND,
     commands_button: HWND,
     status_message: RefCell<String>,
@@ -186,6 +257,7 @@ struct App {
     terminal_preferred_width: i32,
     terminal_drag: Option<theme::Divider>,
     font: HFONT,
+    gutter_width: i32,
     path: Option<PathBuf>,
     encoding: Encoding,
     crlf: bool,
@@ -204,12 +276,13 @@ struct App {
     palette: palette::Palette,
     monospace: bool,
     text_zoom: i32,
+    zoom_wheel: i32,
     printing: Option<crate::printing::Job>,
     exporting: bool,
     export_result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
     loading: Option<Loading>,
     chunk: Option<document::Chunk>,
-    saving: Option<Receiver<Result<(PathBuf, u64), String>>>,
+    saving: Option<Receiver<Result<SavedText, String>>>,
 }
 
 impl App {
@@ -287,6 +360,17 @@ impl App {
                 if let Some(viewer) = &self.viewer {
                     viewer.highlight(pdf);
                 }
+            }
+            return;
+        }
+        if self.path.as_ref() == Some(&hit.path) && crate::paged::active(self.edit) {
+            match crate::paged::reveal_hit(self.edit, &hit) {
+                Ok(true) => {
+                    self.preview_only = false;
+                    self.show_editor();
+                }
+                Ok(false) => self.status("File changed · Search again"),
+                Err(e) => self.status(&e),
             }
             return;
         }
@@ -376,7 +460,7 @@ impl App {
         } else if url.starts_with('#') {
             self.status("Section anchors are not supported yet");
         } else if let Some(base) = self.path.as_ref().and_then(|p| p.parent()) {
-            if let Some(path) = crate::assets::relative_path(base, &url) {
+            if let Some(path) = crate::assets::local_path(base, &url) {
                 if path.is_file() {
                     self.open(path);
                 } else {
@@ -419,6 +503,7 @@ impl App {
         true
     }
     unsafe fn cancel_loading(&mut self) {
+        crate::paged::detach(self.edit);
         self.preview_version
             .set(self.preview_version.get().wrapping_add(1));
         let loading = self.loading.take().is_some();
@@ -434,6 +519,12 @@ impl App {
         }
     }
     unsafe fn begin_load(&mut self, path: PathBuf, offset: Option<u64>) {
+        crate::paged::detach(self.edit);
+        let dynamic = std::fs::metadata(&path).is_ok_and(|m| m.len() > crate::large::THRESHOLD);
+        let editing_region = self.large.is_some();
+        self.preview_scroll.set(None);
+        self.preview_anchors.borrow_mut().clear();
+        self.preview_anchor.set(None);
         self.preview_version
             .set(self.preview_version.get().wrapping_add(1));
         self.search_hit = None;
@@ -454,9 +545,24 @@ impl App {
         }
         SendMessageW(self.edit, EM_SETREADONLY, 1, 0);
         let (tx, receiver) = mpsc::channel();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = cancelled.clone();
         std::thread::spawn(move || {
-            let result = if let Some(offset) = offset {
+            let result = if dynamic {
+                crate::paged::Document::open(&path, || {
+                    !cancel.load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .map(|doc| LoadedText {
+                    units: Vec::new(),
+                    encoding: doc.encoding,
+                    crlf: doc.crlf,
+                    original: None,
+                    chunk: None,
+                    paged: Some(doc),
+                })
+            } else if let Some(offset) = offset {
                 document::Chunk::read(&path, offset).map(|(chunk, source)| LoadedText {
+                    paged: None,
                     units: source.encode_utf16().collect(),
                     encoding: chunk.encoding,
                     crlf: chunk.crlf,
@@ -465,6 +571,7 @@ impl App {
                 })
             } else {
                 document::read(&path).map(|(source, encoding, original)| LoadedText {
+                    paged: None,
                     units: source.encode_utf16().collect(),
                     encoding,
                     crlf: source.contains("\r\n"),
@@ -475,6 +582,8 @@ impl App {
             let _ = tx.send(result);
         });
         self.loading = Some(Loading {
+            cancelled,
+            editing_region,
             receiver,
             data: None,
             inserted: 0,
@@ -530,6 +639,11 @@ impl App {
             let factor = (0.008 / began.elapsed().as_secs_f64().max(0.0001)).clamp(0.5, 2.0);
             loading.batch = ((loading.batch as f64 * factor) as usize).clamp(8192, 256 * 1024);
             if loading.inserted == data.units.len() {
+                let dynamic_hit = if data.paged.is_some() {
+                    self.search_hit.take()
+                } else {
+                    None
+                };
                 let search_selection = self.search_hit.take().map(|hit| {
                     let start = data.chunk.as_ref().map_or(
                         match data.encoding {
@@ -544,7 +658,21 @@ impl App {
                 self.encoding = data.encoding;
                 self.crlf = data.crlf;
                 self.original = data.original;
-                self.chunk = loading.data.take().unwrap().chunk;
+                let loaded = loading.data.take().unwrap();
+                self.chunk = loaded.chunk;
+                if let Some(doc) = loaded.paged {
+                    if let Err(e) = crate::paged::attach(self.edit, doc) {
+                        self.status(&format!("Open failed: {e}"));
+                        SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+                        return;
+                    }
+                }
+                let found_dynamic_hit = dynamic_hit.is_some();
+                if let Some(hit) = dynamic_hit {
+                    if let Err(e) = crate::paged::reveal_hit(self.edit, &hit) {
+                        self.status(&e);
+                    }
+                }
                 SendMessageW(self.edit, EM_EMPTYUNDOBUFFER, 0, 0);
                 SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
                 SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
@@ -553,7 +681,10 @@ impl App {
                     self.watch = Some(crate::external::Watch::new(path.clone(), original));
                 }
                 self.highlighter.clear();
-                self.preview_only = self.is_markdown() && search_selection.is_none();
+                self.preview_only = self.is_markdown()
+                    && search_selection.is_none()
+                    && !found_dynamic_hit
+                    && !loading.editing_region;
                 scroll::pair(self.edit, null_mut());
                 if !self.preview.is_null() {
                     scroll::pair(self.preview, null_mut());
@@ -572,7 +703,7 @@ impl App {
                     ShowWindow(self.preview, SW_SHOW);
                     self.layout();
                 }
-                SetTimer(self.hwnd, 9, 80, None);
+                crate::syntax::schedule(self.hwnd);
                 self.refresh_preview();
                 self.title();
                 self.status("");
@@ -591,15 +722,26 @@ impl App {
             return;
         };
         match receiver.try_recv() {
-            Ok(Ok((path, offset))) => {
+            Ok(Ok(saved)) => {
+                match saved {
+                    SavedText::Region(chunk) => {
+                        self.path = Some(chunk.path.clone());
+                        self.chunk = Some(chunk);
+                    }
+                    SavedText::Full(path) => {
+                        if let Err(e) = crate::paged::saved(self.edit, path.clone()) {
+                            SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
+                            self.status(&e);
+                            return;
+                        }
+                        self.path = Some(path);
+                    }
+                }
                 SendMessageW(self.edit, EM_SETREADONLY, 0, 0);
                 SendMessageW(self.edit, EM_SETMODIFY, 0, 0);
-                self.cancel_loading();
-                if std::fs::metadata(&path).is_ok_and(|m| m.len() > crate::large::THRESHOLD) {
-                    self.begin_load(path, Some(offset));
-                } else {
-                    self.open(path);
-                }
+                self.title();
+                self.status("Saved");
+                self.refresh_preview();
             }
             Err(TryRecvError::Empty) => {
                 self.saving = Some(receiver);
@@ -845,11 +987,26 @@ impl App {
     }
     unsafe fn refresh_status(&self) {
         let message = self.status_message.borrow();
-        let value = if message.is_empty() {
+        let mut value = if message.is_empty() {
             self.hints()
         } else {
             message.clone()
         };
+        if self.loading.is_none()
+            && !self.empty_workspace()
+            && self.image.is_none()
+            && self.pdf_path.is_none()
+            && self.large.is_none()
+        {
+            if let Some((line, total)) = crate::paged::lines(self.edit)
+                .or_else(|| logical_lines(self.edit).map(|(a, b)| (a as u64, b as u64)))
+            {
+                value = format!(
+                    "{}Ln {line} / {total}  ·  {value}",
+                    if self.chunk.is_some() { "Region " } else { "" }
+                );
+            }
+        }
         if text(self.status) != value {
             SetWindowTextW(self.status, wide(&value).as_ptr());
         }
@@ -861,7 +1018,16 @@ impl App {
             SetTimer(self.hwnd, 8, 3000, None);
         }
     }
+    unsafe fn measured_gutter(&self) -> i32 {
+        let total = crate::paged::lines(self.edit)
+            .map(|(_, n)| n)
+            .or_else(|| logical_lines(self.edit).map(|(_, n)| n as u64))
+            .unwrap_or(1);
+        number_gutter(self.hwnd, self.fonts.ui, total)
+    }
     unsafe fn layout(&mut self) {
+        self.gutter_width = self.measured_gutter();
+        crate::paged::preview(self.preview, self.edit);
         if !self.empty_workspace() {
             self.feather = (0, theme::Buffer::default());
         }
@@ -958,22 +1124,19 @@ impl App {
             theme::move_window(view.0, left, 0, right - left, (bottom - d(34)).max(1), 0);
         }
         if let Some(terminal) = &self.terminal {
-            theme::move_window(
-                terminal.0,
-                right + d(8),
-                d(12),
-                (self.terminal_width - d(20)).max(1),
-                (bottom - d(58)).max(1),
-                0,
-            );
-            ShowWindow(
-                terminal.0,
-                if self.terminal_width > d(20) {
-                    SW_SHOWNA
-                } else {
-                    SW_HIDE
-                },
-            );
+            let visible = self.terminal_width > d(20);
+            if visible {
+                theme::move_window(
+                    terminal.0,
+                    right + d(8),
+                    d(12),
+                    self.terminal_width - d(20),
+                    (bottom - d(58)).max(1),
+                    0,
+                );
+            }
+            // Preserve the PTY grid while collapsed; shrinking it destroys the TUI layout.
+            ShowWindow(terminal.0, if visible { SW_SHOWNA } else { SW_HIDE });
         }
         if let Some(viewer) = &self.viewer {
             theme::move_window(viewer.0, left, 0, right - left, (bottom - d(34)).max(1), 0);
@@ -990,9 +1153,9 @@ impl App {
         };
         scroll::resize(
             self.edit,
-            inset,
+            inset + self.gutter_width,
             d(28),
-            (split - inset).max(1),
+            (split - inset - self.gutter_width).max(1),
             (bottom - d(64)).max(1),
         );
         let reading = self.preview_only && self.comparison.is_none();
@@ -1064,7 +1227,7 @@ impl App {
             scroll::show(self.preview, false);
         }
         theme::invalidate(self.hwnd);
-        SetTimer(self.hwnd, 9, 80, None);
+        crate::syntax::schedule(self.hwnd);
     }
     unsafe fn change_dpi(&mut self, dpi: u32) {
         let dpi = dpi.max(96);
@@ -1125,12 +1288,63 @@ impl App {
         self.fonts = fonts;
         self.highlighter.clear();
     }
+    unsafe fn scroll_anchor(&self, source: HWND) -> Option<(i32, f64)> {
+        let anchors = self.preview_anchors.borrow();
+        if anchors.is_empty() {
+            return None;
+        }
+        let preview = source == self.preview;
+        let first = SendMessageW(source, EM_GETFIRSTVISIBLELINE, 0, 0);
+        let cp = SendMessageW(source, EM_LINEINDEX, first as usize, 0) as i32;
+        let i = anchors
+            .partition_point(|a| if preview { a.1 <= cp } else { a.0 <= cp })
+            .saturating_sub(1);
+        let y = character_y(source, if preview { anchors[i].1 } else { anchors[i].0 })?;
+        let fraction = anchors
+            .get(i + 1)
+            .and_then(|next| character_y(source, if preview { next.1 } else { next.0 }))
+            .map_or(0.0, |next| {
+                (-y as f64 / (next - y).max(1) as f64).clamp(0.0, 1.0)
+            });
+        Some((anchors[i].0, fraction))
+    }
+    unsafe fn restore_anchor(&self, target: HWND, anchor: (i32, f64)) -> bool {
+        let anchors = self.preview_anchors.borrow();
+        let Ok(i) = anchors.binary_search_by_key(&anchor.0, |a| a.0) else {
+            return false;
+        };
+        let preview = target == self.preview;
+        let Some(y) = character_y(target, if preview { anchors[i].1 } else { anchors[i].0 }) else {
+            return false;
+        };
+        let next = anchors
+            .get(i + 1)
+            .and_then(|a| character_y(target, if preview { a.1 } else { a.0 }))
+            .unwrap_or(y);
+        let pos =
+            scroll::info(target, true).nPos + y + ((next - y) as f64 * anchor.1).round() as i32;
+        scroll::set_position(target, true, pos);
+        true
+    }
     unsafe fn sync_scroll(&self, source: HWND) {
-        if self.comparison.is_some() || self.preview_only {
+        if self.comparison.is_some() || self.preview_only && !crate::paged::active(self.edit) {
             return;
         }
         if self.preview.is_null() || (source != self.edit && source != self.preview) {
             return;
+        }
+        let dragging = scroll::drag_owner();
+        if !dragging.is_null() {
+            // Paged preview seeks already move the source; its old rendered frame
+            // must never scroll the source back while the replacement is loading.
+            let driver = if crate::paged::active(self.edit) {
+                self.edit
+            } else {
+                dragging
+            };
+            if source != driver {
+                return;
+            }
         }
         let target = if source == self.edit {
             self.preview
@@ -1139,6 +1353,14 @@ impl App {
         };
         scroll::measure(source);
         scroll::measure(target);
+        if let Some(anchor) = self.scroll_anchor(source) {
+            if self.restore_anchor(target, anchor) {
+                if !dragging.is_null() {
+                    UpdateWindow(target);
+                }
+                return;
+            }
+        }
         let from = scroll::info(source, true);
         let to = scroll::info(target, true);
         let pos = (from.nPos as f64 / scroll::limit(&from).max(1) as f64
@@ -1147,6 +1369,43 @@ impl App {
         if (to.nPos - pos).abs() > 1 {
             scroll::set_position(target, true, pos);
         }
+        if !dragging.is_null() {
+            UpdateWindow(target);
+        }
+    }
+    unsafe fn set_reading(&mut self, reading: bool) {
+        let source = if self.preview_only && !self.preview.is_null() {
+            self.preview
+        } else {
+            self.edit
+        };
+        let anchor = self.scroll_anchor(source);
+        self.preview_anchor.set(anchor);
+        let from = scroll::info(source, true);
+        let progress = from.nPos as f64 / scroll::limit(&from).max(1) as f64;
+        if self.preview.is_null() {
+            self.preview = rich_edit(self.hwnd, true, self.font);
+            SendMessageW(self.preview, WM_USER + 225, self.text_zoom as usize, 100);
+        }
+        self.preview_only = reading;
+        self.preview_scroll.set(Some(progress));
+        scroll::pair(self.edit, if reading { null_mut() } else { self.preview });
+        scroll::pair(self.preview, if reading { null_mut() } else { self.edit });
+        self.show_editor();
+        // Apply the reading position after wrapping changes, before preview refresh uses the editor.
+        for view in [self.edit, self.preview] {
+            if anchor.is_some_and(|a| self.restore_anchor(view, a)) {
+                continue;
+            }
+            let range = scroll::info(view, true);
+            scroll::set_position(
+                view,
+                true,
+                (progress * scroll::limit(&range) as f64).round() as i32,
+            );
+        }
+        self.refresh_preview();
+        self.focus_content();
     }
     unsafe fn show_editor(&mut self) {
         self.workspace_idle = false;
@@ -1167,7 +1426,7 @@ impl App {
         SetFocus(self.edit);
         self.status("");
         self.highlighter.clear();
-        SetTimer(self.hwnd, 9, 80, None);
+        crate::syntax::schedule(self.hwnd);
     }
     unsafe fn confirm_save(&mut self) -> bool {
         if self.saving.is_some() {
@@ -1231,6 +1490,25 @@ impl App {
             error(self.hwnd, "Use Export PDF to create a PDF.");
             return false;
         }
+        if crate::paged::active(self.edit) {
+            let doc = match crate::paged::snapshot(self.edit) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    error(self.hwnd, &e);
+                    return false;
+                }
+            };
+            let (tx, receiver) = mpsc::channel();
+            self.saving = Some(receiver);
+            SendMessageW(self.edit, EM_SETREADONLY, 1, 0);
+            self.status("Saving…");
+            std::thread::spawn(move || {
+                let result = doc.save(&path).map(|()| SavedText::Full(path));
+                let _ = tx.send(result);
+            });
+            SetTimer(self.hwnd, 12, 30, None);
+            return false;
+        }
         if let Some(chunk) = self.chunk.clone() {
             let source = text(self.edit);
             let (tx, receiver) = mpsc::channel();
@@ -1238,7 +1516,7 @@ impl App {
             SendMessageW(self.edit, EM_SETREADONLY, 1, 0);
             self.status("Saving…");
             std::thread::spawn(move || {
-                let result = chunk.save(&path, &source).map(|()| (path, chunk.start));
+                let result = chunk.save(&path, &source).map(SavedText::Region);
                 let _ = tx.send(result);
             });
             SetTimer(self.hwnd, 12, 30, None);
@@ -1276,7 +1554,7 @@ impl App {
                 self.title();
                 self.status("Saved");
                 self.highlighter.clear();
-                SetTimer(self.hwnd, 9, 80, None);
+                crate::syntax::schedule(self.hwnd);
                 true
             }
             Err(e) => {
@@ -1286,8 +1564,21 @@ impl App {
         }
     }
     unsafe fn browse_large(&mut self, path: PathBuf, offset: u64) {
+        crate::paged::detach(self.edit);
         self.close_comparison();
         self.watch = None;
+        self.path = None;
+        self.original = None;
+        self.chunk = None;
+        self.preview_version
+            .set(self.preview_version.get().wrapping_add(1));
+        self.preview_anchors.borrow_mut().clear();
+        SendMessageW(self.edit, EM_SETEVENTMASK, 0, 0);
+        SetWindowTextW(self.edit, wide("").as_ptr());
+        SendMessageW(self.edit, EM_SETEVENTMASK, 0, 1);
+        if !self.preview.is_null() {
+            SetWindowTextW(self.preview, wide("").as_ptr());
+        }
         self.image.take();
         self.image_path = None;
         self.large.take();
@@ -1365,7 +1656,7 @@ impl App {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
         if !is_pdf && std::fs::metadata(&path).is_ok_and(|m| m.len() > crate::large::THRESHOLD) {
-            self.begin_load(path, Some(0));
+            self.begin_load(path, None);
             return;
         }
         if is_pdf {
@@ -1422,18 +1713,21 @@ impl App {
                     0,
                     &mut position as *mut _ as isize,
                 );
-                SendMessageW(self.preview, WM_SETREDRAW, 0, 0);
+                let drawing =
+                    crate::syntax::document(self.preview).filter(|doc| doc.Freeze().is_ok());
                 let result = set_rtf(
                     self.preview,
                     &crate::external::rtf(&text(self.edit), &snapshot.source),
                 );
+                if let Some(doc) = drawing {
+                    let _ = doc.Unfreeze();
+                }
                 SendMessageW(
                     self.preview,
                     WM_USER + 222,
                     0,
                     &position as *const _ as isize,
                 );
-                SendMessageW(self.preview, WM_SETREDRAW, 1, 0);
                 theme::invalidate(self.preview);
                 if let Err(e) = result {
                     self.status(&e);
@@ -1452,10 +1746,7 @@ impl App {
                 return;
             }
             self.preview_pending.set(false);
-            let mut rc: RECT = zeroed();
-            GetClientRect(self.preview, &mut rc);
-            let dpi = theme::dpi(self.preview) as i32;
-            let width = ((rc.right - theme::px(self.preview, 48)).max(16) * 1440 / dpi) as usize;
+            let width = scroll::text_width(self.preview);
             let source = text(self.edit);
             let revision = document::fingerprint(source.as_bytes());
             if self.fold_revision.replace(revision) != revision {
@@ -1468,6 +1759,7 @@ impl App {
                 .and_then(Path::parent)
                 .map(Path::to_path_buf);
             let folded = self.folded.borrow().clone();
+            let notify = self.hwnd as usize;
             let (sender, receiver) = mpsc::channel();
             let worker = std::thread::Builder::new()
                 .name("markdown-preview".into())
@@ -1480,9 +1772,11 @@ impl App {
                         let rtf =
                             markdown::folding_preview(&source, width, base.as_deref(), &folded);
                         unsafe { CoUninitialize() };
-                        rtf
+                        (rtf, markdown::scroll_anchors(&source, &folded))
                     });
-                    let _ = sender.send(result);
+                    if sender.send(result).is_ok() {
+                        PostMessageW(notify as HWND, PREVIEW_READY, version as usize, 0);
+                    }
                 });
             match worker {
                 Ok(_) => {
@@ -1492,6 +1786,7 @@ impl App {
                 Err(e) => {
                     scroll::hold_range(self.preview, false);
                     self.status(&format!("Preview worker: {e}"));
+                    crate::paged::preview_ready(self.edit);
                 }
             }
         }
@@ -1519,7 +1814,7 @@ impl App {
             && self.large.is_none()
         {
             match result {
-                Ok(Ok(rtf)) => {
+                Ok(Ok((rtf, anchors))) => {
                     let mut position: POINT = zeroed();
                     SendMessageW(
                         self.preview,
@@ -1527,9 +1822,67 @@ impl App {
                         0,
                         &mut position as *mut _ as isize,
                     );
-                    SendMessageW(self.preview, WM_SETREDRAW, 0, 0);
+                    let drawing =
+                        crate::syntax::document(self.preview).filter(|doc| doc.Freeze().is_ok());
                     let rendered = set_rtf(self.preview, &rtf);
-                    if self.preview_only {
+                    if let Some(doc) = drawing {
+                        let _ = doc.Unfreeze();
+                    }
+                    let mut mapped = self.preview_anchors.borrow_mut();
+                    mapped.clear();
+                    if let Some(doc) = crate::syntax::document(self.preview) {
+                        let mut start = 0;
+                        for (cp, snippet) in anchors {
+                            if let Ok(range) = doc.Range(start, start) {
+                                if range
+                                    .FindText(
+                                        &windows_core::BSTR::from(snippet),
+                                        i32::MAX,
+                                        windows::Win32::UI::Controls::RichEdit::tomConstants(4),
+                                    )
+                                    .unwrap_or(0)
+                                    > 0
+                                {
+                                    if let (Ok(at), Ok(end)) = (range.GetStart(), range.GetEnd()) {
+                                        mapped.push((cp, at));
+                                        start = end;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let (Some(source), Some(preview)) = (
+                        crate::syntax::document(self.edit),
+                        crate::syntax::document(self.preview),
+                    ) {
+                        if let (Ok(source), Ok(preview)) = (
+                            source.Range(0, 0).and_then(|r| r.GetStoryLength()),
+                            preview.Range(0, 0).and_then(|r| r.GetStoryLength()),
+                        ) {
+                            if !mapped.is_empty() {
+                                mapped.push((source.saturating_sub(1), preview.saturating_sub(1)));
+                            }
+                        }
+                    }
+                    drop(mapped);
+                    if crate::paged::active(self.edit) {
+                        self.preview_scroll.set(None);
+                        self.preview_anchor.set(None);
+                        if let Some(anchor) = self.scroll_anchor(self.edit) {
+                            self.restore_anchor(self.preview, anchor);
+                        }
+                    } else if let Some(anchor) = self.preview_anchor.take() {
+                        self.preview_scroll.set(None);
+                        self.restore_anchor(self.edit, anchor);
+                        self.restore_anchor(self.preview, anchor);
+                    } else if let Some(progress) = self.preview_scroll.take() {
+                        let range = scroll::info(self.preview, true);
+                        scroll::set_position(
+                            self.preview,
+                            true,
+                            (progress * scroll::limit(&range) as f64).round() as i32,
+                        );
+                    } else if self.preview_only {
                         SendMessageW(
                             self.preview,
                             WM_USER + 222,
@@ -1539,8 +1892,10 @@ impl App {
                     } else {
                         self.sync_scroll(self.edit);
                     }
-                    SendMessageW(self.preview, WM_SETREDRAW, 1, 0);
                     theme::invalidate(self.preview);
+                    if crate::paged::active(self.edit) {
+                        UpdateWindow(self.preview);
+                    }
                     if let Err(e) = rendered {
                         self.status(&e);
                     }
@@ -1555,6 +1910,7 @@ impl App {
         if self.preview_pending.replace(false) {
             self.refresh_preview();
         }
+        crate::paged::preview_ready(self.edit);
     }
     fn is_markdown(&self) -> bool {
         self.loading.is_none()
@@ -1674,6 +2030,14 @@ impl App {
                     (SAVE, "Save", "Ctrl+S", "save"),
                     (SAVE_AS, "Save as", "Ctrl+Shift+S", "save copy"),
                 ]);
+                if self.chunk.is_some() {
+                    items.push((
+                        OVERVIEW,
+                        "Browse full file",
+                        "",
+                        "large file region navigation",
+                    ));
+                }
                 if self.is_markdown() {
                     items.extend([
                         (
@@ -1876,11 +2240,13 @@ impl App {
                 self.save(true);
             }
             EDITOR => {
-                self.preview_only = false;
                 if let (Some(view), Some(path)) = (&self.large, &self.large_path) {
                     let offset = view.offset();
                     self.begin_load(path.clone(), Some(offset));
+                } else if self.preview_only && self.is_markdown() {
+                    self.set_reading(false);
                 } else {
+                    self.preview_only = false;
                     self.show_editor();
                 }
             }
@@ -1903,32 +2269,7 @@ impl App {
             PREVIEW if self.comparison.is_some() => {
                 self.status("Review external changes first");
             }
-            PREVIEW => {
-                if self.preview.is_null() {
-                    self.preview = rich_edit(self.hwnd, true, self.font);
-                    SendMessageW(self.preview, WM_USER + 225, self.text_zoom as usize, 100);
-                }
-                self.preview_only = !self.preview_only;
-                scroll::pair(
-                    self.edit,
-                    if self.preview_only {
-                        null_mut()
-                    } else {
-                        self.preview
-                    },
-                );
-                scroll::pair(
-                    self.preview,
-                    if self.preview_only {
-                        null_mut()
-                    } else {
-                        self.edit
-                    },
-                );
-                self.show_editor();
-                self.refresh_preview();
-                self.focus_content();
-            }
+            PREVIEW => self.set_reading(!self.preview_only),
             EXPORT => {
                 if self.pdf_path.is_some() || self.image.is_some() {
                     self.status("Open Markdown to export. Use Ctrl+P to print this file.");
@@ -1947,6 +2288,18 @@ impl App {
                     self.status("Exporting…");
                     let source = text(self.edit);
                     let chunk = self.chunk.clone();
+                    let dynamic = if crate::paged::active(self.edit) {
+                        match crate::paged::snapshot(self.edit) {
+                            Ok(doc) => Some(doc),
+                            Err(e) => {
+                                self.exporting = false;
+                                error(self.hwnd, &e);
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let base = self
                         .path
                         .as_deref()
@@ -1955,7 +2308,9 @@ impl App {
                     let output = self.export_result.clone();
                     let hwnd = self.hwnd as usize;
                     std::thread::spawn(move || {
-                        let result = if let Some(chunk) = chunk {
+                        let result = if let Some(doc) = dynamic {
+                            export_sections(doc.sections(), &path, base.as_deref())
+                        } else if let Some(chunk) = chunk {
                             export_chunk_document(&chunk, &source, &path, base.as_deref())
                         } else {
                             export_complete(&source, &path, base.as_deref())
@@ -2001,11 +2356,16 @@ impl App {
                 }
             }
             CHANGE => {
+                if self.gutter_width != self.measured_gutter() {
+                    self.layout();
+                }
+                self.refresh_status();
+                theme::invalidate(self.hwnd);
                 self.preview_version
                     .set(self.preview_version.get().wrapping_add(1));
                 self.title();
                 self.highlighter.clear();
-                SetTimer(self.hwnd, 9, 120, None);
+                crate::syntax::schedule(self.hwnd);
                 if !self.preview.is_null() && self.pdf_path.is_none() && self.image.is_none() {
                     if self.comparison.is_some() || GetWindowTextLengthW(self.edit) <= 512 * 1024 {
                         SetTimer(self.hwnd, 1, 350, None);
@@ -2074,7 +2434,7 @@ impl App {
                 );
                 theme::editor_colors(self.edit);
                 self.highlighter.clear();
-                SetTimer(self.hwnd, 9, 80, None);
+                crate::syntax::schedule(self.hwnd);
                 self.status(if self.monospace {
                     "Consolas"
                 } else {
@@ -2082,16 +2442,11 @@ impl App {
                 });
             }
             TEXT_LARGER | TEXT_SMALLER | TEXT_RESET => {
-                self.text_zoom = if id == TEXT_RESET {
+                self.set_text_zoom(if id == TEXT_RESET {
                     100
                 } else {
-                    (self.text_zoom + if id == TEXT_LARGER { 10 } else { -10 }).clamp(70, 200)
-                };
-                SendMessageW(self.edit, WM_USER + 225, self.text_zoom as usize, 100);
-                if !self.preview.is_null() {
-                    SendMessageW(self.preview, WM_USER + 225, self.text_zoom as usize, 100);
-                }
-                self.status(&format!("{}%", self.text_zoom));
+                    self.text_zoom + if id == TEXT_LARGER { 10 } else { -10 }
+                });
             }
             FIT_PAGE => {
                 if self.pdf_path.is_some() {
@@ -2109,12 +2464,111 @@ impl App {
             _ => (),
         }
     }
+    unsafe fn set_text_zoom(&mut self, value: i32) {
+        self.text_zoom = value.clamp(70, 200);
+        for edit in [self.edit, self.preview] {
+            if !edit.is_null() {
+                SendMessageW(edit, WM_USER + 225, self.text_zoom as usize, 100);
+                scroll::measure(edit);
+                theme::invalidate(edit);
+            }
+        }
+        theme::invalidate(self.hwnd);
+        self.status(&format!("{}%", self.text_zoom));
+    }
+    unsafe fn paint_line_numbers(&self, dc: HDC) {
+        use windows::Win32::UI::Controls::RichEdit::{
+            tomAllowOffClient, tomClientCoord, tomConstants, tomMove, tomParagraph, tomStart,
+        };
+        if GetWindowLongPtrW(self.edit, GWL_STYLE) as u32 & WS_VISIBLE == 0 {
+            return;
+        }
+        let Some(doc) = crate::syntax::document(self.edit) else {
+            return;
+        };
+        let first = SendMessageW(self.edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+        let start = SendMessageW(self.edit, EM_LINEINDEX, first as usize, 0) as i32;
+        let Ok(range) = doc.Range(start, start) else {
+            return;
+        };
+        let _ = range.StartOf(tomParagraph.0, tomMove.0);
+        let mut origin = POINT { x: 0, y: 0 };
+        MapWindowPoints(self.edit, self.hwnd, &mut origin, 1);
+        let height = theme::client(self.edit).bottom;
+        let mut number_metrics: TEXTMETRICW = zeroed();
+        let old = SelectObject(dc, self.fonts.ui);
+        GetTextMetricsW(dc, &mut number_metrics);
+        SelectObject(dc, old);
+        let clip = SaveDC(dc);
+        IntersectClipRect(
+            dc,
+            origin.x - self.gutter_width.max(theme::px(self.hwnd, 56)),
+            origin.y,
+            origin.x,
+            origin.y + height,
+        );
+        let end = range.GetStoryLength().unwrap_or(1).saturating_sub(1);
+        let mut previous = -1;
+        let line_offset = crate::paged::line_offset(self.edit);
+        while let Ok(cp) = range.GetStart() {
+            if cp <= previous || cp > end {
+                break;
+            }
+            previous = cp;
+            let mut pos: POINT = zeroed();
+            SendMessageW(
+                self.edit,
+                EM_POSFROMCHAR,
+                &mut pos as *mut _ as usize,
+                cp as isize,
+            );
+            if pos.y >= height {
+                break;
+            }
+            let (mut x, mut baseline) = (0, 0);
+            if range
+                .GetPoint(
+                    tomConstants(
+                        tomStart.0 | tomClientCoord.0 | tomAllowOffClient.0 | TA_BASELINE as i32,
+                    ),
+                    &mut x,
+                    &mut baseline,
+                )
+                .is_err()
+            {
+                break;
+            }
+            let top = origin.y + baseline - number_metrics.tmAscent;
+            if top + number_metrics.tmHeight > origin.y {
+                if let Ok(line) = range.GetIndex(tomParagraph.0) {
+                    theme::label(
+                        dc,
+                        &(line as u64 + line_offset).to_string(),
+                        RECT {
+                            left: origin.x - self.gutter_width.max(theme::px(self.hwnd, 56)),
+                            right: origin.x - theme::px(self.hwnd, 4),
+                            top,
+                            bottom: top + number_metrics.tmHeight,
+                        },
+                        self.fonts.ui,
+                        theme::MUTED,
+                        DT_RIGHT | DT_SINGLELINE,
+                    );
+                }
+            }
+            if range.Move(tomParagraph.0, 1).unwrap_or(0) == 0 {
+                break;
+            }
+        }
+        RestoreDC(dc, clip);
+    }
     unsafe fn paint(&mut self, target: HDC, dirty: &RECT) {
         use theme::*;
         let rc = client(self.hwnd);
         let d = |v| theme::px(self.hwnd, v);
         let dc = target;
         fill(dc, *dirty, CANVAS);
+        self.paint_line_numbers(dc);
         fill(
             dc,
             RECT {
@@ -2253,7 +2707,7 @@ impl App {
     }
 }
 
-unsafe fn rich_edit(parent: HWND, readonly: bool, font: HFONT) -> HWND {
+pub(crate) unsafe fn rich_edit(parent: HWND, readonly: bool, font: HFONT) -> HWND {
     let control = CreateWindowExW(
         0,
         wide("RICHEDIT50W").as_ptr(),
@@ -2279,9 +2733,9 @@ unsafe fn rich_edit(parent: HWND, readonly: bool, font: HFONT) -> HWND {
         return control;
     }
     if !readonly {
-        SendMessageW(control, EM_SETTEXTMODE, 2, 0); // Rich text colours; files remain plain text.
-        crate::syntax::attach(control);
+        SendMessageW(control, EM_SETTEXTMODE, 2, 0);
     }
+    crate::syntax::attach(control);
     SendMessageW(
         control,
         EM_EXLIMITTEXT,
@@ -2351,12 +2805,69 @@ pub(crate) unsafe fn set_rtf(hwnd: HWND, rtf: &str) -> Result<(), String> {
         error: 0,
         callback: Some(stream_read),
     };
+    let (mut zoom, mut denominator) = (0i32, 0i32);
+    SendMessageW(
+        hwnd,
+        WM_USER + 224,
+        &mut zoom as *mut _ as usize,
+        &mut denominator as *mut _ as isize,
+    );
     SendMessageW(hwnd, EM_STREAMIN, 2, &mut stream as *mut _ as isize);
+    SendMessageW(hwnd, WM_USER + 225, zoom as usize, denominator as isize);
     if stream.error != 0 {
         Err("Markdown rendering failed".into())
     } else {
+        if rtf.contains(r"\u-8192?") {
+            render_math(hwnd).map_err(|e| format!("Math rendering failed: {e}"))?;
+        }
         Ok(())
     }
+}
+
+unsafe fn render_math(hwnd: HWND) -> windows_core::Result<()> {
+    use windows::Win32::UI::Controls::RichEdit::ITextRange2;
+    use windows_core::Interface;
+    let Some(doc) = crate::syntax::document(hwnd) else {
+        return Ok(());
+    };
+    let readonly = GetWindowLongW(hwnd, GWL_STYLE) as u32 & ES_READONLY as u32 != 0;
+    let mask = SendMessageW(hwnd, EM_SETEVENTMASK, 0, 0);
+    let modified = SendMessageW(hwnd, EM_GETMODIFY, 0, 0);
+    SendMessageW(hwnd, EM_SETREADONLY, 0, 0);
+    let result = (|| -> windows_core::Result<()> {
+        let raw = doc.Range(0, i32::MAX)?.GetText()?.to_string();
+        let mut spans = Vec::new();
+        let (mut cp, mut begin) = (0i32, None);
+        for (byte, ch) in raw.char_indices() {
+            if ch == '\u{e000}' {
+                begin = Some((cp, byte + ch.len_utf8()));
+            }
+            if ch == '\u{e001}' {
+                if let Some((first, from)) = begin.take() {
+                    spans.push((first, cp + 1, raw[from..byte].to_owned()));
+                }
+            }
+            cp += ch.len_utf16() as i32;
+        }
+        for (first, last, formula) in spans.into_iter().rev() {
+            let formula = formula.replace(['\r', '\u{b}'], " ");
+            let formula = formula.trim();
+            let range: ITextRange2 = doc.Range(first, last)?.cast()?;
+            // Native TeX conversion: https://devblogs.microsoft.com/math-in-office/setting-and-getting-text-in-various-formats/
+            if formula.len() > 8192
+                || range
+                    .SetText2(0x00200000, &windows_core::BSTR::from(formula))
+                    .is_err()
+            {
+                range.SetText(&windows_core::BSTR::from(formula))?;
+            }
+        }
+        Ok(())
+    })();
+    SendMessageW(hwnd, EM_SETREADONLY, readonly as usize, 0);
+    SendMessageW(hwnd, EM_SETMODIFY, modified as usize, 0);
+    SendMessageW(hwnd, EM_SETEVENTMASK, 0, mask);
+    result
 }
 
 unsafe fn dialog(hwnd: HWND, save: bool, pdf: bool) -> Option<PathBuf> {
@@ -2962,6 +3473,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
         let Ok(mut slot) = slot.try_borrow_mut() else {
             let timer = match msg {
                 EXPORTED => 4,
+                PREVIEW_READY => 14,
                 DISPATCH if wp == LAYOUT => 5,
                 _ => 0,
             };
@@ -3134,6 +3646,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     app.command(wp);
                 }
             }
+            PREVIEW_READY => {
+                let current = app
+                    .preview_job
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(version, _)| *version == wp as u64);
+                if current {
+                    KillTimer(hwnd, 14);
+                    app.preview_tick();
+                }
+            }
             EXPORTED => {
                 app.exporting = false;
                 let result = app.export_result.lock().unwrap().take();
@@ -3183,6 +3706,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     }
                     1 => app.refresh_preview(),
                     9 => {
+                        crate::syntax::scheduled(hwnd);
                         if app.loading.is_none()
                             && app.saving.is_none()
                             && app.pdf_path.is_none()
@@ -3225,10 +3749,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     app.open(path);
                 }
             }
+            scroll::ZOOM => {
+                if lp as HWND == app.edit || (!app.preview.is_null() && lp as HWND == app.preview) {
+                    app.zoom_wheel += wp as i32;
+                    let steps = app.zoom_wheel / 120;
+                    app.zoom_wheel %= 120;
+                    if steps != 0 {
+                        app.set_text_zoom(app.text_zoom + steps * 10);
+                    }
+                }
+            }
+            crate::paged::WINDOW_CHANGED => {
+                if crate::paged::active(app.edit) {
+                    app.preview_anchors.borrow_mut().clear();
+                    app.preview_anchor.set(None);
+                    app.refresh_preview();
+                    app.highlighter.clear();
+                    app.refresh_status();
+                    theme::invalidate(hwnd);
+                    crate::syntax::schedule(hwnd);
+                }
+            }
             scroll::SYNC => {
                 // Only a user-driven source owns the paired scroll; programmatic updates do not echo.
                 app.sync_scroll(wp as HWND);
-                SetTimer(hwnd, 9, 80, None);
+                if wp as HWND == app.preview && scroll::drag_owner().is_null() {
+                    crate::paged::settle(app.edit);
+                }
+                app.refresh_status();
+                theme::invalidate(hwnd);
+                crate::syntax::schedule(hwnd);
             }
             _ => return false,
         }
@@ -3427,6 +3977,9 @@ pub fn run() {
                 preview_job: RefCell::new(None),
                 preview_version: Cell::new(0),
                 preview_pending: Cell::new(false),
+                preview_scroll: Cell::new(None),
+                preview_anchors: RefCell::new(Vec::new()),
+                preview_anchor: Cell::new(None),
                 status,
                 commands_button,
                 status_message: RefCell::new(String::new()),
@@ -3438,6 +3991,7 @@ pub fn run() {
                 terminal_preferred_width: 0,
                 terminal_drag: None,
                 font,
+                gutter_width: 0,
                 path: None,
                 encoding: Encoding::Utf8,
                 crlf: true,
@@ -3456,6 +4010,7 @@ pub fn run() {
                 palette,
                 monospace: false,
                 text_zoom: 100,
+                zoom_wheel: 0,
                 printing: None,
                 exporting: false,
                 export_result: Arc::new(Mutex::new(None)),
@@ -3864,47 +4419,75 @@ fn native_selection_overlay_preserves_document() {
     unsafe {
         let library = LoadLibraryW(wide("Msftedit.dll").as_ptr());
         let fonts = theme::Fonts::new();
-        let edit = rich_edit(null_mut(), false, fonts.code);
-        MoveWindow(edit, 0, 0, 600, 400, 0);
-        let rect = RECT {
-            left: 16,
-            top: 16,
-            right: 560,
-            bottom: 380,
-        };
-        SendMessageW(edit, EM_SETRECT, 0, &rect as *const _ as isize);
-        theme::editor_colors(edit);
-        theme::dark_scrollbars(edit, theme::CANVAS);
-        ShowWindow(edit, SW_SHOW);
-        SetFocus(edit);
-        SetWindowTextW(edit, wide("Selection 中文 123\r\nSecond line").as_ptr());
-        SendMessageW(edit, EM_EMPTYUNDOBUFFER, 0, 0);
-        SendMessageW(edit, EM_SETMODIFY, 0, 0);
-        SendMessageW(edit, EM_SETSEL, 0, 8);
-        let before = text(edit);
-        let screen = GetDC(edit);
-        let mut image = theme::Buffer::default();
-        let mut tint = theme::Buffer::default();
-        assert!(image.ensure(screen, 600, 400));
-        theme::fill(image.dc, rect, theme::CANVAS);
-        SendMessageW(edit, WM_PRINTCLIENT, image.dc as usize, PRF_CLIENT as isize);
-        crate::selection::paint(edit, image.dc, &mut tint);
-        let mut pos: POINT = zeroed();
-        SendMessageW(edit, EM_POSFROMCHAR, &mut pos as *mut _ as usize, 1);
-        assert_ne!(GetPixel(image.dc, pos.x, pos.y + 4), theme::CANVAS);
-        assert_eq!(text(edit), before);
-        assert_eq!(SendMessageW(edit, EM_GETMODIFY, 0, 0), 0);
-        assert_eq!(SendMessageW(edit, EM_CANUNDO, 0, 0), 0);
-        let (mut a, mut b) = (0u32, 0u32);
-        SendMessageW(
-            edit,
-            EM_GETSEL,
-            &mut a as *mut _ as usize,
-            &mut b as *mut _ as isize,
-        );
-        assert_eq!((a, b), (0, 8));
-        ReleaseDC(edit, screen);
-        DestroyWindow(edit);
+        for readonly in [false, true] {
+            let edit = rich_edit(null_mut(), readonly, fonts.code);
+            MoveWindow(edit, 0, 0, 600, 400, 0);
+            let rect = RECT {
+                left: 16,
+                top: 16,
+                right: 560,
+                bottom: 380,
+            };
+            SendMessageW(edit, EM_SETRECT, 0, &rect as *const _ as isize);
+            theme::editor_colors(edit);
+            theme::dark_scrollbars(edit, theme::CANVAS);
+            ShowWindow(edit, SW_SHOW);
+            SetFocus(edit);
+            if readonly {
+                set_rtf(
+                    edit,
+                    &crate::markdown::preview("Selection 中文 123\n\n**Second line**", 8000),
+                )
+                .unwrap();
+            } else {
+                SetWindowTextW(edit, wide("Selection 中文 123\r\nSecond line").as_ptr());
+            }
+            SendMessageW(edit, EM_EMPTYUNDOBUFFER, 0, 0);
+            SendMessageW(edit, EM_SETMODIFY, 0, 0);
+            SendMessageW(edit, EM_SETSEL, 0, 0);
+            let before = text(edit);
+            let screen = GetDC(edit);
+            let mut image = theme::Buffer::default();
+            let mut tint = theme::Buffer::default();
+            assert!(image.ensure(screen, 600, 400));
+            theme::fill(image.dc, rect, theme::CANVAS);
+            SendMessageW(edit, WM_PRINTCLIENT, image.dc as usize, PRF_CLIENT as isize);
+            let mut plain = Vec::new();
+            for y in 16..60 {
+                for x in 16..180 {
+                    plain.push(GetPixel(image.dc, x, y));
+                }
+            }
+            SendMessageW(edit, EM_SETSEL, 0, 8);
+            SendMessageW(edit, WM_PRINTCLIENT, image.dc as usize, PRF_CLIENT as isize);
+            let mut selected = Vec::new();
+            for y in 16..60 {
+                for x in 16..180 {
+                    selected.push(GetPixel(image.dc, x, y));
+                }
+            }
+            assert_eq!(
+                selected, plain,
+                "Native selection must not show beneath the custom overlay, readonly={readonly}"
+            );
+            crate::selection::paint(edit, image.dc, &mut tint);
+            let mut pos: POINT = zeroed();
+            SendMessageW(edit, EM_POSFROMCHAR, &mut pos as *mut _ as usize, 1);
+            assert_ne!(GetPixel(image.dc, pos.x, pos.y + 4), theme::CANVAS);
+            assert_eq!(text(edit), before);
+            assert_eq!(SendMessageW(edit, EM_GETMODIFY, 0, 0), 0);
+            assert_eq!(SendMessageW(edit, EM_CANUNDO, 0, 0), 0);
+            let (mut a, mut b) = (0u32, 0u32);
+            SendMessageW(
+                edit,
+                EM_GETSEL,
+                &mut a as *mut _ as usize,
+                &mut b as *mut _ as isize,
+            );
+            assert_eq!((a, b), (0, 8));
+            ReleaseDC(edit, screen);
+            DestroyWindow(edit);
+        }
         FreeLibrary(library);
     }
 }
@@ -4036,6 +4619,36 @@ fn native_block_caret_tracks_input_and_font() {
         assert_eq!(GetCaretBlinkTime(), blink_time);
         ReleaseDC(edit, dc);
         DestroyWindow(edit);
+        let preview = rich_edit(null_mut(), true, fonts.code);
+        MoveWindow(preview, 0, 0, 600, 400, 0);
+        SendMessageW(preview, EM_SETRECT, 0, &rect as *const _ as isize);
+        ShowWindow(preview, SW_SHOW);
+        SetFocus(preview);
+        SetWindowTextW(preview, wide("W中文 preview").as_ptr());
+        SendMessageW(preview, EM_SETMODIFY, 0, 0);
+        SendMessageW(preview, EM_SETSEL, 0, 0);
+        let mut caret: GUITHREADINFO = zeroed();
+        caret.cbSize = size_of::<GUITHREADINFO>() as u32;
+        GetGUIThreadInfo(GetWindowThreadProcessId(preview, null_mut()), &mut caret);
+        let (mut a, mut b): (POINT, POINT) = (zeroed(), zeroed());
+        SendMessageW(preview, EM_POSFROMCHAR, &mut a as *mut _ as usize, 0);
+        SendMessageW(preview, EM_POSFROMCHAR, &mut b as *mut _ as usize, 1);
+        assert_eq!(caret.hwndCaret, preview);
+        assert_eq!(
+            caret.rcCaret.right - caret.rcCaret.left,
+            b.x - a.x,
+            "Read-only preview uses the same block caret"
+        );
+        SendMessageW(preview, WM_CHAR, 'x' as usize, 0);
+        SendMessageW(preview, WM_KEYDOWN, VK_DELETE as usize, 0);
+        SendMessageW(preview, WM_PASTE, 0, 0);
+        assert_eq!(
+            text(preview),
+            "W中文 preview",
+            "Matching visuals must not enable editing"
+        );
+        assert_eq!(SendMessageW(preview, EM_GETMODIFY, 0, 0), 0);
+        DestroyWindow(preview);
         DeleteObject(large_font);
         FreeLibrary(library);
     }
@@ -4121,7 +4734,44 @@ fn native_highlighting_preserves_text_selection_scroll_and_undo() {
         }
         SetWindowTextW(edit, wide(&"name,city,note\r\n".repeat(4000)).as_ptr());
         SendMessageW(edit, EM_SETSEL, 0, 0);
+        doc.Range(0, 32000)
+            .unwrap()
+            .GetFont()
+            .unwrap()
+            .SetForeColor(theme::INK as i32)
+            .unwrap();
+        let started = std::time::Instant::now();
         h.update(edit, Some(Path::new("dense.csv")));
+        eprintln!("Dense CSV viewport highlighting: {:?}", started.elapsed());
+        assert_eq!(
+            doc.Range(14000, 14004)
+                .unwrap()
+                .GetFont()
+                .unwrap()
+                .GetForeColor()
+                .unwrap(),
+            theme::INK as i32,
+            "Highlighting must not spend native format calls far outside the viewport"
+        );
+        // Repeated requests must preserve the first deadline, not debounce forever.
+        let mut timer: MSG = zeroed();
+        let mut delivered = false;
+        for _ in 0..20 {
+            crate::syntax::schedule(edit);
+            if PeekMessageW(&mut timer, edit, WM_TIMER, WM_TIMER, PM_REMOVE) != 0 {
+                delivered = timer.wParam == 9;
+                if delivered {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        KillTimer(edit, 9);
+        crate::syntax::scheduled(edit);
+        assert!(
+            delivered,
+            "Continuous requests must not starve highlighting"
+        );
         assert_eq!(
             doc.Range(0, 4)
                 .unwrap()
@@ -4131,6 +4781,23 @@ fn native_highlighting_preserves_text_selection_scroll_and_undo() {
                 .unwrap(),
             theme::ACCENT as i32,
             "Dense CSV must retain visible field colours"
+        );
+        ShowWindow(edit, SW_SHOWNOACTIVATE);
+        SendMessageW(edit, EM_GETLINECOUNT, 0, 0);
+        doc.Range(3000, 3000).unwrap().ScrollIntoView(0).unwrap();
+        let line = SendMessageW(edit, EM_GETFIRSTVISIBLELINE, 0, 0);
+        let first = SendMessageW(edit, EM_LINEINDEX, line as usize, 0) as i32;
+        assert!(first > 512, "first={first}, line={line}");
+        h.update(edit, Some(Path::new("dense.csv")));
+        assert_eq!(
+            doc.Range(first, first + 4)
+                .unwrap()
+                .GetFont()
+                .unwrap()
+                .GetForeColor()
+                .unwrap(),
+            theme::ACCENT as i32,
+            "Scrolling must colour newly visible text even inside the cached lexer window"
         );
         // A viewport update on a long source must neither move the caret nor scroll.
         SetWindowTextW(
@@ -4411,6 +5078,15 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
         );
         let fonts = theme::Fonts::new();
         let font = fonts.body;
+        let width = number_gutter(hwnd, fonts.ui, 9_999_999_999);
+        let dc = GetDC(hwnd);
+        let old = SelectObject(dc, fonts.ui);
+        let mut extent: SIZE = zeroed();
+        GetTextExtentPoint32W(dc, wide("9999999999").as_ptr(), 10, &mut extent);
+        SelectObject(dc, old);
+        ReleaseDC(hwnd, dc);
+        assert!(width >= extent.cx + theme::px(hwnd, 16));
+        assert!(width > number_gutter(hwnd, fonts.ui, 999));
         let edit = rich_edit(hwnd, false, font);
         let status = null_mut();
         let commands_button = null_mut();
@@ -4439,6 +5115,9 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
             preview_job: RefCell::new(None),
             preview_version: Cell::new(0),
             preview_pending: Cell::new(false),
+            preview_scroll: Cell::new(None),
+            preview_anchors: RefCell::new(Vec::new()),
+            preview_anchor: Cell::new(None),
             status,
             commands_button,
             status_message: RefCell::new(String::new()),
@@ -4450,6 +5129,7 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
             terminal_preferred_width: 0,
             terminal_drag: None,
             font,
+            gutter_width: 0,
             path: None,
             encoding: Encoding::Utf8,
             crlf: true,
@@ -4468,6 +5148,7 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
             palette,
             monospace: false,
             text_zoom: 100,
+            zoom_wheel: 0,
             printing: None,
             exporting: false,
             export_result: Arc::new(Mutex::new(None)),
@@ -4475,6 +5156,351 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
             chunk: None,
             saving: None,
         };
+        let end_path =
+            std::env::temp_dir().join(format!("plumetxt-end-save-{}.txt", std::process::id()));
+        let full_text = format!("{}TRUE_FILE_END", "A representative paragraph in a large editable text document, with enough text to wrap normally.\n".repeat(100_000));
+        assert!(full_text.len() > 8 * 1024 * 1024);
+        std::fs::write(&end_path, &full_text).unwrap();
+        for reopening in [false, true] {
+            app.open(end_path.clone());
+            let started = std::time::Instant::now();
+            while app.loading.is_some() {
+                assert!(started.elapsed().as_secs() < 60);
+                app.load_tick();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                app.chunk.is_none(),
+                "Files within the editing limit must load completely"
+            );
+            let expected_end = if reopening {
+                "TRUE_FILE_END SAVED_AT_END"
+            } else {
+                "TRUE_FILE_END"
+            };
+            assert!(
+                text(edit).ends_with(expected_end),
+                "Opening must include the real file end"
+            );
+            if !reopening {
+                SendMessageW(edit, EM_SETSEL, usize::MAX, -1);
+                SendMessageW(
+                    edit,
+                    EM_REPLACESEL,
+                    1,
+                    wide(" SAVED_AT_END").as_ptr() as isize,
+                );
+                assert!(app.save(false));
+                assert_eq!(
+                    std::fs::read(&end_path).unwrap(),
+                    format!("{full_text} SAVED_AT_END").as_bytes()
+                );
+                app.watch = None;
+                app.path = None;
+                SetWindowTextW(edit, wide("").as_ptr());
+            }
+        }
+        app.watch = None;
+        app.path = None;
+        std::fs::remove_file(&end_path).unwrap();
+        {
+            let mut file = std::fs::File::create(&end_path).unwrap();
+            let block = "Large file line.\n".repeat(65536);
+            for _ in 0..33 {
+                std::io::Write::write_all(&mut file, block.as_bytes()).unwrap();
+            }
+            std::io::Write::write_all(&mut file, b"TRUE_LARGE_END").unwrap();
+        }
+        assert!(std::fs::metadata(&end_path).unwrap().len() > document::MAX_TEXT_BYTES);
+        for reopening in [false, true] {
+            app.open(end_path.clone());
+            let started = std::time::Instant::now();
+            while app.loading.is_some() {
+                assert!(started.elapsed().as_secs() < 30);
+                app.load_tick();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.large.is_none() && crate::paged::active(edit));
+            assert!(
+                app.gutter_width > theme::px(hwnd, 56),
+                "Millions of lines need a wider gutter"
+            );
+            assert!(GetWindowTextLengthW(edit) < 100_000);
+            assert!(crate::paged::scroll_to(edit, 1_000_000));
+            assert!(text(edit).ends_with(if reopening {
+                "TRUE_LARGE_END SAVED_AT_END"
+            } else {
+                "TRUE_LARGE_END"
+            }));
+            if !reopening {
+                SendMessageW(edit, EM_SETSEL, usize::MAX, -1);
+                SendMessageW(
+                    edit,
+                    EM_REPLACESEL,
+                    1,
+                    wide(" SAVED_AT_END").as_ptr() as isize,
+                );
+                assert!(!app.save(false));
+                while app.saving.is_some() {
+                    assert!(started.elapsed().as_secs() < 30);
+                    app.save_tick();
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let mut file = std::fs::File::open(&end_path).unwrap();
+                let expected = b"TRUE_LARGE_END SAVED_AT_END";
+                std::io::Seek::seek(&mut file, std::io::SeekFrom::End(-(expected.len() as i64)))
+                    .unwrap();
+                let mut tail = vec![0; expected.len()];
+                std::io::Read::read_exact(&mut file, &mut tail).unwrap();
+                assert_eq!(tail, expected);
+            }
+        }
+        app.path = Some(end_path.with_extension("md"));
+        app.set_reading(true);
+        let preview_started = std::time::Instant::now();
+        let expected_ready = app.preview_job.borrow().as_ref().unwrap().0;
+        loop {
+            let mut ready: MSG = zeroed();
+            if PeekMessageW(&mut ready, hwnd, PREVIEW_READY, PREVIEW_READY, PM_REMOVE) != 0
+                && ready.wParam as u64 == expected_ready
+            {
+                break;
+            }
+            assert!(
+                preview_started.elapsed().as_secs() < 10,
+                "Preview completion must notify the UI without timer polling"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        while app.preview_job.borrow().is_some() || app.preview_pending.get() {
+            assert!(preview_started.elapsed().as_secs() < 10);
+            app.preview_tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(text(app.preview).contains("TRUE_LARGE_END SAVED_AT_END"));
+        unsafe extern "system" fn visibility_probe(
+            view: HWND,
+            msg: u32,
+            wp: usize,
+            lp: isize,
+            _: usize,
+            data: usize,
+        ) -> isize {
+            let result = DefSubclassProc(view, msg, wp, lp);
+            let probe = &mut *(data as *mut (usize, bool));
+            let visible = GetWindowLongPtrW(view, GWL_STYLE) as u32 & WS_VISIBLE != 0;
+            if visible != probe.1 {
+                probe.0 += 1;
+            }
+            result
+        }
+        let mut source_visibility = (0usize, false);
+        let mut preview_visibility = (0usize, true);
+        SetWindowSubclass(
+            edit,
+            Some(visibility_probe),
+            9199,
+            &mut source_visibility as *mut _ as usize,
+        );
+        SetWindowSubclass(
+            app.preview,
+            Some(visibility_probe),
+            9199,
+            &mut preview_visibility as *mut _ as usize,
+        );
+        assert!(crate::paged::scroll_to(app.preview, 0));
+        app.refresh_preview();
+        for pos in [250_000, 500_000, 750_000, 1_000_000] {
+            assert!(crate::paged::scroll_to(app.preview, pos));
+        }
+        while app.preview_job.borrow().is_some() {
+            assert!(preview_started.elapsed().as_secs() < 10);
+            app.preview_tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !text(app.preview).contains("TRUE_LARGE_END"),
+            "An intermediate frame must render during a drag"
+        );
+        assert_eq!(
+            GetWindowLongPtrW(edit, GWL_STYLE) as u32 & WS_VISIBLE,
+            0,
+            "Paging a preview must not reveal its hidden source editor"
+        );
+        app.refresh_preview();
+        while app.preview_job.borrow().is_some() {
+            assert!(preview_started.elapsed().as_secs() < 10);
+            app.preview_tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            text(app.preview).contains("TRUE_LARGE_END SAVED_AT_END"),
+            "The last drag target must be displayed"
+        );
+        RemoveWindowSubclass(edit, Some(visibility_probe), 9199);
+        RemoveWindowSubclass(app.preview, Some(visibility_probe), 9199);
+        assert_eq!(
+            source_visibility.0, 0,
+            "Source must remain hidden throughout every native message, not just after paging"
+        );
+        assert_eq!(
+            preview_visibility.0, 0,
+            "Preview must remain visible while its new frame is prepared"
+        );
+        let source_offset = crate::paged::line_offset(edit);
+        app.set_reading(false);
+        assert_eq!(crate::paged::line_offset(edit), source_offset);
+        assert!(text(edit).ends_with("TRUE_LARGE_END SAVED_AT_END"));
+        assert!(crate::paged::scroll_to(app.preview, 0));
+        assert_eq!(crate::paged::line_offset(edit), 0);
+        app.chunk = None;
+        app.path = None;
+        std::fs::remove_file(end_path).unwrap();
+        let save_path =
+            std::env::temp_dir().join(format!("plumetxt-ui-save-{}.md", std::process::id()));
+        std::fs::write(&save_path, "original\n".repeat(1_100_000)).unwrap();
+        app.browse_large(save_path.clone(), 40000);
+        let started = std::time::Instant::now();
+        while app.large.as_ref().unwrap().offset() == 0 {
+            assert!(started.elapsed().as_secs() < 10);
+            let mut message: MSG = zeroed();
+            while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let offset = app.large.as_ref().unwrap().offset();
+        app.command(EDITOR);
+        while app.loading.is_some() {
+            assert!(started.elapsed().as_secs() < 10);
+            app.load_tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !app.preview_only,
+            "Entering a Markdown region must stay in editing mode"
+        );
+        assert_eq!(app.chunk.as_ref().unwrap().start, offset);
+        assert!(
+            offset >= 40000,
+            "Edit the visible region, not the file beginning"
+        );
+        let (chunk, original) = document::Chunk::read(&save_path, 0).unwrap();
+        let expanded = format!("{original}{}", "added line\n".repeat(9000));
+        SetWindowTextW(edit, wide(&expanded).as_ptr());
+        SendMessageW(edit, EM_SETSEL, 123, 123);
+        SendMessageW(edit, EM_REPLACESEL, 1, wide("typed").as_ptr() as isize);
+        let visible = text(edit);
+        let mut expected_edit = expanded.replace("\r\n", "\n");
+        let insertion = expanded.encode_utf16().take(123).collect::<Vec<_>>();
+        let insertion = String::from_utf16_lossy(&insertion)
+            .replace("\r\n", "\n")
+            .len();
+        expected_edit.insert_str(insertion, "typed");
+        assert_eq!(
+            visible.replace("\r\n", "\n").replace('\r', "\n").len(),
+            expected_edit.len(),
+            "Reading text for save must include the entire editable region"
+        );
+        SendMessageW(edit, EM_SETSEL, 123, 123);
+        assert_ne!(SendMessageW(edit, EM_CANUNDO, 0, 0), 0);
+        scroll::set_position(edit, true, 1200);
+        let saved_scroll = scroll::info(edit, true).nPos;
+        app.path = Some(save_path.clone());
+        app.chunk = Some(chunk);
+        assert!(!app.save(false));
+        let started = std::time::Instant::now();
+        while app.saving.is_some() {
+            assert!(started.elapsed().as_secs() < 10);
+            app.save_tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            app.loading.is_none(),
+            "Saving must not reload a shortened region"
+        );
+        assert!(!app.preview_only);
+        assert_eq!(text(edit), visible);
+        let mut caret = 0u32;
+        SendMessageW(edit, EM_GETSEL, &mut caret as *mut _ as usize, 0);
+        assert_eq!(caret, 123, "Saving must retain the caret");
+        assert_eq!(
+            scroll::info(edit, true).nPos,
+            saved_scroll,
+            "Saving must retain the viewport"
+        );
+        assert_ne!(
+            SendMessageW(edit, EM_CANUNDO, 0, 0),
+            0,
+            "Saving must retain undo history"
+        );
+        assert_eq!(SendMessageW(edit, EM_GETMODIFY, 0, 0), 0);
+        let expected_bytes = document::encode(&visible, app.encoding, app.crlf);
+        let disk = std::fs::read(&save_path).unwrap();
+        assert!(
+            disk.starts_with(&expected_bytes),
+            "Every edited byte must be present on disk"
+        );
+        assert_eq!(
+            &disk[expected_bytes.len()..],
+            &"original\n".repeat(1_100_000).as_bytes()[original.len()..],
+            "Saving must preserve the unedited suffix"
+        );
+        app.chunk = None;
+        app.path = None;
+        SetWindowTextW(edit, wide("").as_ptr());
+        app.open(save_path.clone());
+        let reopened = std::time::Instant::now();
+        while app.loading.is_some() {
+            assert!(reopened.elapsed().as_secs() < 10);
+            app.load_tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            text(edit).contains("typed"),
+            "A newly opened document must retain saved edits"
+        );
+        app.watch = None;
+        app.chunk = None;
+        app.path = None;
+        if !app.preview.is_null() {
+            DestroyWindow(app.preview);
+            app.preview = null_mut();
+        }
+        app.preview_only = false;
+        app.preview_job.borrow_mut().take();
+        std::fs::remove_file(save_path).unwrap();
+        SetWindowTextW(edit, wide("").as_ptr());
+        // A collapsed terminal keeps its window dimensions (and therefore its PTY grid).
+        let panel = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            null(),
+            WS_CHILD,
+            0,
+            0,
+            800,
+            260,
+            hwnd,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        app.terminal = Some(terminal::Terminal(panel));
+        app.terminal_open = true;
+        app.layout();
+        let panel_size = theme::client(panel);
+        for _ in 0..3 {
+            app.terminal_open = false;
+            app.layout();
+            assert_eq!(theme::client(panel).right, panel_size.right);
+            assert_eq!(theme::client(panel).bottom, panel_size.bottom);
+            app.terminal_open = true;
+            app.layout();
+            assert_eq!(theme::client(panel).right, panel_size.right);
+        }
+        app.terminal.take();
         // Exercise the real divider messages and retain the chosen width across layouts.
         app.terminal_open = true;
         app.layout();
@@ -4535,6 +5561,115 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
         app.layout();
         app.preview = rich_edit(hwnd, true, font);
         MoveWindow(app.preview, 0, 0, 800, 600, 0);
+        for (value, total) in [("", 1), ("a\r\nb", 2), ("a\nb\n", 3)] {
+            SetWindowTextW(edit, wide(value).as_ptr());
+            SendMessageW(edit, EM_SETSEL, 0, 0);
+            assert_eq!(logical_lines(edit), Some((1, total)));
+            SendMessageW(edit, EM_SETSEL, usize::MAX, -1);
+            assert_eq!(logical_lines(edit), Some((total, total)));
+        }
+        SetWindowTextW(
+            edit,
+            wide(&format!("{}\r\nend", "wrapped words ".repeat(100))).as_ptr(),
+        );
+        scroll::resize(edit, 80, 20, 180, 400);
+        scroll::measure(edit);
+        assert!(SendMessageW(edit, EM_GETLINECOUNT, 0, 0) > 2);
+        assert_eq!(logical_lines(edit).unwrap().1, 2);
+        let dc = GetDC(hwnd);
+        let mut gutter = theme::Buffer::default();
+        assert!(gutter.ensure(dc, 1000, 700));
+        theme::fill(
+            gutter.dc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1000,
+                bottom: 700,
+            },
+            theme::CANVAS,
+        );
+        app.paint_line_numbers(gutter.dc);
+        assert!(
+            (24..76).any(|x| (20..100).any(|y| GetPixel(gutter.dc, x, y) != theme::CANVAS)),
+            "Logical line numbers must be painted beside the editor"
+        );
+        let mut body = theme::Buffer::default();
+        assert!(body.ensure(dc, 180, 400));
+        SetWindowTextW(edit, wide("1").as_ptr());
+        for zoom in [70, 100, 150, 200] {
+            app.set_text_zoom(zoom);
+            theme::fill(
+                gutter.dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1000,
+                    bottom: 700,
+                },
+                theme::CANVAS,
+            );
+            theme::fill(
+                body.dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 180,
+                    bottom: 400,
+                },
+                theme::CANVAS,
+            );
+            app.paint_line_numbers(gutter.dc);
+            SendMessageW(edit, WM_PRINTCLIENT, body.dc as usize, PRF_CLIENT as isize);
+            let mut pos: POINT = zeroed();
+            SendMessageW(edit, EM_POSFROMCHAR, &mut pos as *mut _ as usize, 0);
+            let number_bottom = (20..150)
+                .rev()
+                .find(|&y| (24..76).any(|x| GetPixel(gutter.dc, x, y) != theme::CANVAS))
+                .unwrap();
+            let text_bottom = (pos.y..pos.y + 70)
+                .rev()
+                .find(|&y| (pos.x..pos.x + 40).any(|x| GetPixel(body.dc, x, y) != theme::CANVAS))
+                .unwrap();
+            assert!(
+                (number_bottom - (20 + text_bottom)).abs() <= 2,
+                "Line number baseline must match text at {zoom}%: {number_bottom} vs {}",
+                20 + text_bottom
+            );
+        }
+        app.set_text_zoom(100);
+        ReleaseDC(hwnd, dc);
+        let preview = app.preview;
+        APP.with(|slot| *slot.borrow_mut() = Some(app));
+        let previous_proc = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wndproc as *const () as isize);
+        for (source, delta, expected) in [(edit, 60i16, 100), (preview, 60, 110), (edit, -120, 100)]
+        {
+            SendMessageW(
+                source,
+                WM_MOUSEWHEEL,
+                ((delta as u16 as usize) << 16) | 8,
+                0,
+            );
+            for control in [edit, preview] {
+                let (mut numerator, mut denominator) = (0i32, 0i32);
+                SendMessageW(
+                    control,
+                    WM_USER + 224,
+                    &mut numerator as *mut _ as usize,
+                    &mut denominator as *mut _ as isize,
+                );
+                assert_eq!(
+                    if denominator == 0 {
+                        100
+                    } else {
+                        numerator * 100 / denominator
+                    },
+                    expected
+                );
+            }
+        }
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous_proc);
+        let mut app = APP.with(|slot| slot.borrow_mut().take().unwrap());
         let drain = |app: &App| {
             let started = std::time::Instant::now();
             while app.preview_job.borrow().is_some() {
@@ -4543,6 +5678,95 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         };
+        let mixed: String = (0..200).map(|n| format!("# Heading {n}\r\n\r\nParagraph {n} has **bold** text and a [link](https://example.com).\r\n\r\n```rust\r\n{}\r\n```\r\n\r\n",
+            format!("let value = {n};\r\n").repeat(n % 9 + 1))).collect();
+        SetWindowTextW(edit, wide(&mixed).as_ptr());
+        app.layout();
+        app.refresh_preview();
+        drain(&app);
+        // Drag the real preview thumb without pumping/releasing the mouse. The
+        // editor must paint along with it, and stale peer notifications cannot echo.
+        scroll::set_position(edit, true, 0);
+        scroll::set_position(app.preview, true, 0);
+        let preview = app.preview;
+        let mut preview_rect: RECT = zeroed();
+        GetWindowRect(preview, &mut preview_rect);
+        let mut bar = null_mut();
+        loop {
+            bar = FindWindowExW(
+                hwnd,
+                bar,
+                wide("PlumeTxtScroll").as_ptr(),
+                wide("Vertical scroll").as_ptr(),
+            );
+            assert!(!bar.is_null(), "Preview scrollbar missing");
+            let mut rect: RECT = zeroed();
+            GetWindowRect(bar, &mut rect);
+            if rect.left >= preview_rect.left && rect.left < preview_rect.right {
+                break;
+            }
+        }
+        APP.with(|slot| *slot.borrow_mut() = Some(app));
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wndproc as *const () as isize);
+        let y = theme::client(bar).bottom / 2;
+        SendMessageW(bar, WM_LBUTTONDOWN, 1, ((y << 16) | 10) as isize);
+        assert_eq!(scroll::drag_owner(), preview);
+        assert!(
+            scroll::info(edit, true).nPos > 0,
+            "Editor must follow before mouse release or queued messages"
+        );
+        SendMessageW(bar, WM_MOUSEMOVE, 1, (((y + 20) << 16) | 10) as isize);
+        let at = scroll::info(preview, true).nPos;
+        let editor_at = scroll::info(edit, true).nPos;
+        for _ in 0..4 {
+            SendMessageW(hwnd, scroll::SYNC, edit as usize, 0);
+            SendMessageW(bar, WM_MOUSEMOVE, 1, (((y + 20) << 16) | 10) as isize);
+            assert_eq!(
+                scroll::info(preview, true).nPos,
+                at,
+                "Held preview must not oscillate"
+            );
+            assert_eq!(
+                scroll::info(edit, true).nPos,
+                editor_at,
+                "Held editor must not oscillate"
+            );
+        }
+        SendMessageW(bar, WM_LBUTTONUP, 0, (((y + 20) << 16) | 10) as isize);
+        assert!(scroll::drag_owner().is_null());
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous_proc);
+        let mut app = APP.with(|slot| slot.borrow_mut().take().unwrap());
+        scroll::pair(edit, null_mut());
+        DestroyWindow(app.preview);
+        app.preview = null_mut();
+        app.layout();
+        for (reading, progress) in [(true, 0.6), (false, 0.75), (true, 0.3), (false, 0.45)] {
+            let source = if app.preview_only { app.preview } else { edit };
+            let range = scroll::info(source, true);
+            scroll::set_position(
+                source,
+                true,
+                (scroll::limit(&range) as f64 * progress) as i32,
+            );
+            let anchor = app.scroll_anchor(source);
+            app.command(PREVIEW);
+            drain(&app);
+            assert_eq!(app.preview_only, reading);
+            let target = if reading { app.preview } else { edit };
+            let range = scroll::info(target, true);
+            if let Some((cp, _)) = anchor {
+                assert_eq!(
+                    app.scroll_anchor(target).unwrap().0,
+                    cp,
+                    "Both views must show the same paragraph"
+                );
+            } else {
+                assert!(
+                    (range.nPos as f64 / scroll::limit(&range).max(1) as f64 - progress).abs()
+                        < 0.02
+                );
+            }
+        }
         SetWindowTextW(edit, wide("# Old\r\n\r\nSTALE_MARKER").as_ptr());
         app.refresh_preview();
         let first_version = app.preview_job.borrow().as_ref().unwrap().0;
@@ -4633,6 +5857,60 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
         app.command(PREVIEW);
         assert!(app.pdf_path.is_none());
         assert_eq!(text(edit), source);
+        for name in [
+            "lines.txt",
+            "lines.md",
+            "lines.rs",
+            "lines.py",
+            "lines.json",
+            "lines.toml",
+            "lines.csv",
+            "README",
+            "lines.custom",
+        ] {
+            let path = std::env::temp_dir().join(format!("plumetxt-{}-{name}", std::process::id()));
+            std::fs::write(&path, "first\nsecond\nthird").unwrap();
+            app.open(path.clone());
+            let started = std::time::Instant::now();
+            while app.loading.is_some() {
+                assert!(started.elapsed().as_secs() < 10);
+                app.load_tick();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if app.preview_only {
+                app.command(EDITOR);
+            }
+            drain(&app);
+            assert_eq!(logical_lines(edit), Some((1, 3)), "Line count for {name}");
+            let mut origin = POINT { x: 0, y: 0 };
+            MapWindowPoints(edit, hwnd, &mut origin, 1);
+            let dc = GetDC(hwnd);
+            let mut numbers = theme::Buffer::default();
+            assert!(numbers.ensure(dc, 1000, 700));
+            theme::fill(
+                numbers.dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1000,
+                    bottom: 700,
+                },
+                theme::CANVAS,
+            );
+            app.paint_line_numbers(numbers.dc);
+            assert!(
+                (origin.x - theme::px(hwnd, 56)..origin.x - theme::px(hwnd, 4))
+                    .any(|x| (origin.y..origin.y + 100)
+                        .any(|y| GetPixel(numbers.dc, x, y) != theme::CANVAS)),
+                "Every editable file must draw line numbers: {name}"
+            );
+            ReleaseDC(hwnd, dc);
+            app.watch = None;
+            std::fs::remove_file(path).unwrap();
+        }
+        app.path = Some(PathBuf::from("plain.txt"));
+        SetWindowTextW(edit, wide(&source).as_ptr());
+        SendMessageW(edit, EM_SETMODIFY, 0, 0);
         // Opening a project preserves a document, but a pristine empty editor becomes idle.
         let root = std::env::current_dir().unwrap().join("tmp/workspace-idle");
         std::fs::create_dir_all(&root).unwrap();
@@ -4699,5 +5977,195 @@ fn native_preview_coalesces_requests_and_rejects_stale_results() {
         assert_ne!(GetWindowLongW(edit, GWL_STYLE) as u32 & WS_VISIBLE, 0);
         drop(app);
         DestroyWindow(hwnd);
+    }
+}
+
+#[test]
+#[ignore = "Requires Windows RichEdit; renders the Markdown visual fixture"]
+fn native_markdown_visual_fixture() {
+    unsafe {
+        let _ole = crate::assets::Ole::new().unwrap();
+        LoadLibraryW(wide("Msftedit.dll").as_ptr());
+        let fonts = theme::Fonts::new();
+        let edit = rich_edit(null_mut(), true, fonts.body);
+        MoveWindow(edit, 0, 0, 800, 1900, 0);
+        theme::editor_colors(edit);
+        theme::dark_scrollbars(edit, theme::CANVAS);
+        let source = include_str!("../examples/markdown-showcase.md");
+        set_rtf(
+            edit,
+            &crate::markdown::preview(source, scroll::text_width(edit)),
+        )
+        .unwrap();
+        let screen = GetDC(edit);
+        let mut buffer = theme::Buffer::default();
+        assert!(buffer.ensure(screen, 800, 1900));
+        theme::fill(
+            buffer.dc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 800,
+                bottom: 1900,
+            },
+            theme::CANVAS,
+        );
+        SendMessageW(
+            edit,
+            WM_PRINTCLIENT,
+            buffer.dc as usize,
+            PRF_CLIENT as isize,
+        );
+        let mut pixels = vec![0u8; 800 * 1900 * 4];
+        for y in 0..1900 {
+            for x in 0..800 {
+                let c = GetPixel(buffer.dc, x, y);
+                let i = ((1899 - y) * 800 + x) as usize * 4;
+                pixels[i..i + 4].copy_from_slice(&[(c >> 16) as u8, (c >> 8) as u8, c as u8, 255]);
+            }
+        }
+        let mut bmp = vec![0u8; 54];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[2..6].copy_from_slice(&(54u32 + pixels.len() as u32).to_le_bytes());
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&800i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&1900i32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&32u16.to_le_bytes());
+        bmp.extend(pixels);
+        std::fs::create_dir_all("tmp").unwrap();
+        std::fs::write("tmp/markdown-visual.bmp", bmp).unwrap();
+        assert!(text(edit).contains("Code stays readable"));
+        assert!(!text(edit).contains("\\frac"));
+        let doc = crate::syntax::document(edit).unwrap();
+        let code = doc.Range(0, 0).unwrap();
+        code.FindText(
+            &windows_core::BSTR::from("fn main"),
+            i32::MAX,
+            windows::Win32::UI::Controls::RichEdit::tomConstants(4),
+        )
+        .unwrap();
+        let start = code.GetStart().unwrap();
+        assert_eq!(
+            doc.Range(start, start + 2)
+                .unwrap()
+                .GetFont()
+                .unwrap()
+                .GetForeColor()
+                .unwrap(),
+            theme::ACCENT as i32
+        );
+        let mut point: POINT = zeroed();
+        SendMessageW(
+            edit,
+            EM_POSFROMCHAR,
+            &mut point as *mut _ as usize,
+            start as isize,
+        );
+        let mut colored = 0;
+        for y in point.y..point.y + 24 {
+            for x in point.x..point.x + 20 {
+                let color = GetPixel(buffer.dc, x, y);
+                let (r, g, b) = (
+                    (color & 255) as i32,
+                    ((color >> 8) & 255) as i32,
+                    ((color >> 16) & 255) as i32,
+                );
+                if (r - 63).abs() < 40 && (g - 221).abs() < 40 && (b - 207).abs() < 40 {
+                    colored += 1;
+                }
+            }
+        }
+        assert!(
+            colored > 2,
+            "Code tokens must actually paint in colour, not merely store a font colour"
+        );
+        for width in [340, 800] {
+            for zoom in [100, 150, 200] {
+                crate::scroll::resize(edit, 0, 0, width, 600);
+                SendMessageW(edit, WM_USER + 225, zoom, 100);
+                let available = scroll::text_width(edit);
+                set_rtf(
+                    edit,
+                    &crate::markdown::preview(
+                        "```rust\nlet value = 42;\n```\n\n|A|B|\n|---|---|\n|1|2|",
+                        available,
+                    ),
+                )
+                .unwrap();
+                scroll::measure(edit);
+                let mut format: RECT = zeroed();
+                SendMessageW(edit, EM_GETRECT, 0, &mut format as *mut _ as isize);
+                let edge = format.left * zoom as i32 / 100
+                    + (available as i64 * theme::dpi(edit) as i64 * zoom as i64 / (1440 * 100))
+                        as i32;
+                assert!(
+                    edge < width - theme::px(edit, 20),
+                    "Right border must leave room for the scrollbar"
+                );
+                theme::fill(
+                    buffer.dc,
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 800,
+                        bottom: 1900,
+                    },
+                    theme::CANVAS,
+                );
+                SendMessageW(
+                    edit,
+                    WM_PRINTCLIENT,
+                    buffer.dc as usize,
+                    PRF_CLIENT as isize,
+                );
+                let mut border_pixels = 0;
+                for x in edge - 3..=edge + 3 {
+                    for y in 5..100 {
+                        if GetPixel(buffer.dc, x, y) == theme::rgb(59, 75, 92) {
+                            border_pixels += 1;
+                        }
+                    }
+                }
+                assert!(
+                    border_pixels > 5,
+                    "Native right border missing at width={width}, zoom={zoom}, edge={edge}"
+                );
+            }
+        }
+        ReleaseDC(edit, screen);
+        DestroyWindow(edit);
+    }
+}
+
+#[test]
+#[ignore = "Requires Windows RichEdit math"]
+fn native_math_formulas_preserve_readonly() {
+    unsafe {
+        let _ole = crate::assets::Ole::new().unwrap();
+        LoadLibraryW(wide("Msftedit.dll").as_ptr());
+        let fonts = theme::Fonts::new();
+        let view = rich_edit(null_mut(), true, fonts.body);
+        MoveWindow(view, 0, 0, 600, 400, 0);
+        set_rtf(
+            view,
+            &crate::markdown::preview(
+                "Inline $E=mc^2$ and $\\frac{a}{b}$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$",
+                8000,
+            ),
+        )
+        .unwrap();
+        let rendered = text(view);
+        assert!(
+            !rendered.contains("\\frac")
+                && !rendered.contains('\u{e000}')
+                && !rendered.contains('\u{e001}')
+        );
+        assert_ne!(
+            GetWindowLongW(view, GWL_STYLE) as u32 & ES_READONLY as u32,
+            0
+        );
+        DestroyWindow(view);
     }
 }

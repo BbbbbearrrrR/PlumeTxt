@@ -92,10 +92,20 @@ impl vt100::Callbacks for Replies {
 struct Cursor {
     position: Option<(u16, u16)>,
     pending: Option<(Option<(u16, u16)>, std::time::Instant)>,
+    input_until: Option<std::time::Instant>,
 }
 impl Cursor {
     fn update(&mut self, position: (u16, u16), hidden: bool, now: std::time::Instant) -> bool {
         let next = (!hidden).then_some(position);
+        // Follow confirmed input-line echoes immediately; keep filtering TUI cursor jumps.
+        if !hidden
+            && self.input_until.is_some_and(|until| now <= until)
+            && self.position.is_some_and(|old| old.0 == position.0)
+        {
+            self.position = next;
+            self.pending = None;
+            return false;
+        }
         if let Some((candidate, since)) = self.pending {
             if now.duration_since(since).as_millis() >= 32 {
                 self.position = candidate;
@@ -178,8 +188,14 @@ impl Terminal {
                         pixel_height: 0,
                     })
                     .map_err(|e| e.to_string())?;
-                let mut command = CommandBuilder::new("powershell.exe");
-                command.args(["-NoLogo", "-NoProfile"]);
+                let shell = std::env::var_os("PATH")
+                    .map(|path| {
+                        std::env::split_paths(&path).any(|dir| dir.join("pwsh.exe").is_file())
+                    })
+                    .unwrap_or(false);
+                let mut command =
+                    CommandBuilder::new(if shell { "pwsh.exe" } else { "powershell.exe" });
+                command.arg("-NoLogo");
                 command.cwd(&cwd);
                 command.env("TERM", "xterm-256color");
                 let child = pair
@@ -293,7 +309,7 @@ fn color(c: vt100::Color, default: u32) -> u32 {
                 rgb(188, 144, 218),
                 ACCENT,
                 rgb(222, 232, 233),
-                rgb(113, 132, 137),
+                MUTED,
                 rgb(255, 145, 151),
                 rgb(146, 229, 177),
                 rgb(246, 219, 153),
@@ -379,6 +395,18 @@ fn key_sequence(
         .into_bytes(),
     )
 }
+fn foreground(cell: &vt100::Cell) -> u32 {
+    if cell.dim()
+        && matches!(
+            cell.fgcolor(),
+            vt100::Color::Default | vt100::Color::Idx(7 | 15)
+        )
+    {
+        MUTED
+    } else {
+        color(cell.fgcolor(), INK)
+    }
+}
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let clean: String = normalized
@@ -433,8 +461,16 @@ impl State {
         }
     }
     fn write(&mut self, bytes: &[u8]) {
+        self.cursor.input_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+        let changed = self.parser.screen().scrollback() != 0 || self.selection.is_some();
         self.parser.screen_mut().set_scrollback(0);
         self.selection = None;
+        if changed {
+            unsafe {
+                invalidate(self.hwnd);
+            }
+        }
         if let Some(s) = &mut self.session {
             if let Err(e) = s.writer.send(bytes.to_vec()) {
                 self.parser.process(format!("\r\n{e}").as_bytes());
@@ -447,6 +483,9 @@ impl State {
         let cols = ((rc.right - px(self.hwnd, 32)) / self.cell_w).clamp(10, 400) as u16;
         if self.parser.screen().size() != (rows, cols) {
             self.parser.screen_mut().set_size(rows, cols);
+            // Old coordinates belong to the previous grid. Present the new cursor only
+            // after the application has redrawn, using the existing stabilization timer.
+            self.cursor = Cursor::default();
         }
         if let Some(s) = &mut self.session {
             if s.size != (rows, cols)
@@ -467,10 +506,12 @@ impl State {
     }
     unsafe fn output(&mut self) {
         // Bound each dispatch so continuous output cannot starve keyboard messages.
+        let mut changed = false;
         for batch in 0..16 {
             let Ok(event) = self.events.try_recv() else {
                 break;
             };
+            changed = true;
             if batch == 15 {
                 PostMessageW(self.hwnd, READY, 0, 0);
             }
@@ -481,11 +522,6 @@ impl State {
                 }
                 Event::Output(bytes) => {
                     self.parser.process(&bytes);
-                    self.cursor.update(
-                        self.parser.screen().cursor_position(),
-                        self.parser.screen().hide_cursor(),
-                        std::time::Instant::now(),
-                    );
                     let replies = std::mem::take(&mut self.parser.callbacks_mut().bytes);
                     if !replies.is_empty() {
                         if let Some(session) = &self.session {
@@ -503,13 +539,27 @@ impl State {
                 }
             }
         }
-        if IsWindowVisible(self.hwnd) != 0 && !self.frame_pending {
-            self.frame_pending = SetTimer(self.hwnd, 2, 8, None) != 0;
-            if !self.frame_pending {
-                invalidate(self.hwnd);
+        if !changed {
+            return;
+        }
+        if self.parser.callbacks().sync_started.is_some() {
+            if IsWindowVisible(self.hwnd) != 0 && !self.frame_pending {
+                self.frame_pending = SetTimer(self.hwnd, 2, 8, None) != 0;
             }
+        } else {
+            KillTimer(self.hwnd, 2);
+            self.frame_pending = false;
+            self.cursor.update(
+                self.parser.screen().cursor_position(),
+                self.parser.screen().hide_cursor(),
+                std::time::Instant::now(),
+            );
+            self.position_ime();
+            // Invalidation coalesces output into a frame without a WM_TIMER delay.
+            invalidate(self.hwnd);
         }
     }
+
     unsafe fn paint(&mut self, dc: HDC, dirty: &RECT) {
         let screen = self.parser.screen();
         let pending = self.cursor.update(
@@ -567,7 +617,7 @@ impl State {
                     if cell.is_wide_continuation() {
                         continue;
                     }
-                    let mut fg = color(cell.fgcolor(), INK);
+                    let mut fg = foreground(cell);
                     let mut bg = color(cell.bgcolor(), SURFACE);
                     if cell.inverse() {
                         std::mem::swap(&mut fg, &mut bg);
@@ -688,6 +738,11 @@ impl State {
     }
 }
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    // DefWindowProc sends WM_SIZE synchronously for this message. Do not hold
+    // State across it, otherwise the nested resize is deferred until after paint.
+    if msg == WM_WINDOWPOSCHANGED {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
     if msg == WM_ERASEBKGND {
         return 1;
     }
@@ -705,6 +760,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             ),
             1,
         );
+        let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RefCell<State>;
+        if !p.is_null() {
+            if let Ok(mut s) = (*p).try_borrow_mut() {
+                s.resize();
+                return 0;
+            }
+        }
         PostMessageW(hwnd, RESIZE, 0, 0);
         return 0;
     }
@@ -843,7 +905,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
             } else if msg == WM_SYSKEYDOWN {
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
-            invalidate(hwnd);
         }
         WM_SYSCHAR => {
             if (lp >> 16) & 0xff == 0x0e {
@@ -857,7 +918,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                     s.write(format!("\x1b{ch}").as_bytes());
                 }
             }
-            invalidate(hwnd);
         }
         WM_CHAR => {
             // Physical Backspace is encoded on keydown; Ctrl+H has a different scan code.
@@ -887,7 +947,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) ->
                 let text = String::from_utf16_lossy(&units);
                 s.write(text.as_bytes());
             }
-            invalidate(hwnd);
         }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -945,6 +1004,109 @@ fn native_terminal_uses_file_directory_and_keeps_session() {
             drop(s);
             std::thread::sleep(Duration::from_millis(15));
         }
+        // Exercise real completion through the same TranslateMessage path as the app.
+        (*state).borrow_mut().write(b"function PlumeTxtCompleteProbe { Write-Output ('COMPLETE_'+'OK') }\rPlumeTxtCompleteP");
+        PostMessageW(terminal.0, WM_KEYDOWN, VK_TAB as usize, 0x000f0001);
+        PostMessageW(terminal.0, WM_KEYDOWN, VK_RETURN as usize, 0x001c0001);
+        let completion = Instant::now();
+        loop {
+            let mut msg: MSG = zeroed();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            let contents = (*state).borrow().parser.screen().contents();
+            if contents.contains("COMPLETE_OK") {
+                break;
+            }
+            assert!(
+                completion.elapsed() < Duration::from_secs(10),
+                "Tab completion failed: {contents}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if std::env::var_os("PLUMETXT_AGENT_PROBE").is_some() {
+            MoveWindow(terminal.0, 0, 0, 800, 600, 0);
+            let pump = |seconds: f32| {
+                let probe = Instant::now();
+                while probe.elapsed().as_secs_f32() < seconds {
+                    let mut msg: MSG = zeroed();
+                    while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            (*state).borrow_mut().write(b"codex --no-alt-screen\r");
+            pump(3.0);
+            if (*state)
+                .borrow()
+                .parser
+                .screen()
+                .contents()
+                .contains("Update available")
+            {
+                (*state).borrow_mut().write(b"\x1b[B\r");
+                pump(3.0);
+            }
+            std::fs::write(
+                cwd.join("agent-probe.txt"),
+                (*state).borrow().parser.screen().contents(),
+            )
+            .unwrap();
+            (*state).borrow_mut().write(b"/sta");
+            pump(0.5);
+            std::fs::write(
+                cwd.join("agent-before-tab.txt"),
+                (*state).borrow().parser.screen().contents(),
+            )
+            .unwrap();
+            PostMessageW(terminal.0, WM_KEYDOWN, VK_TAB as usize, 0x000f0001);
+            pump(0.5);
+            let completed = (*state).borrow().parser.screen().contents();
+            std::fs::write(cwd.join("agent-after-tab.txt"), &completed).unwrap();
+            assert!(
+                completed.contains("› /status"),
+                "Codex slash completion failed: {completed}"
+            );
+            MoveWindow(terminal.0, 0, 0, 600, 480, 0);
+            ShowWindow(terminal.0, SW_HIDE);
+            ShowWindow(terminal.0, SW_SHOWNA);
+            pump(0.5);
+            (*state).borrow_mut().write(b"\x15/sta");
+            pump(0.5);
+            PostMessageW(terminal.0, WM_KEYDOWN, VK_TAB as usize, 0x000f0001);
+            pump(0.5);
+            let resized = (*state).borrow().parser.screen().contents();
+            assert!(
+                resized.contains("› /status"),
+                "Completion after resizing failed: {resized}"
+            );
+            drop(terminal);
+            DestroyWindow(parent);
+            return;
+        }
+        {
+            let mut s = (*state).borrow_mut();
+            s.cursor.position = Some((2, 3));
+        }
+        MoveWindow(terminal.0, 0, 0, 700, 400, 0);
+        let grid = (*state).borrow().parser.screen().size();
+        assert_eq!(
+            (*state).borrow().session.as_ref().unwrap().size,
+            grid,
+            "PTY and parser must resize before WM_SIZE returns"
+        );
+        assert!(
+            (*state).borrow().cursor.position.is_none(),
+            "Do not draw old-grid cursor coordinates"
+        );
+        (*state).borrow_mut().cursor.position = Some((2, 3));
+        ShowWindow(terminal.0, SW_HIDE);
+        ShowWindow(terminal.0, SW_SHOWNA);
+        assert_eq!((*state).borrow().parser.screen().size(), grid);
+        assert_eq!((*state).borrow().cursor.position, Some((2, 3)));
         let (input, received) = channel();
         let original_writer = {
             let mut s = (*state).borrow_mut();
@@ -967,9 +1129,18 @@ fn native_terminal_uses_file_directory_and_keeps_session() {
         for unit in "中文😀".encode_utf16() {
             SendMessageW(terminal.0, WM_CHAR, unit as usize, 0);
         }
+        SendMessageW(terminal.0, WM_KEYDOWN, VK_TAB as usize, 0x000f0001);
+        SendMessageW(terminal.0, WM_CHAR, 9, 0x000f0001);
+        keys[VK_SHIFT as usize] = 0x80;
+        SetKeyboardState(keys.as_ptr());
+        SendMessageW(terminal.0, WM_KEYDOWN, VK_TAB as usize, 0x000f0001);
+        SendMessageW(terminal.0, WM_CHAR, 9, 0x000f0001);
         SetKeyboardState(original_keys.as_ptr());
         let actual: Vec<u8> = received.try_iter().flatten().collect();
-        assert_eq!(actual, "\x1b[1;5D\x17\x08\x7f\x1b[3~中文😀".as_bytes());
+        assert_eq!(
+            actual,
+            "\x1b[1;5D\x17\x08\x7f\x1b[3~中文😀\t\x1b[Z".as_bytes()
+        );
         (*state).borrow_mut().session.as_mut().unwrap().writer = original_writer;
         (*state)
             .borrow_mut()
@@ -997,6 +1168,39 @@ fn native_terminal_uses_file_directory_and_keeps_session() {
         let mut caret: POINT = zeroed();
         assert_ne!(GetCaretPos(&mut caret), 0);
         assert!(caret.x >= 0 && caret.y >= 0);
+        let (echo, echo_events) = channel();
+        let live_events = {
+            let mut s = (*state).borrow_mut();
+            s.cursor.position = Some((1, 4));
+            s.cursor.input_until = Some(Instant::now() + Duration::from_millis(250));
+            std::mem::replace(&mut s.events, echo_events)
+        };
+        echo.send(Event::Output(b"\x1b[?2026h\x1b[2;5HX\x1b[?25h".to_vec()))
+            .unwrap();
+        SendMessageW(terminal.0, READY, 0, 0);
+        assert!(
+            (*state).borrow().frame_pending,
+            "Incomplete TUI frames must stay buffered"
+        );
+        echo.send(Event::Output(b"\x1b[?2026l".to_vec())).unwrap();
+        SendMessageW(terminal.0, READY, 0, 0);
+        assert!(
+            !(*state).borrow().frame_pending,
+            "Completed input echo must not wait for a timer"
+        );
+        assert_eq!((*state).borrow().cursor.position, Some((1, 5)));
+        UpdateWindow(terminal.0);
+        SendMessageW(terminal.0, READY, 0, 0);
+        assert_eq!(
+            GetUpdateRect(terminal.0, null_mut(), 0),
+            0,
+            "Empty wakeups must not repaint"
+        );
+        {
+            let mut s = (*state).borrow_mut();
+            s.events = live_events;
+            s.cursor.input_until = None;
+        }
         let (cursor_x, cursor_y) = {
             let mut s = (*state).borrow_mut();
             s.parser.process(b"\x1b[2J\x1b[2;5H\x1b[?25h\x1b[6 q");
@@ -1141,6 +1345,23 @@ fn conpty_working_cursor_does_not_follow_intermediate_positions() {
     assert!(cursor.update((0, 0), true, now + Duration::from_millis(40)));
     assert!(!cursor.update((0, 0), true, now + Duration::from_millis(72)));
     assert_eq!(cursor.position, None, "Explicit hiding must still work");
+    cursor.position = Some((23, 2));
+    cursor.input_until = Some(now + Duration::from_millis(90));
+    for (delay, col) in [(75, 3), (76, 4), (77, 3), (78, 2)] {
+        assert!(!cursor.update((23, col), false, now + Duration::from_millis(delay)));
+        assert_eq!(
+            cursor.position,
+            Some((23, col)),
+            "Typing and deletion echoes must not wait 32 ms"
+        );
+    }
+    assert!(cursor.update((19, 0), false, now + Duration::from_millis(79)));
+    assert_eq!(
+        cursor.position,
+        Some((23, 2)),
+        "Working redraws still preserve the input cursor"
+    );
+    cursor.pending = None;
     // Held arrow keys must keep advancing even without an idle paint between repeats.
     for col in 0..20 {
         cursor.update(
@@ -1156,6 +1377,11 @@ fn conpty_working_cursor_does_not_follow_intermediate_positions() {
 
 #[test]
 fn terminal_keys_and_paste_preserve_input_semantics() {
+    let mut hint = vt100::Parser::new(1, 10, 0);
+    hint.process(b"A\x1b[90mB\x1b[0;2mC\x1b[0;31mD");
+    for (col, expected) in [(0, INK), (1, MUTED), (2, MUTED), (3, rgb(237, 111, 117))] {
+        assert_eq!(foreground(hint.screen().cell(0, col).unwrap()), expected);
+    }
     let mut parser = vt100::Parser::new_with_callbacks(12, 90, 0, Replies::default());
     parser.process(b"abc\x1b[");
     parser.process(b"6nxyz\x1b[5n");

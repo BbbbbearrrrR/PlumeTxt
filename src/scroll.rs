@@ -15,6 +15,7 @@ use windows_sys::Win32::{
         WindowsAndMessaging::*,
     },
 };
+pub const ZOOM: u32 = WM_APP + 96;
 pub const SYNC: u32 = WM_APP + 91;
 pub const POSITION: u32 = WM_APP + 92;
 const UPDATE: u32 = WM_APP + 93;
@@ -38,7 +39,8 @@ struct Bar {
     vertical: bool,
     bg: u32,
     drag: bool,
-    offset: i32,
+    pointer_origin: i32,
+    drag_position: Option<i32>,
     settled: Option<SCROLLINFO>,
     buffer: Buffer,
 }
@@ -70,6 +72,9 @@ pub unsafe fn pair(hwnd: HWND, peer: HWND) {
     } else {
         SetPropW(hwnd, wide("PlumeTxtScrollPeer").as_ptr(), peer);
     }
+}
+pub unsafe fn drag_owner() -> HWND {
+    GetPropW(GetCapture(), wide("PlumeTxtScrollDragOwner").as_ptr())
 }
 pub unsafe fn hold_range(hwnd: HWND, hold: bool) {
     let key = wide("PlumeTxtHoldRange");
@@ -201,7 +206,8 @@ pub unsafe fn attach(hwnd: HWND, bg: u32) {
                 vertical,
                 bg,
                 drag: false,
-                offset: 0,
+                pointer_origin: 0,
+                drag_position: None,
                 settled: None,
                 buffer: Buffer::default(),
             }))) as isize,
@@ -301,6 +307,31 @@ unsafe fn editor_viewport(hwnd: HWND) -> RECT {
 pub unsafe fn show(hwnd: HWND, visible: bool) {
     SendMessageW(hwnd, UPDATE, 1, visible as isize);
 }
+pub unsafe fn text_width(hwnd: HWND) -> usize {
+    let mut format: RECT = zeroed();
+    SendMessageW(hwnd, EM_GETRECT, 0, &mut format as *mut _ as isize);
+    let right = format.right.min(editor_viewport(hwnd).right - px(hwnd, 24));
+    let (mut zoom, mut denominator) = (0i32, 0i32);
+    SendMessageW(
+        hwnd,
+        WM_USER + 224,
+        &mut zoom as *mut _ as usize,
+        &mut denominator as *mut _ as isize,
+    );
+    // RichEdit scales its left inset along with the document.
+    let left = if zoom > 0 && denominator > 0 {
+        format.left * zoom / denominator
+    } else {
+        format.left
+    };
+    let width = (right - left - px(hwnd, 8)).max(16) as i64 * 1440 / dpi(hwnd) as i64;
+    (if zoom > 0 && denominator > 0 {
+        width * denominator as i64 / zoom as i64
+    } else {
+        width
+    }) as usize
+}
+
 pub unsafe fn set_position(hwnd: HWND, vertical: bool, pos: i32) {
     SendMessageW(hwnd, POSITION, vertical as usize, pos as isize);
 }
@@ -393,21 +424,21 @@ unsafe fn refresh(hwnd: HWND, s: &mut Host) {
             && (vertical || s.kind == 2);
         crate::theme::move_window(
             bar,
-            origin.x + if vertical { r.right - px(hwnd, 12) } else { 0 },
-            origin.y + if vertical { 0 } else { r.bottom - px(hwnd, 12) },
+            origin.x + if vertical { r.right - px(hwnd, 20) } else { 0 },
+            origin.y + if vertical { 0 } else { r.bottom - px(hwnd, 20) },
             if vertical {
-                px(hwnd, 12)
+                px(hwnd, 20)
             } else {
-                r.right - px(hwnd, 12)
+                r.right - px(hwnd, 20)
             },
             if vertical {
                 if s.kind == 2 || s.kind == 3 {
-                    r.bottom - px(hwnd, 12)
+                    r.bottom - px(hwnd, 20)
                 } else {
                     r.bottom
                 }
             } else {
-                px(hwnd, 12)
+                px(hwnd, 20)
             },
             0,
         );
@@ -556,6 +587,17 @@ unsafe extern "system" fn host_proc(
         refresh(hwnd, &mut s);
         return 0;
     }
+    if msg == WM_MOUSEWHEEL && wp & 8 != 0 && s.kind == 0 {
+        let delta = (wp >> 16) as u16 as i16 as i32;
+        drop(s);
+        SendMessageW(
+            GetAncestor(hwnd, GA_ROOT),
+            ZOOM,
+            delta as usize,
+            hwnd as isize,
+        );
+        return 0;
+    }
     if msg == WM_MOUSEWHEEL && s.kind == 1 {
         let delta = (wp >> 16) as u16 as i16 as i32;
         s.wheel += delta;
@@ -673,8 +715,6 @@ unsafe extern "system" fn host_proc(
             position(hwnd, 0, false, x);
             position(hwnd, 0, true, y);
             refresh(hwnd, &mut s);
-            PostMessageW(hwnd, POSITION, 0, x as isize);
-            PostMessageW(hwnd, POSITION, 1, y as isize);
         }
     }
     if matches!(
@@ -687,11 +727,15 @@ unsafe extern "system" fn host_proc(
             | WM_VSCROLL
             | WM_HSCROLL
             | WM_KEYDOWN
+            | WM_CHAR
+            | WM_LBUTTONUP
             | WM_SHOWWINDOW
     ) {
         PostMessageW(hwnd, UPDATE, 0, 0);
-        if matches!(msg, WM_MOUSEWHEEL | WM_VSCROLL | WM_KEYDOWN)
-            || (msg == WM_SETFOCUS && s.kind != 0)
+        if matches!(
+            msg,
+            WM_MOUSEWHEEL | WM_VSCROLL | WM_KEYDOWN | WM_CHAR | WM_LBUTTONUP | WM_SETTEXT | WM_SIZE
+        ) || (msg == WM_SETFOCUS && s.kind != 0)
         {
             PostMessageW(GetAncestor(hwnd, GA_ROOT), SYNC, hwnd as usize, 0);
         }
@@ -701,7 +745,7 @@ unsafe extern "system" fn host_proc(
 fn thumb(length: i32, i: &SCROLLINFO, dpi: u32) -> (i32, i32) {
     let length = (length - scale(8, dpi)).max(1);
     let size = ((length as f64 * i.nPage as f64 / (i.nMax + 1).max(1) as f64) as i32)
-        .clamp(scale(24, dpi).min(length), length);
+        .clamp(scale(40, dpi).min(length), length);
     (
         scale(4, dpi) + ((length - size) as f64 * i.nPos as f64 / limit(i).max(1) as f64) as i32,
         size,
@@ -728,15 +772,23 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
     }
     let rc = client(hwnd);
     let length = if s.vertical { rc.bottom } else { rc.right };
-    let mut i = info(s.owner, s.vertical);
+    let mut i = if s.vertical {
+        crate::paged::scroll_info(s.owner)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| info(s.owner, s.vertical));
     let held = !GetPropW(s.owner, wide("PlumeTxtHoldRange").as_ptr()).is_null();
-    if held {
+    if held || s.drag {
         if let Some(settled) = s.settled {
             i.nMax = settled.nMax;
             i.nPage = settled.nPage;
         }
     } else {
         s.settled = Some(i);
+    }
+    if let Some(pos) = s.drag_position {
+        i.nPos = pos.clamp(0, limit(&i));
     }
     let draw_thumb = !held || s.settled.is_some();
     let (start, size) = thumb(length, &i, dpi(hwnd));
@@ -749,8 +801,8 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
                 fill(s.buffer.dc, rc, s.bg);
                 let r = if s.vertical {
                     RECT {
-                        left: px(hwnd, 4),
-                        right: px(hwnd, 8),
+                        left: px(hwnd, if s.drag { 5 } else { 6 }),
+                        right: px(hwnd, if s.drag { 15 } else { 14 }),
                         top: start,
                         bottom: start + size,
                     }
@@ -758,8 +810,8 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
                     RECT {
                         left: start,
                         right: start + size,
-                        top: px(hwnd, 4),
-                        bottom: px(hwnd, 8),
+                        top: px(hwnd, if s.drag { 5 } else { 6 }),
+                        bottom: px(hwnd, if s.drag { 15 } else { 14 }),
                     }
                 };
                 if draw_thumb {
@@ -786,35 +838,80 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -
             } else {
                 lp as u16 as i16 as i32
             };
+            let on_thumb = p >= start && p < start + size;
             s.drag = true;
-            s.offset = if p >= start && p < start + size {
-                p - start
-            } else {
-                size / 2
-            };
+            s.pointer_origin = p;
+            SetPropW(hwnd, wide("PlumeTxtScrollDragOwner").as_ptr(), s.owner);
             SetCapture(hwnd);
-            let pos = ((p - s.offset - px(hwnd, 4)) as f64
+            // Grabbing the thumb must not seek: inverse pixel mapping loses precision.
+            if on_thumb {
+                s.drag_position = Some(i.nPos);
+                drop(s);
+                invalidate(hwnd);
+                return 0;
+            }
+            let pos = ((p - size / 2 - px(hwnd, 4)) as f64
                 / (length - size - px(hwnd, 8)).max(1) as f64
                 * limit(&i) as f64) as i32;
-            set_position(s.owner, s.vertical, pos);
-            PostMessageW(GetAncestor(s.owner, GA_ROOT), SYNC, s.owner as usize, 0);
+            s.drag_position = Some(pos.clamp(0, limit(&i)));
+            if let Some(origin) = s.settled.as_mut() {
+                origin.nPos = pos.clamp(0, limit(&i));
+            }
+            let owner = s.owner;
+            let vertical = s.vertical;
+            drop(s);
             invalidate(hwnd);
+            UpdateWindow(hwnd);
+            if !vertical || !crate::paged::scroll_to(owner, pos) {
+                set_position(owner, vertical, pos);
+                SendMessageW(GetAncestor(owner, GA_ROOT), SYNC, owner as usize, 0);
+            }
+            UpdateWindow(owner);
+            return 0;
         }
         WM_MOUSEMOVE if s.drag => {
+            let mut latest = lp;
+            let mut next: MSG = zeroed();
+            while PeekMessageW(&mut next, hwnd, 0, 0, PM_NOREMOVE) != 0
+                && next.message == WM_MOUSEMOVE
+            {
+                PeekMessageW(&mut next, hwnd, WM_MOUSEMOVE, WM_MOUSEMOVE, PM_REMOVE);
+                latest = next.lParam;
+            }
+            let lp = latest;
             let p = if s.vertical {
                 (lp >> 16) as u16 as i16 as i32
             } else {
                 lp as u16 as i16 as i32
             };
-            let pos = ((p - s.offset - px(hwnd, 4)) as f64
-                / (length - size - px(hwnd, 8)).max(1) as f64
-                * limit(&i) as f64) as i32;
-            set_position(s.owner, s.vertical, pos);
-            PostMessageW(GetAncestor(s.owner, GA_ROOT), SYNC, s.owner as usize, 0);
+            let origin = s.settled.map_or(i.nPos, |v| v.nPos);
+            let pos = (origin as f64
+                + (p - s.pointer_origin) as f64 / (length - size - px(hwnd, 8)).max(1) as f64
+                    * limit(&i) as f64)
+                .round() as i32;
+            let pos = pos.clamp(0, limit(&i));
+            // Windows can send mouse moves without displacement (e.g. after a
+            // repaint). Re-seeking a paged document here reloads the same window.
+            if s.drag_position == Some(pos) {
+                return 0;
+            }
+            s.drag_position = Some(pos);
+            let owner = s.owner;
+            let vertical = s.vertical;
+            drop(s);
             invalidate(hwnd);
+            UpdateWindow(hwnd);
+            if !vertical || !crate::paged::scroll_to(owner, pos) {
+                set_position(owner, vertical, pos);
+                SendMessageW(GetAncestor(owner, GA_ROOT), SYNC, owner as usize, 0);
+            }
+            UpdateWindow(owner);
+            return 0;
         }
         WM_LBUTTONUP | WM_CAPTURECHANGED => {
             s.drag = false;
+            s.drag_position = None;
+            RemovePropW(hwnd, wide("PlumeTxtScrollDragOwner").as_ptr());
             if msg == WM_LBUTTONUP {
                 ReleaseCapture();
             }
@@ -838,11 +935,30 @@ fn thumb_reaches_both_ends() {
     i.nPos = 900;
     assert_eq!(thumb(408, &i, 96), (364, 40));
     assert_eq!(thumb(816, &i, 192), (728, 80));
+    i.nMax = 1_000_000;
+    i.nPage = 1;
+    i.nPos = 0;
+    assert_eq!(thumb(408, &i, 96), (4, 40));
+    assert_eq!(thumb(816, &i, 192), (8, 80));
 }
 
 #[test]
 #[ignore = "Requires Windows RichEdit"]
 fn native_scroll_remains_available_without_native_tracks() {
+    unsafe extern "system" fn count_seek(
+        hwnd: HWND,
+        msg: u32,
+        wp: usize,
+        lp: isize,
+        _: usize,
+        data: usize,
+    ) -> isize {
+        if msg == POSITION {
+            let count = &*(data as *const std::cell::Cell<usize>);
+            count.set(count.get() + 1);
+        }
+        DefSubclassProc(hwnd, msg, wp, lp)
+    }
     use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
     unsafe {
         let library = LoadLibraryW(wide("Msftedit.dll").as_ptr());
@@ -946,6 +1062,73 @@ fn native_scroll_remains_available_without_native_tracks() {
             parent,
             "Custom track must not scroll with RichEdit's children"
         );
+        assert_eq!(
+            client(bar).right,
+            px(hwnd, 20),
+            "Scrollbar hit area must be 20 logical pixels wide"
+        );
+        set_position(hwnd, true, limit(&info(hwnd, true)) / 2);
+        let seeks = std::cell::Cell::new(0usize);
+        SetWindowSubclass(hwnd, Some(count_seek), 9198, &seeks as *const _ as usize);
+        let before = info(hwnd, true);
+        let (top, size) = thumb(client(bar).bottom, &before, dpi(bar));
+        let held = (((top + size / 2) << 16) | 10) as isize;
+        SendMessageW(bar, WM_LBUTTONDOWN, 1, held);
+        for _ in 0..4 {
+            SendMessageW(bar, WM_MOUSEMOVE, 1, held);
+            assert_eq!(
+                info(hwnd, true).nPos,
+                before.nPos,
+                "Holding the thumb must not quantize the document position"
+            );
+        }
+        assert_eq!(
+            seeks.get(),
+            0,
+            "Holding must not repeatedly reload the same document window"
+        );
+        for delta in [-20, 20, -10, 10] {
+            let moved = (((top + size / 2 + delta) << 16) | 10) as isize;
+            SendMessageW(bar, WM_MOUSEMOVE, 1, moved);
+            let position = info(hwnd, true).nPos;
+            assert_eq!(
+                position.cmp(&before.nPos),
+                delta.cmp(&0),
+                "Dragging must follow in both directions, away from the endpoints"
+            );
+            let count = seeks.get();
+            assert!(count > 0);
+            for _ in 0..3 {
+                SendMessageW(bar, WM_MOUSEMOVE, 1, moved);
+                assert_eq!(
+                    info(hwnd, true).nPos,
+                    position,
+                    "Repeated mouse coordinates must not seek again"
+                );
+            }
+            assert_eq!(seeks.get(), count, "Duplicate moves must not seek");
+        }
+        SendMessageW(bar, WM_LBUTTONUP, 0, held);
+        RemoveWindowSubclass(hwnd, Some(count_seek), 9198);
+        SendMessageW(bar, WM_LBUTTONDOWN, 1, (40 << 16) | 1);
+        for y in [60, 80, 100, 120] {
+            PostMessageW(bar, WM_MOUSEMOVE, 1, (y << 16) | 1);
+        }
+        PostMessageW(bar, WM_LBUTTONUP, 0, (120 << 16) | 1);
+        SendMessageW(bar, WM_MOUSEMOVE, 1, (50 << 16) | 1);
+        let bar_state = &*(GetWindowLongPtrW(bar, GWLP_USERDATA) as *const RefCell<Bar>);
+        assert!(bar_state.borrow().drag_position.is_some());
+        let mut queued: MSG = zeroed();
+        assert_ne!(
+            PeekMessageW(&mut queued, bar, WM_MOUSEMOVE, WM_LBUTTONUP, PM_REMOVE),
+            0
+        );
+        assert_eq!(
+            queued.message, WM_LBUTTONUP,
+            "Coalescing must keep release events and discard stale moves"
+        );
+        DispatchMessageW(&queued);
+        assert!(bar_state.borrow().drag_position.is_none());
         DestroyWindow(hwnd);
         DestroyWindow(parent);
         FreeLibrary(library);
@@ -1078,6 +1261,16 @@ fn native_markdown_long_scroll_settles() {
         assert!(
             (info(hwnd, true).nPos - max / 2).abs() <= 2,
             "Focus must preserve the viewport"
+        );
+        set_position(hwnd, true, max / 3);
+        let mut queued: MSG = zeroed();
+        while PeekMessageW(&mut queued, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&queued);
+            DispatchMessageW(&queued);
+        }
+        assert!(
+            (info(hwnd, true).nPos - max / 3).abs() <= 2,
+            "Queued focus restoration must not overwrite a newer reading position"
         );
         let short = make();
         editor_colors(short);

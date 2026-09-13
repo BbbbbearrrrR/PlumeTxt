@@ -1305,6 +1305,30 @@ fn native_continuous_reader_settles_after_scrolling() {
                 panic!("Reader did not load");
             }
         }
+        ShowWindow(parent, SW_SHOWNOACTIVATE);
+        let mut bar = FindWindowExW(
+            reader.0,
+            null_mut(),
+            wide("PlumeTxtScroll").as_ptr(),
+            null(),
+        );
+        while !bar.is_null() && client(bar).bottom <= client(bar).right {
+            bar = FindWindowExW(reader.0, bar, wide("PlumeTxtScroll").as_ptr(), null());
+        }
+        assert!(!bar.is_null());
+        SendMessageW(bar, WM_LBUTTONDOWN, 1, (12 << 16) | 5);
+        for y in [100, 250, 400, 150] {
+            SendMessageW(bar, WM_MOUSEMOVE, 1, (y << 16) | 5);
+            assert_eq!(
+                GetUpdateRect(reader.0, null_mut(), 0),
+                0,
+                "PDF drag must paint before the next pointer message"
+            );
+            assert_eq!(GetUpdateRect(bar, null_mut(), 0), 0);
+            with(reader.0, |s| assert!(s.y > 0));
+        }
+        SendMessageW(bar, WM_LBUTTONUP, 0, (150 << 16) | 5);
+        ShowWindow(parent, SW_HIDE);
         with(reader.0, |s| {
             s.y = s.layout.pages[0].top + s.layout.pages[0].height - 100;
             s.scrollbars();

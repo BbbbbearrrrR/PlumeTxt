@@ -7,6 +7,7 @@ mod imageview;
 mod large;
 mod markdown;
 mod outline;
+mod paged;
 mod palette;
 mod pdf;
 mod pdftext;
