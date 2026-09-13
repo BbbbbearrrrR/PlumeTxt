@@ -4146,7 +4146,7 @@ fn native_markdown_pdf_roundtrip() {
         );
         DestroyWindow(control);
         let control = rich_edit(null_mut(), true, GetStockObject(DEFAULT_GUI_FONT));
-        let source = include_str!("../examples/welcome.md");
+        let source = "# PlumeTxt\n\n**加粗** and *italic*.\n\n> Hello, world\n\n```rust\nfn main() {}\n```";
         set_rtf(control, &markdown::rtf(source, 9000)).unwrap();
         let rendered = text(control);
         assert!(rendered.contains("PlumeTxt"), "{rendered}");
@@ -5991,7 +5991,32 @@ fn native_markdown_visual_fixture() {
         MoveWindow(edit, 0, 0, 800, 1900, 0);
         theme::editor_colors(edit);
         theme::dark_scrollbars(edit, theme::CANVAS);
-        let source = include_str!("../examples/markdown-showcase.md");
+        let source = r#"# Markdown preview
+
+Readable **bold**, *italic*, ~~deleted~~, `inline code`.
+
+```rust
+fn main() {
+    println!("Code stays readable");
+}
+```
+
+| Feature | Status |
+| --- | --- |
+| Unicode 中文 | Ready |
+
+- [x] Finished task
+
+> A quote with **emphasis**.
+
+---
+
+Inline: $\frac{a}{b}$.
+
+$$
+\int_0^1 x^2\,dx = \frac{1}{3}
+$$
+"#;
         set_rtf(
             edit,
             &crate::markdown::preview(source, scroll::text_width(edit)),

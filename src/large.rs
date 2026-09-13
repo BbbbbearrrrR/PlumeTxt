@@ -595,7 +595,7 @@ fn native_large_view_draws_and_releases() {
             null(),
         );
         let fonts = Fonts::new();
-        let view = Large::create(parent, PathBuf::from("examples/welcome.md"), fonts.code);
+        let view = Large::create(parent, PathBuf::from("README.md"), fonts.code);
         let start = std::time::Instant::now();
         loop {
             let mut msg: MSG = zeroed();
